@@ -1,0 +1,53 @@
+{
+  "name": "agy-loop",
+  "version": "0.1.0",
+  "description": "Non-blocking /loop scheduler for Antigravity CLI & Desktop — recurring prompts, adaptive self-pacing, isolated subagents, and live-reloading loop.md.",
+  "type": "module",
+  "license": "MIT",
+  "author": {
+    "name": "Max",
+    "url": "https://github.com/maxlee"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/maxlee/agy-loop.git"
+  },
+  "homepage": "https://github.com/maxlee/agy-loop",
+  "bugs": {
+    "url": "https://github.com/maxlee/agy-loop/issues"
+  },
+  "keywords": [
+    "loop",
+    "schedule",
+    "cron",
+    "subagents",
+    "polling",
+    "automation",
+    "ci",
+    "cli"
+  ],
+  "bin": {
+    "agy-loop": "./bin/agy-loop.mjs"
+  },
+  "files": [
+    "plugin.json",
+    "skills/",
+    "agents/",
+    "assets/",
+    "bin/",
+    "install.sh",
+    "uninstall.sh",
+    "README.md",
+    "README.zh-CN.md",
+    "ARCHITECTURE.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "validate": "agy plugin validate --strict .",
+    "prepublishOnly": "npm test"
+  }
+}

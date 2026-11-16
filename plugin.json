@@ -1,0 +1,30 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "agy-loop",
+  "displayName": "AGY Loop",
+  "version": "0.1.0",
+  "description": "Non-blocking /loop scheduler for Antigravity CLI & Desktop — recurring prompts, adaptive self-pacing, isolated subagents, and live-reloading loop.md.",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "/loop 1m check local build and tests",
+    "/loop check current PR CI status and fix failures --stateful",
+    "/loop status"
+  ],
+  "author": {
+    "name": "Max",
+    "url": "https://github.com/maxlee"
+  },
+  "homepage": "https://github.com/maxlee/agy-loop",
+  "repository": "https://github.com/maxlee/agy-loop",
+  "license": "MIT",
+  "keywords": [
+    "loop",
+    "schedule",
+    "cron",
+    "subagents",
+    "polling",
+    "automation",
+    "ci",
+    "cli"
+  ]
+}

@@ -1,0 +1,58 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Verify, Release & Publish
+    runs-on: ubuntu-latest
+    env:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Verify tag matches manifest versions
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PKG_VERSION="$(node -p "JSON.parse(fs.readFileSync('package.json', 'utf8')).version")"
+          PLUGIN_VERSION="$(node -p "JSON.parse(fs.readFileSync('plugin.json', 'utf8')).version")"
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ] || [ "$TAG_VERSION" != "$PLUGIN_VERSION" ]; then
+            printf 'Version mismatch: tag=%s package.json=%s plugin.json=%s\n' "$TAG_VERSION" "$PKG_VERSION" "$PLUGIN_VERSION" >&2
+            exit 1
+          fi
+
+      - name: Check POSIX shell syntax
+        run: sh -n install.sh uninstall.sh skills/loop/scripts/loop-helper.sh
+
+      - name: Run test suite
+        run: npm test
+
+      - name: Dry-run npm tarball
+        run: npm pack --dry-run
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+
+      - name: Publish to npm
+        if: startsWith(github.ref, 'refs/tags/v') && env.NPM_TOKEN != ''
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public
