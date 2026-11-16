@@ -237,6 +237,10 @@ run_parse() {
           print "{\"action\":\"doctor\"}"
           finish_ok()
         }
+        if (w1 == "clean-shadow") {
+          print "{\"action\":\"doctor\",\"clean_shadow\":true}"
+          finish_ok()
+        }
         if (w1 == "help" || w1 == "--help" || w1 == "-h") {
           print "{\"action\":\"help\"}"
           finish_ok()
@@ -245,6 +249,15 @@ run_parse() {
           print "{\"action\":\"stop\",\"target\":\"all\"}"
           finish_ok()
         }
+      } else if (ntok >= 2 && qflag[1] == 0 && tolower(tok[1]) == "doctor") {
+        if (ntok == 2 && qflag[2] == 0 && tok[2] == "--clean-shadow") {
+          print "{\"action\":\"doctor\",\"clean_shadow\":true}"
+          finish_ok()
+        }
+        json_error("Unknown arguments for doctor (expected /loop doctor or /loop doctor --clean-shadow)")
+      } else if (ntok == 2 && qflag[1] == 0 && tok[1] == "--clean-shadow" && qflag[2] == 0 && tolower(tok[2]) == "doctor") {
+        print "{\"action\":\"doctor\",\"clean_shadow\":true}"
+        finish_ok()
       } else if (ntok == 2 && qflag[1] == 0) {
         w1 = tolower(tok[1])
         if (w1 == "stop" || w1 == "cancel") {
@@ -831,9 +844,128 @@ inspect_skills_json() {
   ' "$_sj"
 }
 
+emit_json_error() {
+  POSIXLY_CORRECT=1 LC_ALL=C awk '
+    function init_tables(    i, c) {
+      esc["\""] = "\\\""
+      esc["\\"] = "\\\\"
+      esc["\b"] = "\\b"
+      esc["\f"] = "\\f"
+      esc["\n"] = "\\n"
+      esc["\r"] = "\\r"
+      esc["\t"] = "\\t"
+      for (i = 1; i < 32; i++) {
+        c = sprintf("%c", i)
+        if (!(c in esc)) {
+          esc[c] = sprintf("\\u%04x", i)
+        }
+      }
+    }
+    function json_escape(s,    i, n, ch, out) {
+      out = ""
+      n = length(s)
+      for (i = 1; i <= n; i++) {
+        ch = substr(s, i, 1)
+        if (ch in esc) out = out esc[ch]
+        else out = out ch
+      }
+      return out
+    }
+    BEGIN {
+      init_tables()
+      printf "{\"error\":\"%s\"}\n", json_escape(ARGV[2])
+      exit 2
+    }
+  ' SENTINEL "$1"
+}
+
+move_shadow_path() {
+  _src="$1"
+  _dest="$2"
+  mkdir -p "$(dirname -- "$_dest")"
+  if ! mv "$_src" "$_dest" 2>/dev/null; then
+    cp -RPp "$_src" "$_dest"
+    rm -rf "$_src"
+  fi
+}
+
 run_doctor() {
-  ws_dir="$(normalize_dir "${1:-$PWD}")"
+  clean_mode="$1"
+  shift
+
+  ws_arg=""
+  ws_set=0
+  for arg in "$@"; do
+    case "$arg" in
+      --clean-shadow)
+        clean_mode=1
+        ;;
+      -*)
+        emit_json_error "Unknown option for doctor: $arg"
+        ;;
+      *)
+        if [ "$ws_set" -eq 1 ]; then
+          emit_json_error "Unexpected extra argument for doctor: $arg"
+        fi
+        ws_arg="$arg"
+        ws_set=1
+        ;;
+    esac
+  done
+
+  ws_dir="$(normalize_dir "${ws_arg:-$PWD}")"
   home_dir="${HOME:-}"
+
+  c1=""
+  c2=""
+  c3=""
+  c4=""
+  backup_dir=""
+
+  if [ "$clean_mode" -eq 1 ] && [ -n "$home_dir" ]; then
+    p1="$home_dir/.gemini/config/skills/loop"
+    p2="$home_dir/.gemini/config/agents/loop-worker.md"
+    p3="$home_dir/.gemini/antigravity-cli/skills/loop"
+    p4="$home_dir/.gemini/skills/loop"
+
+    has_any_shadow=0
+    if [ -e "$p1" ] || [ -L "$p1" ]; then has_any_shadow=1; fi
+    if [ -e "$p2" ] || [ -L "$p2" ]; then has_any_shadow=1; fi
+    if [ -e "$p3" ] || [ -L "$p3" ]; then has_any_shadow=1; fi
+    if [ -e "$p4" ] || [ -L "$p4" ]; then has_any_shadow=1; fi
+
+    if [ "$has_any_shadow" -eq 1 ]; then
+      ts="$(date -u +%Y%m%d-%H%M%SZ)"
+      base_backup="$home_dir/.gemini/config/.agy-loop-backup-$ts"
+      backup_dir="$base_backup"
+      if [ -e "$backup_dir" ] || [ -L "$backup_dir" ]; then
+        backup_dir="${base_backup}-$$"
+        _seq=1
+        while [ -e "$backup_dir" ] || [ -L "$backup_dir" ]; do
+          backup_dir="${base_backup}-$$-${_seq}"
+          _seq=$((_seq + 1))
+        done
+      fi
+      mkdir -p "$backup_dir"
+
+      if [ -e "$p1" ] || [ -L "$p1" ]; then
+        move_shadow_path "$p1" "$backup_dir/config/skills/loop"
+        c1="$p1"
+      fi
+      if [ -e "$p2" ] || [ -L "$p2" ]; then
+        move_shadow_path "$p2" "$backup_dir/config/agents/loop-worker.md"
+        c2="$p2"
+      fi
+      if [ -e "$p3" ] || [ -L "$p3" ]; then
+        move_shadow_path "$p3" "$backup_dir/antigravity-cli/skills/loop"
+        c3="$p3"
+      fi
+      if [ -e "$p4" ] || [ -L "$p4" ]; then
+        move_shadow_path "$p4" "$backup_dir/skills/loop"
+        c4="$p4"
+      fi
+    fi
+  fi
 
   s1=""
   s2=""
@@ -866,6 +998,7 @@ run_doctor() {
   fi
 
   LP_S1="$s1" LP_S2="$s2" LP_S3="$s3" LP_S4="$s4" \
+  LP_C1="$c1" LP_C2="$c2" LP_C3="$c3" LP_C4="$c4" LP_BACKUP_DIR="$backup_dir" \
   LP_WS_WARNS="$ws_warns" LP_GL_WARNS="$gl_warns" LP_ACTIVE="$active_md" \
   POSIXLY_CORRECT=1 LC_ALL=C awk '
     function init_tables(    i, c) {
@@ -916,19 +1049,37 @@ run_doctor() {
       if (ENVIRON["LP_S3"] != "") shadows[++sc] = ENVIRON["LP_S3"]
       if (ENVIRON["LP_S4"] != "") shadows[++sc] = ENVIRON["LP_S4"]
 
+      cc = 0
+      if (ENVIRON["LP_C1"] != "") cleaned[++cc] = ENVIRON["LP_C1"]
+      if (ENVIRON["LP_C2"] != "") cleaned[++cc] = ENVIRON["LP_C2"]
+      if (ENVIRON["LP_C3"] != "") cleaned[++cc] = ENVIRON["LP_C3"]
+      if (ENVIRON["LP_C4"] != "") cleaned[++cc] = ENVIRON["LP_C4"]
+
       wc = 0
       add_lines(ENVIRON["LP_WS_WARNS"])
       add_lines(ENVIRON["LP_GL_WARNS"])
 
       ok = (sc == 0 && wc == 0) ? "true" : "false"
       act = ENVIRON["LP_ACTIVE"]
+      bdir = ENVIRON["LP_BACKUP_DIR"]
 
       printf "{\"ok\":%s,\"shadows\":[", ok
       for (i = 1; i <= sc; i++) {
         if (i > 1) printf ","
         printf "\"%s\"", json_escape(shadows[i])
       }
-      printf "],\"skill_filter_warnings\":["
+      printf "],\"cleaned_shadows\":["
+      for (i = 1; i <= cc; i++) {
+        if (i > 1) printf ","
+        printf "\"%s\"", json_escape(cleaned[i])
+      }
+      printf "],\"backup_dir\":"
+      if (bdir != "") {
+        printf "\"%s\"", json_escape(bdir)
+      } else {
+        printf "null"
+      }
+      printf ",\"skill_filter_warnings\":["
       for (i = 1; i <= wc; i++) {
         if (i > 1) printf ","
         printf "\"%s\"", json_escape(warns[i])
@@ -945,21 +1096,34 @@ run_doctor() {
   '
 }
 
-case "$SUBCMD" in
-  parse)
-    run_parse "$@"
-    ;;
-  resolve-task)
-    run_resolve_task "$@"
-    ;;
-  doctor)
-    run_doctor "$@"
-    ;;
-  help|--help|-h|"")
-    printf '%s\n' '{"usage":"loop-helper.sh <parse|resolve-task|doctor> [args...]"}'
+run_session_start() {
+  home_dir="${HOME:-}"
+  s1=""
+  s2=""
+  s3=""
+  s4=""
+  if [ -n "$home_dir" ]; then
+    p1="$home_dir/.gemini/config/skills/loop"
+    p2="$home_dir/.gemini/config/agents/loop-worker.md"
+    p3="$home_dir/.gemini/antigravity-cli/skills/loop"
+    p4="$home_dir/.gemini/skills/loop"
+    if [ -e "$p1" ] || [ -L "$p1" ]; then s1="$p1"; fi
+    if [ -e "$p2" ] || [ -L "$p2" ]; then s2="$p2"; fi
+    if [ -e "$p3" ] || [ -L "$p3" ]; then s3="$p3"; fi
+    if [ -e "$p4" ] || [ -L "$p4" ]; then s4="$p4"; fi
+  fi
+
+  # Fast-path (<5ms): 0 forks if TTY, pure drain + "{}" when clean (0 tokens, 0 UI noise)
+  if [ -z "$s1$s2$s3$s4" ]; then
+    if [ ! -t 0 ]; then
+      cat >/dev/null
+    fi
+    printf '{}\n'
     exit 0
-    ;;
-  *)
+  fi
+
+  emit_session_hook_json() {
+    LP_S1="$s1" LP_S2="$s2" LP_S3="$s3" LP_S4="$s4" LP_PWD="$PWD" \
     POSIXLY_CORRECT=1 LC_ALL=C awk '
       function init_tables(    i, c) {
         esc["\""] = "\\\""
@@ -976,6 +1140,7 @@ case "$SUBCMD" in
           }
         }
       }
+
       function json_escape(s,    i, n, ch, out) {
         out = ""
         n = length(s)
@@ -986,11 +1151,164 @@ case "$SUBCMD" in
         }
         return out
       }
+
+      function norm_ws(p) {
+        if (p == "") p = ENVIRON["LP_PWD"]
+        while (length(p) > 1 && substr(p, length(p), 1) == "/") {
+          p = substr(p, 1, length(p) - 1)
+        }
+        return p
+      }
+
       BEGIN {
         init_tables()
-        printf "{\"error\":\"Unknown subcommand: %s\"}\n", json_escape(ARGV[2])
-        exit 2
+        raw = ""
       }
-    ' SENTINEL "$SUBCMD"
+
+      {
+        raw = (NR == 1) ? $0 : (raw "\n" $0)
+      }
+
+      END {
+        n = length(raw)
+        i = 1
+        ntk = 0
+        while (i <= n) {
+          ch = substr(raw, i, 1)
+          if (ch == " " || ch == "\t" || ch == "\r" || ch == "\n") {
+            i++
+            continue
+          }
+          if (ch == "\"") {
+            sval = ""
+            i++
+            while (i <= n) {
+              sc = substr(raw, i, 1)
+              if (sc == "\\" && i < n) {
+                nx = substr(raw, i + 1, 1)
+                if (nx == "n") sval = sval "\n"
+                else if (nx == "r") sval = sval "\r"
+                else if (nx == "t") sval = sval "\t"
+                else sval = sval nx
+                i += 2
+                continue
+              }
+              if (sc == "\"") {
+                i++
+                break
+              }
+              sval = sval sc
+              i++
+            }
+            ntk++
+            tk_type[ntk] = "STR"
+            tk_val[ntk] = sval
+            continue
+          }
+          if (ch == ":" || ch == "[" || ch == "]" || ch == "{" || ch == "}" || ch == ",") {
+            ntk++
+            tk_type[ntk] = "SYM"
+            tk_val[ntk] = ch
+            i++
+            continue
+          }
+          j = i
+          while (j <= n) {
+            c2 = substr(raw, j, 1)
+            if (c2 == " " || c2 == "\t" || c2 == "\r" || c2 == "\n" || c2 == "\"" || c2 == ":" || c2 == "[" || c2 == "]" || c2 == "{" || c2 == "}" || c2 == ",") {
+              break
+            }
+            j++
+          }
+          ntk++
+          tk_type[ntk] = "LIT"
+          tk_val[ntk] = substr(raw, i, j - i)
+          i = j
+        }
+
+        ws_cwd = ""
+        ws_root = ""
+        ws_first = ""
+        for (k = 1; k <= ntk - 2; k++) {
+          if (tk_type[k] == "STR" && tk_type[k + 1] == "SYM" && tk_val[k + 1] == ":") {
+            if (tk_val[k] == "cwd" && tk_type[k + 2] == "STR" && ws_cwd == "") {
+              ws_cwd = tk_val[k + 2]
+            } else if (tk_val[k] == "workspaceRoot" && tk_type[k + 2] == "STR" && ws_root == "") {
+              ws_root = tk_val[k + 2]
+            } else if (tk_val[k] == "workspacePaths" && tk_type[k + 2] == "SYM" && tk_val[k + 2] == "[" && k + 3 <= ntk && tk_type[k + 3] == "STR" && ws_first == "") {
+              ws_first = tk_val[k + 3]
+            }
+          }
+        }
+
+        ws = ws_cwd
+        if (ws == "") ws = ws_root
+        if (ws == "") ws = ws_first
+        ws = norm_ws(ws)
+
+        sc = 0
+        if (ENVIRON["LP_S1"] != "") shadows[++sc] = ENVIRON["LP_S1"]
+        if (ENVIRON["LP_S2"] != "") shadows[++sc] = ENVIRON["LP_S2"]
+        if (ENVIRON["LP_S3"] != "") shadows[++sc] = ENVIRON["LP_S3"]
+        if (ENVIRON["LP_S4"] != "") shadows[++sc] = ENVIRON["LP_S4"]
+
+        inline_list = ""
+        md_bullets = ""
+        for (m = 1; m <= sc; m++) {
+          if (m > 1) inline_list = inline_list ", "
+          inline_list = inline_list shadows[m]
+          md_bullets = md_bullets "> - `" shadows[m] "`\n"
+        }
+
+        sys_msg = "[agy-loop] Shadow warning (workspace: " ws "): Pre-existing user-level customization path(s) (" inline_list ") take higher discovery precedence than plugins and shadow loop-worker and/or /loop (forcing stale loop-worker tools even when invoking /agy-loop:loop). Explain this collision and offer to archive them non-destructively via `sh ~/.gemini/config/plugins/agy-loop/install.sh --clean-shadow` (followed by `/skills reload`) or `/agy-loop:loop doctor --clean-shadow`."
+
+        user_md = "> [!WARNING]\n" \
+          "> **AGY Loop (`agy-loop`): Local Shadow Customization(s) Detected**\n" \
+          "> Pre-existing user-level file(s) take precedence over plugins and shadow `loop-worker` and/or `/loop` (even under `/agy-loop:loop`):\n" \
+          md_bullets \
+          ">\n" \
+          "> Archive them non-destructively into `~/.gemini/config/.agy-loop-backup-<timestamp>/` with one command:\n" \
+          "> ```sh\n" \
+          "> sh ~/.gemini/config/plugins/agy-loop/install.sh --clean-shadow\n" \
+          "> ```\n" \
+          "> Then run `/skills reload` (or run `/agy-loop:loop doctor --clean-shadow` right here in chat)."
+
+        printf "{\"injectSteps\":[{\"systemMessage\":{\"systemMessage\":\"%s\",\"metadata\":{\"user_markdown\":\"%s\"}}}]}\n",
+          json_escape(sys_msg),
+          json_escape(user_md)
+        exit 0
+      }
+    '
+  }
+
+  if [ ! -t 0 ]; then
+    emit_session_hook_json
+  else
+    emit_session_hook_json </dev/null
+  fi
+}
+
+case "$SUBCMD" in
+  parse)
+    run_parse "$@"
+    ;;
+  resolve-task)
+    run_resolve_task "$@"
+    ;;
+  doctor)
+    run_doctor 0 "$@"
+    ;;
+  clean-shadow)
+    run_doctor 1 "$@"
+    ;;
+  session-start)
+    run_session_start "$@"
+    ;;
+  help|--help|-h|"")
+    printf '%s\n' '{"usage":"loop-helper.sh <parse|resolve-task|doctor|clean-shadow|session-start> [args...]"}'
+    exit 0
+    ;;
+  *)
+    emit_json_error "Unknown subcommand: $SUBCMD"
     ;;
 esac

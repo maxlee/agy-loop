@@ -1,11 +1,11 @@
 ---
 name: loop
-description: "Schedules non-blocking recurring prompts, CI/PR babysitting, one-shot delayed check-ins, and live-reloading loop.md maintenance loops using native schedule timers and isolated background subagents. Use when the user invokes /loop or /agy-loop:loop, clicks a Marketplace starter prompt, asks to poll or monitor builds/PRs/deploys on a fixed interval or adaptive backoff, or runs /loop status, /loop stop, or /loop doctor."
+description: "Schedules non-blocking recurring prompts, CI/PR babysitting, one-shot delayed check-ins, and live-reloading loop.md maintenance loops using native schedule timers and isolated background subagents. Use when the user invokes /agy-loop:loop (or standalone /loop), clicks a Marketplace starter prompt, asks to poll or monitor builds/PRs/deploys on a fixed interval or adaptive backoff, or runs /agy-loop:loop status, stop, doctor, or help."
 ---
 
-# `/loop` Non-Blocking Subagent Scheduler (`agy-loop`)
+# `/agy-loop:loop` Non-Blocking Subagent Scheduler (`agy-loop`)
 
-Act as a **non-blocking Loop Orchestrator** whenever the user invokes `/loop` or `/agy-loop:loop` (or when awakened by a `[LOOP_WAKEUP]` timer/cron notification or a returning loop subagent).
+Act as a **non-blocking Loop Orchestrator** whenever the user invokes `/agy-loop:loop` (or standalone `/loop`, or when awakened by a `[LOOP_WAKEUP]` timer/cron notification or a returning loop subagent).
 
 ## Core Non-Blocking Invariants
 
@@ -29,24 +29,24 @@ AGY_LOOP_ARGS
 - If `loop-helper.sh` exits with code `2` (`{"error":"..."}`), report the validation error concisely and stop.
 - Handle lifecycle actions immediately without starting a loop:
 
-### 1. `{"action":"status"}` (`/loop status` or `/loop list`)
+### 1. `{"action":"status"}` (`/agy-loop:loop status` or `list`)
 1. Call `manage_task(Action="list")` to inspect active `schedule` timers and cron jobs.
 2. Call `manage_subagents(Action="list")` to inspect `Running` or `Idle` `loop-worker` / loop `self` subagents.
-3. Present a concise status summary showing active loop `TaskId`s, cadence/mode, iteration progress, and active/idle subagent `ConversationId`s (or state that no `/loop` tasks are currently active).
+3. Present a concise status summary showing active loop `TaskId`s, cadence/mode, iteration progress, and active/idle subagent `ConversationId`s (or state that no `/agy-loop:loop` tasks are currently active).
 
-### 2. `{"action":"stop","target":"all"|<id>}` (`/loop stop [id|all|--all]`, `/loop cancel [id|all]`, or conversational stop)
-1. Call `manage_task(Action="list")` and call `manage_task(Action="kill", TaskId=...)` on matching `/loop` timer/cron schedules (or the specific `<target>` `TaskId`).
+### 2. `{"action":"stop","target":"all"|<id>}` (`/agy-loop:loop stop [id|all|--all]`, `cancel`, or conversational stop)
+1. Call `manage_task(Action="list")` and call `manage_task(Action="kill", TaskId=...)` on matching loop timer/cron schedules (or the specific `<target>` `TaskId`).
 2. Call `manage_subagents(Action="list")`:
    - If the user asked to stop *after* the current pass finishes, leave a `Running` worker alone and stop once it reports back.
    - Otherwise, call `manage_subagents(Action="kill", ConversationIds=[...])` on active or `Idle` loop subagents. *(Caution: killing a `Workspace: "branch"` / `--worktree` subagent deletes its temporary worktree — surface any unmerged branch/diff info first if needed.)*
 3. Confirm all cancelled `TaskId`s and subagents in one concise message.
 
-### 3. `{"action":"doctor"}` (`/loop doctor`)
-1. Run `sh "<skill_dir>/scripts/loop-helper.sh" doctor "<workspace_dir>"`.
-2. Report `ok`, any user-level shadow paths overriding the plugin (`~/.gemini/config/skills/loop`, `~/.gemini/config/agents/loop-worker.md`, `~/.gemini/antigravity-cli/skills/loop`, `~/.gemini/skills/loop` — recommend `npx agy-loop install --clean-shadow` if present), any `skills.json` `"include_only"` / `"exclude"` filter warnings, and the active `loop.md` path (inspect with `read_file` / `view_file` if requested).
+### 3. `{"action":"doctor"}` or `{"action":"doctor","clean_shadow":true}` (`/agy-loop:loop doctor [--clean-shadow]`)
+1. If `"clean_shadow": true`, run `sh "<skill_dir>/scripts/loop-helper.sh" doctor --clean-shadow "<workspace_dir>"` to non-destructively move any shadowing user-level customizations into `~/.gemini/config/.agy-loop-backup-<UTC-timestamp>/`. Report `cleaned_shadows`, `backup_dir`, resulting `ok` status, and **remind the user to run `/skills reload`** so the current session picks up the unshadowed plugin skill and `loop-worker` subagent.
+2. Otherwise, run `sh "<skill_dir>/scripts/loop-helper.sh" doctor "<workspace_dir>"` and report `ok`, any user-level shadow paths overriding the plugin (`~/.gemini/config/skills/loop`, `~/.gemini/config/agents/loop-worker.md`, `~/.gemini/antigravity-cli/skills/loop`, `~/.gemini/skills/loop` — recommend `/agy-loop:loop doctor --clean-shadow`, `sh ~/.gemini/config/plugins/agy-loop/install.sh --clean-shadow`, or `npx agy-loop doctor --clean-shadow` followed by `/skills reload`), any `skills.json` `"include_only"` / `"exclude"` filter warnings, and the active `loop.md` path (inspect with `read_file` / `view_file` if requested).
 
-### 4. `{"action":"help"}` (`/loop help`, `/loop --help`, or `/loop -h`)
-Print a concise usage summary of `/loop` (5 modes: fixed interval `/loop 30s <task>` or `<task> every 5m`, dynamic self-paced `/loop <task>`, live-reloading `loop.md` `/loop` or `/loop 15m`, delayed one-shot `/loop in 20m <task>` or `--once`, and lifecycle `/loop status|stop|doctor|help`; plus flags `--max <N>`, `--stateful`, `--worktree`, `--share`, `--model <inherit|flash_lite|flash|pro>`, `--self`, `--cron`, `--exact`, `--daemon`, `--once`) and end your turn without dispatching a worker.
+### 4. `{"action":"help"}` (`/agy-loop:loop help`, `--help`, or `-h`)
+Print a concise usage summary of `/agy-loop:loop` (5 modes: fixed interval `/agy-loop:loop 30s <task>` or `<task> every 5m`, dynamic self-paced `/agy-loop:loop <task>`, live-reloading `loop.md` `/agy-loop:loop` or `/agy-loop:loop 15m`, delayed one-shot `/agy-loop:loop in 20m <task>` or `--once`, and lifecycle `/agy-loop:loop status|stop|doctor [--clean-shadow]|help`; plus flags `--max <N>`, `--stateful`, `--worktree`, `--share`, `--model <inherit|flash_lite|flash|pro>`, `--self`, `--cron`, `--exact`, `--daemon`, `--once`) and end your turn without dispatching a worker.
 
 ---
 

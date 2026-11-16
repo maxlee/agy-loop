@@ -1,19 +1,21 @@
-# `/loop` Recipes, `.agents/loop.md` Templates & CLI TUI Controls
+# `/agy-loop:loop` Recipes, `.agents/loop.md` Templates & CLI TUI Controls
 
-Progressive-disclosure reference for `skills/loop/SKILL.md` (`agy-loop`). Load this file via `read_file` or `view_file` only when the user asks for `.agents/loop.md` starter templates, advanced `/loop` recipes, or interactive CLI controls.
+Progressive-disclosure reference for `skills/loop/SKILL.md` (`agy-loop`). Load this file via `read_file` or `view_file` only when the user asks for `.agents/loop.md` starter templates, advanced `/agy-loop:loop` recipes, or interactive CLI controls.
+
+> **Why `/agy-loop:loop`?** Antigravity native plugins namespace bundled skills as `/<plugin>:<skill>` across Desktop Marketplace and CLI (`agy`), avoiding writes outside the plugin bundle (`~/.gemini/config/skills/`).
 
 ---
 
 ## 1. Ready-to-Use `.agents/loop.md` Templates
 
-When `/loop` or `/loop <interval>` is invoked without an inline prompt, `skills/loop/scripts/loop-helper.sh resolve-task` evaluates files on **every wake-up** (up to `25,000` bytes) in strict priority order:
+When `/agy-loop:loop` or `/agy-loop:loop <interval>` is invoked without an inline prompt, `skills/loop/scripts/loop-helper.sh resolve-task` evaluates files on **every wake-up** (up to `25,000` bytes) in strict priority order:
 
 1. `<workspace>/.agents/loop.md` — Team or repository-specific loop policy (commit to git or gitignore per preference)
 2. `<workspace>/loop.md` — Workspace root loop policy
 3. `~/.gemini/config/loop.md` — Personal global fallback across repositories
 4. Built-in branch, incremental test, and PR maintenance fallback
 
-Live edits to any `loop.md` file take effect automatically on the next scheduled tick without restarting `/loop`.
+Live edits to any `loop.md` file take effect automatically on the next scheduled tick without restarting `/agy-loop:loop`.
 
 ### Template A: PR Babysitter & CI Healer (`.agents/loop.md`)
 
@@ -56,58 +58,58 @@ Live edits to any `loop.md` file take effect automatically on the next scheduled
 
 ---
 
-## 2. Advanced `/loop` Recipes
+## 2. Advanced `/agy-loop:loop` Recipes
 
 ### Sub-Minute Local Service / Health Readiness (`DurationSeconds`)
 Beats 1-minute cron floors using non-overlapping one-shot timers:
 ```text
-/loop 20s "curl -fsS http://localhost:8080/healthz && curl -fsS http://localhost:8080/readyz" --max 15
+/agy-loop:loop 20s "curl -fsS http://localhost:8080/healthz && curl -fsS http://localhost:8080/readyz" --max 15
 ```
 
 ### Multi-Turn Stateful Bug Hunting (`--stateful`)
 Re-awakens the same `Idle` `loop-worker` via `send_message` so hypotheses ruled out in Iteration #1 are remembered in Iteration #2 without bloating main chat:
 ```text
-/loop check cargo test and fix intermittent race condition in worker_pool --stateful --max 10
+/agy-loop:loop check cargo test and fix intermittent race condition in worker_pool --stateful --max 10
 ```
 
 ### Risk-Free Experimental Fix in an Isolated Git Worktree (`--worktree`)
 Runs inside `Workspace: "branch"` so uncommitted edits in your active terminal remain untouched while you keep coding or chatting:
 ```text
-/loop 5m refactor flaky integration test in tests/sync.spec.ts until green --worktree --stateful --max 8
+/agy-loop:loop 5m refactor flaky integration test in tests/sync.spec.ts until green --worktree --stateful --max 8
 ```
 
 ### Delegating to Nested Slash Skills or MCP Tools (`--self` or `/skill`)
 Prompts starting with `/` (or passing `--self`) automatically route to the built-in `self` subagent instead of `loop-worker`:
 ```text
-/loop 30m /check
-/loop check Sentry MCP errors for release v2.4.0 and summarize regressions --self --max 12
+/agy-loop:loop 30m /check
+/agy-loop:loop check Sentry MCP errors for release v2.4.0 and summarize regressions --self --max 12
 ```
 
 ### Exact Wall-Clock Recurring Cron (`--cron --exact`)
 Opts into 5-field `CronExpression` when wall-clock alignment (`*/15 * * * *`, `0 * * * *`) is preferred over completion-chained timers:
 ```text
-/loop 15m check staging deployment metrics --cron --exact --max 16
+/agy-loop:loop 15m check staging deployment metrics --cron --exact --max 16
 ```
 
 ### Delayed One-Shot Check-In (`in <delay>` or `--once`)
 Sleeps non-blockingly first, runs a single isolated pass when the timer triggers, reports, and exits:
 ```text
-/loop in 25m verify canary rollout metrics and error budget
-/loop --once 10m check if docker multi-arch build finished
+/agy-loop:loop in 25m verify canary rollout metrics and error budget
+/agy-loop:loop --once 10m check if docker multi-arch build finished
 ```
 
 ---
 
 ## 3. Interactive Antigravity CLI (`agy`) TUI Controls
 
-While `/loop` runs asynchronously in the background, users have full interactive control from the `agy` TUI in addition to `/loop status` and `/loop stop`:
+While `/agy-loop:loop` runs asynchronously in the background, users have full interactive control from the `agy` TUI in addition to `/agy-loop:loop status` and `/agy-loop:loop stop`:
 
 | Control | Where to Use | Effect |
 | :--- | :--- | :--- |
-| `/loop status` | Main chat prompt | Lists active `schedule` timers/crons (`manage_task`) and `Running`/`Idle` loop subagents (`manage_subagents`). |
-| `/loop stop [id\|all]` | Main chat prompt | Programmatically cancels active loop schedules and terminates loop subagents. |
-| `/loop doctor` | Main chat prompt | Checks shadow files in `~/.gemini/...`, `skills.json` `include_only`/`exclude` filters, and active `loop.md` path. |
-| `/loop help` | Main chat prompt | Prints concise `/loop` modes, flags, and lifecycle reference without starting a loop. |
+| `/agy-loop:loop status` | Main chat prompt | Lists active `schedule` timers/crons (`manage_task`) and `Running`/`Idle` loop subagents (`manage_subagents`). |
+| `/agy-loop:loop stop [id\|all]` | Main chat prompt | Programmatically cancels active loop schedules and terminates loop subagents. |
+| `/agy-loop:loop doctor [--clean-shadow]` | Main chat prompt | Checks shadow files in `~/.gemini/...` (and optionally backs them up), `skills.json` filters, and active `loop.md`. |
+| `/agy-loop:loop help` | Main chat prompt | Prints concise `/agy-loop:loop` modes, flags, and lifecycle reference without starting a loop. |
 | `/tasks` -> `k` | `agy` TUI panel | Opens background task manager; highlight a scheduled timer or cron job and press `k` to kill future wake-ups (`x` removes finished entries). |
 | `/agents` -> `k` | `agy` TUI panel | Opens subagent manager; highlight a `Running` or `Idle` `loop-worker` and press `k` to terminate it immediately (cleans up temporary `--worktree` branches). |
 | `/agents` -> `Enter` | `agy` TUI panel | Inspect the isolated subagent's private reasoning and command transcript (`Esc` returns to main chat). |

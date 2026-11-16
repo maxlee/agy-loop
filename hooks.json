@@ -1,0 +1,11 @@
+{
+  "agy-loop-shadow-check": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "sh ./skills/loop/scripts/loop-helper.sh session-start",
+        "timeout": 5
+      }
+    ]
+  }
+}

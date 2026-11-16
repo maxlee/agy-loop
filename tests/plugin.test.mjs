@@ -125,7 +125,7 @@ if (args[0] === "plugin" && args[1] === "list" && args.includes("--json")) {
         {
           name: "agy-loop",
           enabled: true,
-          version: "0.1.0",
+          version: "1.0.0",
           source: "antigravity",
           path: \`\${process.env.HOME}/.gemini/config/plugins/agy-loop\`,
           skills: ["loop"],
@@ -255,6 +255,11 @@ test("plugin.json, package.json, and assets/logo.svg satisfy strict schema and p
   for (const prompt of pluginJson.suggestedPrompts) {
     assert.equal(typeof prompt, "string");
     assert.ok(prompt.trim().length > 0);
+    assert.match(
+      prompt,
+      /^\/agy-loop:loop\b/,
+      `suggestedPrompt '${prompt}' should use the plugin-namespaced '/agy-loop:loop' command`
+    );
   }
 
   assert.equal(packageJson.name, pluginJson.name);
@@ -267,6 +272,10 @@ test("plugin.json, package.json, and assets/logo.svg satisfy strict schema and p
   assert.equal(packageJson.engines?.node, ">=18");
   assert.equal(packageJson.bin?.["agy-loop"], "./bin/agy-loop.mjs");
   assert.equal(packageJson.dependencies, undefined, "Expected zero external dependencies");
+  assert.ok(
+    Array.isArray(packageJson.files) && packageJson.files.includes("hooks.json"),
+    'package.json "files" must include "hooks.json"'
+  );
 
   const svg = fs.readFileSync(logoPath, "utf8");
   assert.match(svg, /<svg\b[^>]*viewBox="0 0 128 128"/);
@@ -410,7 +419,9 @@ test(
 
     const docCmdRes = runHelper(["parse", "doctor"]);
     assert.equal(docCmdRes.status, 0, docCmdRes.stderr);
-    assert.deepEqual(JSON.parse(docCmdRes.stdout), { action: "doctor" });
+    const docCmdParsed = JSON.parse(docCmdRes.stdout);
+    assert.equal(docCmdParsed.action, "doctor");
+    assert.ok(!docCmdParsed.clean_shadow);
 
     // 2. Fixed sub-minute interval
     const fixed30s = JSON.parse(runHelper(["parse", "/loop 30s check local build"]).stdout);
@@ -661,6 +672,45 @@ test("bin/agy-loop.mjs handles install, --clean-shadow, doctor --json, validate,
   assert.equal(docOk.ok, true);
   assert.deepEqual(docOk.shadows, []);
 
+  // 4b. doctor --clean-shadow --json (and human-readable status --clean-shadow) cleans shadows directly
+  fs.mkdirSync(shadowSkillDir, { recursive: true });
+  fs.writeFileSync(path.join(shadowSkillDir, "SKILL.md"), "re-seeded shadow skill\n");
+  fs.mkdirSync(path.dirname(shadowAgentFile), { recursive: true });
+  fs.writeFileSync(shadowAgentFile, "re-seeded shadow agent\n");
+
+  const docCleanJsonRes = runCli(["doctor", "--clean-shadow", "--json"]);
+  assert.equal(docCleanJsonRes.status, 0, docCleanJsonRes.stderr);
+  const docClean = JSON.parse(docCleanJsonRes.stdout);
+  assert.equal(docClean.ok, true);
+  assert.ok(docClean.backupDir && docClean.backupDir.includes(".agy-loop-backup-"));
+  assert.equal(docClean.cleanedShadows.length, 2);
+  assert.deepEqual(docClean.shadows, []);
+  assert.equal(fs.existsSync(shadowSkillDir), false);
+  assert.equal(fs.existsSync(shadowAgentFile), false);
+  assert.equal(
+    fs.readFileSync(
+      path.join(docClean.backupDir, "config", "skills", "loop", "SKILL.md"),
+      "utf8"
+    ),
+    "re-seeded shadow skill\n"
+  );
+  assert.equal(
+    fs.readFileSync(
+      path.join(docClean.backupDir, "config", "agents", "loop-worker.md"),
+      "utf8"
+    ),
+    "re-seeded shadow agent\n"
+  );
+
+  // Human-readable doctor --clean-shadow reminds about /skills reload
+  fs.mkdirSync(shadowSkillDir, { recursive: true });
+  fs.writeFileSync(path.join(shadowSkillDir, "SKILL.md"), "human shadow skill\n");
+  const docCleanHumanRes = runCli(["doctor", "--clean-shadow"]);
+  assert.equal(docCleanHumanRes.status, 0, docCleanHumanRes.stderr);
+  assert.match(docCleanHumanRes.stdout, /\/skills reload/);
+  assert.match(docCleanHumanRes.stdout, /shadow files:\s+none/);
+  assert.equal(fs.existsSync(shadowSkillDir), false);
+
   // 5. validate --json
   const valRes = runCli(["validate", "--json"]);
   assert.equal(valRes.status, 0);
@@ -908,9 +958,271 @@ test("install.sh and uninstall.sh work in local, piped, --clean-shadow, and miss
   assert.match(missingUninstall.stderr, /not found in PATH/);
 });
 
+const hooksJsonPath = path.join(REPO_ROOT, "hooks.json");
 const realAgyProbe = spawnSync("agy", ["--version"], { encoding: "utf8" });
 const hasRealAgy = !realAgyProbe.error && realAgyProbe.status === 0;
 const hasFullPluginFiles = fs.existsSync(skillMdPath) && fs.existsSync(agentMdPath);
+
+test(
+  "installed plugin self-reinstall (--clean-shadow) via real 'agy plugin install' backs up shadows without self-copy crash",
+  {
+    skip: !hasRealAgy ? "real 'agy' CLI not on PATH" : false,
+  },
+  (t) => {
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "agy-loop-e2e-home-"));
+    const tmpHome = path.join(tmpRoot, "home");
+    const tmpWs = path.join(tmpRoot, "ws");
+    fs.mkdirSync(tmpHome, { recursive: true });
+    fs.mkdirSync(tmpWs, { recursive: true });
+
+    t.after(() => {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    });
+
+    const isolatedEnv = { ...process.env, HOME: tmpHome };
+    delete isolatedEnv.ANTIGRAVITY_LS_ADDRESS;
+    delete isolatedEnv.ANTIGRAVITY_CSRF_TOKEN;
+    assert.notEqual(isolatedEnv.HOME, REAL_HOME);
+
+    const shadowSkillDir = path.join(tmpHome, ".gemini", "config", "skills", "loop");
+    const shadowAgentFile = path.join(tmpHome, ".gemini", "config", "agents", "loop-worker.md");
+
+    const seedShadows = (tag) => {
+      fs.mkdirSync(shadowSkillDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(shadowSkillDir, "SKILL.md"),
+        `---\nname: loop\ndescription: "OLD_USER_SKILL_${tag}"\n---\nOld skill ${tag}\n`
+      );
+      fs.mkdirSync(path.dirname(shadowAgentFile), { recursive: true });
+      fs.writeFileSync(
+        shadowAgentFile,
+        `---\nname: loop-worker\ndescription: "OLD_USER_AGENT_${tag}"\nsubagent: true\nmainAgent: false\n---\nOld agent ${tag}\n`
+      );
+    };
+
+    seedShadows("A");
+
+    // 1. Install via real 'agy plugin install <REPO_ROOT>'
+    const installRes = spawnSync("agy", ["plugin", "install", REPO_ROOT], {
+      cwd: tmpWs,
+      env: isolatedEnv,
+      encoding: "utf8",
+    });
+    assert.equal(installRes.status, 0, `agy plugin install failed: ${installRes.stderr}`);
+
+    const installedDir = path.join(tmpHome, ".gemini", "config", "plugins", "agy-loop");
+    assert.equal(fs.existsSync(path.join(installedDir, "plugin.json")), true);
+    // Loose shadow files remain intact right after 'agy plugin install'
+    assert.equal(fs.existsSync(path.join(shadowSkillDir, "SKILL.md")), true);
+    assert.equal(fs.existsSync(shadowAgentFile), true);
+
+    // 2. Run installed copy's install.sh --clean-shadow (from inside installedDir)
+    const selfShRes = spawnSync("sh", [path.join(installedDir, "install.sh"), "--clean-shadow"], {
+      cwd: installedDir,
+      env: isolatedEnv,
+      encoding: "utf8",
+    });
+    assert.equal(
+      selfShRes.status,
+      0,
+      `installed install.sh --clean-shadow failed:\nstdout: ${selfShRes.stdout}\nstderr: ${selfShRes.stderr}`
+    );
+    assert.doesNotMatch(selfShRes.stderr, /same directory/i);
+    assert.equal(fs.existsSync(shadowSkillDir), false);
+    assert.equal(fs.existsSync(shadowAgentFile), false);
+
+    const configDir = path.join(tmpHome, ".gemini", "config");
+    const backupsAfterSh = fs
+      .readdirSync(configDir)
+      .filter((name) => name.startsWith(".agy-loop-backup-"));
+    assert.equal(backupsAfterSh.length, 1);
+    const shBackupDir = path.join(configDir, backupsAfterSh[0]);
+    assert.match(
+      fs.readFileSync(path.join(shBackupDir, "config", "skills", "loop", "SKILL.md"), "utf8"),
+      /OLD_USER_SKILL_A/
+    );
+    assert.match(
+      fs.readFileSync(path.join(shBackupDir, "config", "agents", "loop-worker.md"), "utf8"),
+      /OLD_USER_AGENT_A/
+    );
+
+    // 3. Re-seed shadows and run installed copy's bin/agy-loop.mjs install --clean-shadow --json
+    seedShadows("B");
+    const selfNodeRes = spawnSync(
+      process.execPath,
+      [path.join(installedDir, "bin", "agy-loop.mjs"), "install", "--clean-shadow", "--json"],
+      {
+        cwd: installedDir,
+        env: isolatedEnv,
+        encoding: "utf8",
+      }
+    );
+    assert.equal(
+      selfNodeRes.status,
+      0,
+      `installed agy-loop.mjs install --clean-shadow failed:\nstdout: ${selfNodeRes.stdout}\nstderr: ${selfNodeRes.stderr}`
+    );
+    const selfNodeJson = JSON.parse(selfNodeRes.stdout);
+    assert.equal(selfNodeJson.ok, true);
+    assert.equal(selfNodeJson.alreadyInPlace, true);
+    assert.equal(selfNodeJson.movedShadows.length, 2);
+    assert.deepEqual(selfNodeJson.shadows, []);
+    assert.match(
+      fs.readFileSync(
+        path.join(selfNodeJson.backupDir, "config", "skills", "loop", "SKILL.md"),
+        "utf8"
+      ),
+      /OLD_USER_SKILL_B/
+    );
+    assert.match(
+      fs.readFileSync(
+        path.join(selfNodeJson.backupDir, "config", "agents", "loop-worker.md"),
+        "utf8"
+      ),
+      /OLD_USER_AGENT_B/
+    );
+
+    // 4. Verify doctor --json on installed copy reports ok: true
+    const finalDocRes = spawnSync(
+      process.execPath,
+      [path.join(installedDir, "bin", "agy-loop.mjs"), "doctor", "--json"],
+      {
+        cwd: tmpWs,
+        env: isolatedEnv,
+        encoding: "utf8",
+      }
+    );
+    assert.equal(finalDocRes.status, 0, finalDocRes.stderr);
+    const finalDoc = JSON.parse(finalDocRes.stdout);
+    assert.equal(finalDoc.ok, true);
+    assert.equal(finalDoc.plugin.installed, true);
+    assert.deepEqual(finalDoc.shadows, []);
+  }
+);
+
+test(
+  "hooks.json SessionStart hook and loop-helper.sh session-start / doctor --clean-shadow work end-to-end",
+  {
+    skip: !fs.existsSync(hooksJsonPath)
+      ? "hooks.json not present yet"
+      : !fs.existsSync(helperShPath)
+        ? "loop-helper.sh not present yet"
+        : false,
+  },
+  (t) => {
+    const { home, workspace, envWithMockAgy } = makeSandbox(t);
+
+    const hooksConfig = JSON.parse(fs.readFileSync(hooksJsonPath, "utf8"));
+    assert.equal(typeof hooksConfig, "object");
+    const hookNames = Object.keys(hooksConfig);
+    assert.ok(hookNames.length >= 1, "hooks.json must define at least one named hook");
+
+    let sessionStartHandler = null;
+    for (const key of hookNames) {
+      const spec = hooksConfig[key];
+      if (spec && Array.isArray(spec.SessionStart) && spec.SessionStart.length > 0) {
+        sessionStartHandler = spec.SessionStart[0];
+        // SessionStart uses a flat handler array (not PreToolUse matcher wrapper)
+        assert.equal(
+          sessionStartHandler.matcher,
+          undefined,
+          "SessionStart handlers must be flat (no matcher wrapper)"
+        );
+        break;
+      }
+    }
+    assert.ok(sessionStartHandler, "hooks.json must register a SessionStart handler");
+    assert.equal(typeof sessionStartHandler.command, "string");
+    assert.match(sessionStartHandler.command, /session-start/);
+
+    const hookStdin = JSON.stringify({
+      conversationId: "00000000-0000-0000-0000-000000000001",
+      workspacePaths: [workspace],
+      hookEventName: "SessionStart",
+      cwd: workspace,
+    });
+
+    // 1. Clean HOME -> SessionStart outputs {} (zero injected steps, zero token cost)
+    const cleanHookRes = spawnSync("sh", ["-c", sessionStartHandler.command], {
+      cwd: REPO_ROOT,
+      env: { ...envWithMockAgy, PLUGIN_ROOT: REPO_ROOT },
+      input: hookStdin,
+      encoding: "utf8",
+    });
+    assert.equal(cleanHookRes.status, 0, cleanHookRes.stderr);
+    const cleanHookJson = JSON.parse(cleanHookRes.stdout);
+    assert.deepEqual(cleanHookJson, {});
+
+    // 2. Shadowed HOME -> SessionStart outputs injectSteps warning naming shadow paths & --clean-shadow
+    const shadowSkillDir = path.join(home, ".gemini", "config", "skills", "loop");
+    const shadowAgentFile = path.join(home, ".gemini", "config", "agents", "loop-worker.md");
+    fs.mkdirSync(shadowSkillDir, { recursive: true });
+    fs.writeFileSync(path.join(shadowSkillDir, "SKILL.md"), "shadow skill\n");
+    fs.mkdirSync(path.dirname(shadowAgentFile), { recursive: true });
+    fs.writeFileSync(shadowAgentFile, "shadow agent\n");
+
+    const warnHookRes = spawnSync("sh", ["-c", sessionStartHandler.command], {
+      cwd: REPO_ROOT,
+      env: { ...envWithMockAgy, PLUGIN_ROOT: REPO_ROOT },
+      input: hookStdin,
+      encoding: "utf8",
+    });
+    assert.equal(warnHookRes.status, 0, warnHookRes.stderr);
+    const warnHookJson = JSON.parse(warnHookRes.stdout);
+    assert.ok(
+      Array.isArray(warnHookJson.injectSteps) && warnHookJson.injectSteps.length >= 1,
+      "Expected non-empty injectSteps when shadow files exist"
+    );
+    const step0 = warnHookJson.injectSteps[0];
+    assert.ok(step0.systemMessage && typeof step0.systemMessage === "object");
+    const combinedText = `${step0.systemMessage.systemMessage || ""}\n${
+      step0.systemMessage.metadata?.user_markdown || ""
+    }`;
+    assert.match(combinedText, /--clean-shadow/);
+    assert.match(combinedText, /skills\/loop/);
+    assert.match(combinedText, /loop-worker\.md/);
+
+    // 3. loop-helper.sh parse "doctor --clean-shadow"
+    const parseCleanDoc = spawnSync("sh", [helperShPath, "parse", "doctor --clean-shadow"], {
+      cwd: workspace,
+      env: envWithMockAgy,
+      encoding: "utf8",
+    });
+    assert.equal(parseCleanDoc.status, 0, parseCleanDoc.stderr);
+    const parsedCleanDocJson = JSON.parse(parseCleanDoc.stdout);
+    assert.equal(parsedCleanDocJson.action, "doctor");
+    assert.equal(parsedCleanDocJson.clean_shadow, true);
+
+    // 4. loop-helper.sh doctor --clean-shadow <workspace> backs up both without collision
+    const helperCleanRes = spawnSync(
+      "sh",
+      [helperShPath, "doctor", "--clean-shadow", workspace],
+      {
+        cwd: workspace,
+        env: envWithMockAgy,
+        encoding: "utf8",
+      }
+    );
+    assert.equal(helperCleanRes.status, 0, helperCleanRes.stderr);
+    const helperCleanJson = JSON.parse(helperCleanRes.stdout);
+    assert.equal(helperCleanJson.ok, true);
+    assert.deepEqual(helperCleanJson.shadows, []);
+    assert.equal(helperCleanJson.cleaned_shadows.length, 2);
+    assert.ok(helperCleanJson.backup_dir && fs.existsSync(helperCleanJson.backup_dir));
+    assert.equal(fs.existsSync(shadowSkillDir), false);
+    assert.equal(fs.existsSync(shadowAgentFile), false);
+
+    // 5. After cleanup, SessionStart returns {} again
+    const postCleanHookRes = spawnSync("sh", ["-c", sessionStartHandler.command], {
+      cwd: REPO_ROOT,
+      env: { ...envWithMockAgy, PLUGIN_ROOT: REPO_ROOT },
+      input: hookStdin,
+      encoding: "utf8",
+    });
+    assert.equal(postCleanHookRes.status, 0, postCleanHookRes.stderr);
+    assert.deepEqual(JSON.parse(postCleanHookRes.stdout), {});
+  }
+);
 
 test(
   "live 'agy plugin validate --strict --json' passes with 0 findings",
@@ -935,5 +1247,8 @@ test(
     assert.deepEqual(report.findings, [], "Expected 0 warnings and 0 notes under --strict");
     assert.ok(report.components.skills >= 1, "Expected at least 1 compiled skill");
     assert.ok(report.components.agents >= 1, "Expected at least 1 compiled subagent");
+    if (fs.existsSync(hooksJsonPath)) {
+      assert.equal(report.components.hooks, 1, "Expected hooks: 1 when hooks.json is present");
+    }
   }
 );

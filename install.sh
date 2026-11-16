@@ -91,8 +91,27 @@ do
   fi
 done
 
-printf "==> Installing agy-loop via Antigravity CLI (%s)...\n" "$INSTALL_TARGET"
-agy plugin install "$INSTALL_TARGET"
+INSTALLED_PLUGIN_DIR="$HOME/.gemini/config/plugins/agy-loop"
+ALREADY_IN_PLACE=0
+if [ -d "$INSTALL_TARGET" ] && [ -d "$INSTALLED_PLUGIN_DIR" ]; then
+  SRC_REAL=$(CDPATH= cd -- "$INSTALL_TARGET" 2>/dev/null && pwd -P || true)
+  DST_REAL=$(CDPATH= cd -- "$INSTALLED_PLUGIN_DIR" 2>/dev/null && pwd -P || true)
+  if [ -n "$SRC_REAL" ] && [ "$SRC_REAL" = "$DST_REAL" ]; then
+    ALREADY_IN_PLACE=1
+  fi
+fi
+
+if [ "$ALREADY_IN_PLACE" -eq 1 ]; then
+  if [ ! -f "$INSTALLED_PLUGIN_DIR/plugin.json" ] || ! grep -Eq '"name"[[:space:]]*:[[:space:]]*"agy-loop"' "$INSTALLED_PLUGIN_DIR/plugin.json"; then
+    printf "Error: invalid or missing plugin.json in %s\n" "$INSTALLED_PLUGIN_DIR" >&2
+    exit 1
+  fi
+  agy plugin validate "$INSTALLED_PLUGIN_DIR" >/dev/null
+  printf "==> Verified agy-loop already installed at %s (skipping self-copy)...\n" "$INSTALLED_PLUGIN_DIR"
+else
+  printf "==> Installing agy-loop via Antigravity CLI (%s)...\n" "$INSTALL_TARGET"
+  agy plugin install "$INSTALL_TARGET"
+fi
 
 BACKUP_DIR=""
 if [ "$SHADOW_FOUND" -eq 1 ] && [ "$CLEAN_SHADOW" -eq 1 ]; then
@@ -134,11 +153,12 @@ elif [ "$SHADOW_FOUND" -eq 1 ]; then
     fi
   done
   printf "To archive them safely into ~/.gemini/config/.agy-loop-backup-<timestamp>/, re-run with --clean-shadow:\n" >&2
-  printf "  npx agy-loop install --clean-shadow\n" >&2
-  printf "  # or: curl -fsSL https://raw.githubusercontent.com/maxlee/agy-loop/main/install.sh | sh -s -- --clean-shadow\n\n" >&2
+  printf "  sh ~/.gemini/config/plugins/agy-loop/install.sh --clean-shadow\n" >&2
+  printf "  # or: npx agy-loop doctor --clean-shadow\n\n" >&2
 fi
 
 printf "==> Done! AGY Loop (agy-loop) is installed.\n"
+printf "    Run '/skills reload' in open 'agy' sessions, then invoke '/agy-loop:loop' (or '/agy-loop:loop help').\n"
 printf "    - If 'agy' is already open, run: /skills reload\n"
 printf "    - Try: /loop 1m check local build and tests\n"
 printf "    - Try: /loop check current PR CI status and fix failures --stateful\n"

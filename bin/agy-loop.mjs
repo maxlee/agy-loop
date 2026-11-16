@@ -13,9 +13,9 @@ const PLUGIN_ROOT = path.resolve(__dirname, "..");
 function readPluginVersion() {
   try {
     const raw = fs.readFileSync(path.join(PLUGIN_ROOT, "package.json"), "utf8");
-    return JSON.parse(raw).version || "0.1.0";
+    return JSON.parse(raw).version || "1.0.0";
   } catch {
-    return "0.1.0";
+    return "1.0.0";
   }
 }
 
@@ -29,6 +29,37 @@ function lstatExists(targetPath) {
     return true;
   } catch {
     return false;
+  }
+}
+
+function isSameDirectory(dirA, dirB) {
+  try {
+    return fs.realpathSync(dirA) === fs.realpathSync(dirB);
+  } catch {
+    return false;
+  }
+}
+
+function validateLocalManifest(pluginDir) {
+  const manifestPath = path.join(pluginDir, "plugin.json");
+  if (!lstatExists(manifestPath)) {
+    return { ok: false, error: `Missing plugin.json in ${pluginDir}` };
+  }
+  try {
+    const raw = fs.readFileSync(manifestPath, "utf8");
+    const parsed = JSON.parse(stripJsonc(raw));
+    if (!parsed || typeof parsed !== "object" || parsed.name !== "agy-loop") {
+      return {
+        ok: false,
+        error: `Invalid plugin.json in ${pluginDir}: expected "name": "agy-loop"`,
+      };
+    }
+    return { ok: true, manifest: parsed };
+  } catch (err) {
+    return {
+      ok: false,
+      error: `Failed to parse plugin.json in ${pluginDir}: ${err.message}`,
+    };
   }
 }
 
@@ -309,7 +340,7 @@ function movePathSafe(src, dest) {
   }
 }
 
-function backupShadowPaths(homeDir, shadows) {
+function backupShadowPaths(homeDir, shadows = detectShadowPaths(homeDir)) {
   const baseDir = path.join(homeDir, ".gemini", "config");
   fs.mkdirSync(baseDir, { recursive: true });
 
@@ -380,7 +411,7 @@ function emitMissingAgyError(jsonMode) {
 
 function printHelp(version) {
   process.stdout.write(`AGY Loop (agy-loop) v${version}
-Non-blocking /loop scheduler plugin for Antigravity CLI & Desktop.
+Non-blocking /agy-loop:loop scheduler plugin for Antigravity Desktop & CLI.
 
 Usage:
   agy-loop [command] [options]
@@ -402,6 +433,7 @@ Options:
 Examples:
   npx agy-loop
   npx agy-loop install --clean-shadow
+  npx agy-loop doctor --clean-shadow
   npx agy-loop doctor --json
   npx agy-loop uninstall
 `);
@@ -446,32 +478,83 @@ function parseCliArgs(argv) {
 function handleInstall({ cleanShadow, json, version }) {
   const homeDir = resolveHome();
   const workspaceDir = process.cwd();
+  const installedPluginDir = path.join(homeDir, ".gemini", "config", "plugins", "agy-loop");
 
   const probe = runAgy(["--version"]);
   if (!probe.found) {
     emitMissingAgyError(json);
   }
 
-  const installRes = runAgy(["plugin", "install", PLUGIN_ROOT]);
-  if (installRes.status !== 0) {
-    if (json) {
-      process.stdout.write(
-        `${JSON.stringify(
-          {
-            ok: false,
-            action: "install",
-            error: (installRes.stderr || installRes.stdout || "agy plugin install failed").trim(),
-            backupDir: null,
-          },
-          null,
-          2
-        )}\n`
-      );
-    } else {
-      if (installRes.stdout) process.stderr.write(installRes.stdout);
-      if (installRes.stderr) process.stderr.write(installRes.stderr);
+  const alreadyInPlace = isSameDirectory(PLUGIN_ROOT, installedPluginDir);
+  let installStdout = "";
+
+  if (alreadyInPlace) {
+    const manifestCheck = validateLocalManifest(PLUGIN_ROOT);
+    if (!manifestCheck.ok) {
+      if (json) {
+        process.stdout.write(
+          `${JSON.stringify(
+            {
+              ok: false,
+              action: "install",
+              error: manifestCheck.error,
+              backupDir: null,
+            },
+            null,
+            2
+          )}\n`
+        );
+      } else {
+        process.stderr.write(`Error: ${manifestCheck.error}\n`);
+      }
+      process.exit(1);
     }
-    process.exit(installRes.status || 1);
+
+    const valRes = runAgy(["plugin", "validate", PLUGIN_ROOT]);
+    if (valRes.status !== 0) {
+      const errMsg = (valRes.stderr || valRes.stdout || "agy plugin validate failed").trim();
+      if (json) {
+        process.stdout.write(
+          `${JSON.stringify(
+            {
+              ok: false,
+              action: "install",
+              error: errMsg,
+              backupDir: null,
+            },
+            null,
+            2
+          )}\n`
+        );
+      } else {
+        if (valRes.stdout) process.stderr.write(valRes.stdout);
+        if (valRes.stderr) process.stderr.write(valRes.stderr);
+      }
+      process.exit(valRes.status || 1);
+    }
+  } else {
+    const installRes = runAgy(["plugin", "install", PLUGIN_ROOT]);
+    if (installRes.status !== 0) {
+      if (json) {
+        process.stdout.write(
+          `${JSON.stringify(
+            {
+              ok: false,
+              action: "install",
+              error: (installRes.stderr || installRes.stdout || "agy plugin install failed").trim(),
+              backupDir: null,
+            },
+            null,
+            2
+          )}\n`
+        );
+      } else {
+        if (installRes.stdout) process.stderr.write(installRes.stdout);
+        if (installRes.stderr) process.stderr.write(installRes.stderr);
+      }
+      process.exit(installRes.status || 1);
+    }
+    installStdout = installRes.stdout || "";
   }
 
   let backupInfo = null;
@@ -491,7 +574,9 @@ function handleInstall({ cleanShadow, json, version }) {
           action: "install",
           version,
           pluginRoot: PLUGIN_ROOT,
+          alreadyInPlace,
           backupDir: backupInfo ? backupInfo.backupDir : null,
+          cleanedShadows: backupInfo ? backupInfo.moved.map((m) => m.from) : [],
           movedShadows: backupInfo ? backupInfo.moved : [],
           shadows: remainingShadows.map((s) => s.path),
           skillFilterWarnings,
@@ -503,10 +588,16 @@ function handleInstall({ cleanShadow, json, version }) {
     return;
   }
 
-  if (installRes.stdout.trim()) {
-    process.stdout.write(`${installRes.stdout.trim()}\n`);
+  if (installStdout.trim()) {
+    process.stdout.write(`${installStdout.trim()}\n`);
   }
-  process.stdout.write(`==> Installed agy-loop v${version} (${PLUGIN_ROOT})\n`);
+  if (alreadyInPlace) {
+    process.stdout.write(
+      `==> Verified agy-loop v${version} already installed at ${PLUGIN_ROOT} (skipped self-copy)\n`
+    );
+  } else {
+    process.stdout.write(`==> Installed agy-loop v${version} (${PLUGIN_ROOT})\n`);
+  }
 
   if (backupInfo && backupInfo.moved.length > 0) {
     process.stdout.write(
@@ -520,7 +611,9 @@ function handleInstall({ cleanShadow, json, version }) {
       process.stderr.write(`  - ${item.path}\n`);
     }
     process.stderr.write(
-      `To archive them into ~/.gemini/config/.agy-loop-backup-<timestamp>/ automatically, run:\n  npx agy-loop install --clean-shadow\n\n`
+      `To archive them into ~/.gemini/config/.agy-loop-backup-<timestamp>/ automatically, run:\n` +
+        `  npx agy-loop doctor --clean-shadow\n` +
+        `  # or: sh ~/.gemini/config/plugins/agy-loop/install.sh --clean-shadow\n\n`
     );
   }
 
@@ -535,9 +628,9 @@ function handleInstall({ cleanShadow, json, version }) {
   process.stdout.write(
     `==> Quickstart:\n` +
       `  1. If 'agy' is already open, run: /skills reload\n` +
-      `  2. Start a recurring loop:       /loop 1m check local build and tests\n` +
-      `  3. Start an adaptive CI loop:    /loop check current PR CI status and fix failures --stateful\n` +
-      `  4. Inspect or stop active loops: /loop status  |  /loop stop\n`
+      `  2. Start a recurring loop:       /agy-loop:loop 1m check local build and tests\n` +
+      `  3. Start an adaptive CI loop:    /agy-loop:loop check current PR CI status and fix failures --stateful\n` +
+      `  4. Inspect or stop active loops: /agy-loop:loop status  |  /agy-loop:loop stop\n`
   );
 }
 
@@ -619,7 +712,7 @@ function parsePluginListOutput(stdout) {
   return [];
 }
 
-function handleDoctor({ json, version }) {
+function handleDoctor({ cleanShadow = false, json, version }) {
   const homeDir = resolveHome();
   const workspaceDir = process.cwd();
 
@@ -641,6 +734,12 @@ function handleDoctor({ json, version }) {
     }
   } else {
     pluginListError = (listRes.stderr || listRes.stdout || "agy plugin list failed").trim();
+  }
+
+  let backupInfo = null;
+  const initialShadows = detectShadowPaths(homeDir);
+  if (cleanShadow && initialShadows.length > 0) {
+    backupInfo = backupShadowPaths(homeDir, initialShadows);
   }
 
   const shadows = detectShadowPaths(homeDir);
@@ -670,6 +769,9 @@ function handleDoctor({ json, version }) {
       path: pluginEntry?.path || null,
       error: pluginListError,
     },
+    backupDir: backupInfo ? backupInfo.backupDir : null,
+    cleanedShadows: backupInfo ? backupInfo.moved.map((m) => m.from) : [],
+    movedShadows: backupInfo ? backupInfo.moved : [],
     shadows: shadows.map((s) => s.path),
     skillFilterWarnings,
     loopMd: {
@@ -701,6 +803,18 @@ function handleDoctor({ json, version }) {
     process.stdout.write(`  plugin status:  not installed (run 'npx agy-loop install')\n`);
   }
 
+  if (backupInfo && backupInfo.moved.length > 0) {
+    process.stdout.write(
+      `  cleaned shadow: ${backupInfo.moved.length} archived to ${backupInfo.backupDir}\n`
+    );
+    for (const item of backupInfo.moved) {
+      process.stdout.write(`    - ${item.from}\n`);
+    }
+    process.stdout.write(
+      `  reload hint:    If 'agy' is currently open, run '/skills reload' to refresh skills and subagents.\n`
+    );
+  }
+
   if (shadows.length === 0) {
     process.stdout.write(`  shadow files:   none\n`);
   } else {
@@ -708,7 +822,9 @@ function handleDoctor({ json, version }) {
     for (const s of shadows) {
       process.stdout.write(`    - ${s.path}\n`);
     }
-    process.stdout.write(`    Fix: npx agy-loop install --clean-shadow\n`);
+    process.stdout.write(
+      `    Fix: npx agy-loop doctor --clean-shadow  (or: sh ~/.gemini/config/plugins/agy-loop/install.sh --clean-shadow)\n`
+    );
   }
 
   if (skillFilterWarnings.length === 0) {
@@ -774,7 +890,11 @@ function main() {
       break;
     case "doctor":
     case "status":
-      handleDoctor({ json: parsed.json, version });
+      handleDoctor({
+        cleanShadow: parsed.cleanShadow,
+        json: parsed.json,
+        version,
+      });
       break;
     default: {
       const msg = `Unknown command '${parsed.command}'. Run 'agy-loop --help' for usage.`;

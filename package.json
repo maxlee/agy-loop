@@ -1,7 +1,7 @@
 {
   "name": "agy-loop",
-  "version": "0.1.0",
-  "description": "Non-blocking /loop scheduler for Antigravity CLI & Desktop — recurring prompts, adaptive self-pacing, isolated subagents, and live-reloading loop.md.",
+  "version": "1.0.0",
+  "description": "Non-blocking /agy-loop:loop scheduler for Antigravity Desktop & CLI — recurring prompts, adaptive self-pacing, isolated subagents, and live-reloading loop.md.",
   "type": "module",
   "license": "MIT",
   "author": {
@@ -31,6 +31,7 @@
   },
   "files": [
     "plugin.json",
+    "hooks.json",
     "skills/",
     "agents/",
     "assets/",
