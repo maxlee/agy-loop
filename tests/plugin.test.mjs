@@ -86,7 +86,7 @@ const args = process.argv.slice(2);
 const logFile = process.env.MOCK_AGY_LOG;
 const stateFile = process.env.MOCK_AGY_STATE;
 const mockVersion = process.env.MOCK_AGY_VERSION || "1.5.9";
-const mockPluginVersion = process.env.MOCK_AGY_PLUGIN_VERSION || "1.1.0";
+const mockPluginVersion = process.env.MOCK_AGY_PLUGIN_VERSION || "1.2.0";
 const sleepMs = Number.parseInt(process.env.MOCK_AGY_SLEEP_MS || "0", 10);
 
 function handleArgs() {
@@ -260,7 +260,7 @@ test("plugin.json, package.json, and assets/logo.svg satisfy strict schema and p
   assert.equal(pluginJson.$schema, "https://antigravity.google/schemas/v1/plugin.json");
   assert.equal(pluginJson.name, "agy-loop");
   assert.equal(pluginJson.displayName, "AGY Loop");
-  assert.equal(pluginJson.version, "1.1.0");
+  assert.equal(pluginJson.version, "1.2.0");
   assert.doesNotMatch(
     pluginJson.displayName,
     /Antigravity|Gemini|Claude|Cursor|Plugin/i,
@@ -286,11 +286,15 @@ test("plugin.json, package.json, and assets/logo.svg satisfy strict schema and p
   assert.deepEqual(packageJson.author, pluginJson.author);
   assert.equal(packageJson.type, "module");
   assert.equal(packageJson.engines?.node, ">=18");
-  assert.equal(packageJson.bin?.["agy-loop"], "./bin/agy-loop.mjs");
+  assert.equal(packageJson.bin?.["agy-loop"], "bin/agy-loop.mjs");
   assert.equal(packageJson.dependencies, undefined, "Expected zero external dependencies");
   assert.ok(
     Array.isArray(packageJson.files) && packageJson.files.includes("hooks.json"),
     'package.json "files" must include "hooks.json"'
+  );
+  assert.ok(
+    Array.isArray(packageJson.files) && packageJson.files.includes("lib/"),
+    'package.json "files" must include "lib/"'
   );
 
   const svg = fs.readFileSync(logoPath, "utf8");
@@ -649,10 +653,20 @@ test("bin/agy-loop.mjs handles install, --clean-shadow, doctor --json, validate,
   const helpRes = runCli(["--help"]);
   assert.equal(helpRes.status, 0);
   assert.match(helpRes.stdout, /Usage:\s+agy-loop/);
+  assert.match(helpRes.stdout, /\bdoctor,\s*status\b/);
+  for (const subcmd of ["run", "ps", "logs", "stop", "statusline"]) {
+    assert.match(
+      helpRes.stdout,
+      new RegExp(`\\b${subcmd}\\b`),
+      `agy-loop --help must mention '${subcmd}'`
+    );
+  }
 
   const verRes = runCli(["version", "--json"]);
   assert.equal(verRes.status, 0);
-  assert.equal(JSON.parse(verRes.stdout).name, "agy-loop");
+  const verJson = JSON.parse(verRes.stdout);
+  assert.equal(verJson.name, "agy-loop");
+  assert.equal(verJson.version, "1.2.0");
 
   // Create shadow files in isolated HOME
   const shadowSkillDir = path.join(home, ".gemini", "config", "skills", "loop");
@@ -683,6 +697,7 @@ test("bin/agy-loop.mjs handles install, --clean-shadow, doctor --json, validate,
   assert.equal(docShadow.ok, false);
   assert.equal(docShadow.agy.version, "1.5.9");
   assert.equal(docShadow.plugin.installed, true);
+  assert.equal(docShadow.plugin.version, "1.2.0");
   assert.equal(docShadow.shadows.length, 2);
   assert.equal(docShadow.skillFilterWarnings.length, 1);
   assert.equal(docShadow.loopMd.activeSource, ".agents/loop.md");

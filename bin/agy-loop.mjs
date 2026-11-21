@@ -6,6 +6,15 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import {
+  handleLogs,
+  handlePs,
+  handleRun,
+  handleStatusline,
+  handleStop,
+} from "../lib/cli-commands.mjs";
+import { listLoops, resolveStateRoot } from "../lib/state-store.mjs";
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const PLUGIN_ROOT = path.resolve(__dirname, "..");
@@ -13,9 +22,9 @@ const PLUGIN_ROOT = path.resolve(__dirname, "..");
 function readPluginVersion() {
   try {
     const raw = fs.readFileSync(path.join(PLUGIN_ROOT, "package.json"), "utf8");
-    return JSON.parse(raw).version || "1.1.0";
+    return JSON.parse(raw).version || "1.2.0";
   } catch {
-    return "1.1.0";
+    return "1.2.0";
   }
 }
 
@@ -981,87 +990,30 @@ function inspectAgentTools(pluginEntry) {
 }
 
 function inspectActiveLoops(workspaceDir) {
-  const envStateDir = process.env.AGY_LOOP_STATE_DIR;
-  const stateRoot =
-    typeof envStateDir === "string" && envStateDir.trim()
-      ? envStateDir.trim()
-      : path.join(workspaceDir, ".agents", ".agy-loop");
-  const loopsDir = path.join(stateRoot, "loops");
-
-  if (!lstatExists(loopsDir)) {
-    return [];
-  }
-
-  let entries;
-  try {
-    entries = fs.readdirSync(loopsDir, { withFileTypes: true });
-  } catch {
-    return [];
-  }
-
-  const active = [];
-  for (const entry of entries) {
-    const stateFile = path.join(loopsDir, entry.name, "state.json");
-    let parsed;
-    try {
-      const stat = fs.statSync(stateFile);
-      if (!stat.isFile()) {
-        continue;
-      }
-      parsed = JSON.parse(fs.readFileSync(stateFile, "utf8"));
-    } catch {
-      continue;
-    }
-
-    if (!isPlainObject(parsed) || parsed.status !== "running") {
-      continue;
-    }
-
-    const maxIterations =
-      typeof parsed.max_iterations === "number"
-        ? parsed.max_iterations
-        : typeof parsed.maxIterations === "number"
-          ? parsed.maxIterations
-          : null;
-
-    active.push({
-      loopId: parsed.loop_id ?? parsed.loopId ?? entry.name,
-      status: parsed.status,
-      iteration: typeof parsed.iteration === "number" ? parsed.iteration : null,
-      maxIterations,
-      pacing: parsed.pacing ?? null,
-      taskId: parsed.task_id ?? parsed.taskId ?? null,
-      workerId: parsed.worker_id ?? parsed.workerId ?? null,
-      updatedAt: parsed.updated_at ?? parsed.updatedAt ?? null,
-    });
-  }
-
-  active.sort((a, b) => {
-    const ta = a.updatedAt ? Date.parse(a.updatedAt) : Number.NaN;
-    const tb = b.updatedAt ? Date.parse(b.updatedAt) : Number.NaN;
-    if (!Number.isNaN(ta) && !Number.isNaN(tb) && tb !== ta) {
-      return tb - ta;
-    }
-    const sa = String(a.updatedAt || "");
-    const sb = String(b.updatedAt || "");
-    const cmp = sb.localeCompare(sa);
-    if (cmp !== 0) {
-      return cmp;
-    }
-    return String(b.loopId || "").localeCompare(String(a.loopId || ""));
-  });
-
-  return active;
+  const stateRoot = resolveStateRoot(workspaceDir);
+  const loops = listLoops(stateRoot, { includeAll: false });
+  return loops.map((item) => ({
+    loopId: item.loop_id,
+    status: item.status,
+    iteration: typeof item.iteration === "number" ? item.iteration : null,
+    maxIterations: typeof item.max_iterations === "number" ? item.max_iterations : null,
+    pacing: item.pacing ?? null,
+    taskId: item.task_id ?? null,
+    workerId: item.worker_id ?? null,
+    updatedAt: item.updated_at ?? null,
+    engine: item.engine || "interactive",
+    stale: Boolean(item.stale),
+  }));
 }
 
 function printHelp(version) {
   process.stdout.write(`AGY Loop (agy-loop) v${version}
-Non-blocking /agy-loop:loop scheduler plugin for Antigravity Desktop & CLI.
+Non-blocking /agy-loop:loop scheduler plugin and headless runner for Antigravity Desktop & CLI.
 
 Usage:
   agy-loop [command] [options]
 
-Commands:
+Plugin Commands:
   install, update     Install or update the agy-loop plugin (default)
   uninstall, remove   Uninstall the agy-loop plugin from Antigravity
   validate            Run 'agy plugin validate --strict' on the bundled plugin
@@ -1069,7 +1021,14 @@ Commands:
   version             Print package version
   help                Show this help message
 
-Options:
+Headless Runner Commands:
+  run [interval] [prompt...]   Run a non-interactive headless loop (run 'agy-loop run --help' for options)
+  ps, list                     List active loops (supports --all, --global, --json)
+  logs [<id|prefix|latest>]    View or follow (-f) loop event logs
+  stop <id|prefix|all>         Stop running interactive or headless loops (--after-current, --all)
+  statusline                   Emit compact single-line status for statusLine/HUD (<5ms, zero subprocesses)
+
+Options (Plugin Commands):
   --clean-shadow      Move shadowing user-level loop files into a timestamped backup
   --json              Emit machine-readable JSON output
   -h, --help          Show this help message
@@ -1078,9 +1037,12 @@ Options:
 Examples:
   npx agy-loop
   npx agy-loop install --clean-shadow
-  npx agy-loop doctor --clean-shadow
   npx agy-loop doctor --json
-  npx agy-loop uninstall
+  agy-loop run --once --model gemini-4-carbon-low "Check tests and fix failures"
+  agy-loop run 2m --stateful --verifier-model gemini-4-neon-xhigh
+  agy-loop ps --all
+  agy-loop logs latest -f
+  agy-loop stop all
 `);
 }
 
@@ -1560,10 +1522,11 @@ function handleDoctor({ cleanShadow = false, json, version }) {
   } else {
     process.stdout.write(`  active loops:   ${activeLoops.length} running\n`);
     for (const loop of activeLoops) {
+      const staleLabel = loop.stale ? ", STALE" : "";
       process.stdout.write(
-        `    - ${loop.loopId} (iter ${loop.iteration ?? "?"}/${loop.maxIterations ?? "?"}, pacing=${
+        `    - ${loop.loopId} (${loop.engine || "interactive"}, iter ${loop.iteration ?? "?"}/${loop.maxIterations ?? "?"}, pacing=${
           loop.pacing || "?"
-        }, updated=${loop.updatedAt || "?"})\n`
+        }${staleLabel}, updated=${loop.updatedAt || "?"})\n`
       );
     }
   }
@@ -1579,9 +1542,33 @@ function handleDoctor({ cleanShadow = false, json, version }) {
   }
 }
 
-function main() {
+async function main() {
   const version = readPluginVersion();
-  const parsed = parseCliArgs(process.argv.slice(2));
+  const rawArgv = process.argv.slice(2);
+  const subcommand = rawArgv[0];
+
+  if (subcommand === "run") {
+    await handleRun(rawArgv.slice(1), { version });
+    return;
+  }
+  if (subcommand === "ps" || subcommand === "list") {
+    await handlePs(rawArgv.slice(1));
+    return;
+  }
+  if (subcommand === "logs") {
+    await handleLogs(rawArgv.slice(1));
+    return;
+  }
+  if (subcommand === "stop") {
+    await handleStop(rawArgv.slice(1));
+    return;
+  }
+  if (subcommand === "statusline") {
+    await handleStatusline(rawArgv.slice(1));
+    return;
+  }
+
+  const parsed = parseCliArgs(rawArgv);
 
   if (parsed.help || parsed.command === "help") {
     printHelp(version);
@@ -1643,4 +1630,8 @@ function main() {
   }
 }
 
-main();
+main().catch((err) => {
+  const msg = err instanceof Error ? err.message : String(err);
+  process.stderr.write(`Error: ${msg}\n`);
+  process.exit(1);
+});

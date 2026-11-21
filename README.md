@@ -12,13 +12,13 @@
 [![Node >=18](https://img.shields.io/badge/Node-%3E%3D18-22C55E.svg)](package.json)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-[**English**](README.md) · [**简体中文**](README.zh-CN.md) · [**Why AGY Loop?**](#-why-agy-loop) · [**Quick Install**](#-installation) · [**Commands & Flags**](#-slash-commands-modes--flags) · [**`loop.md` Guide**](#-agentsloopmd-hot-reload-guide) · [**Exit & Stop**](#-how-to-exit-or-stop-a-loop) · [**Architecture**](ARCHITECTURE.md)
+[**English**](README.md) · [**简体中文**](README.zh-CN.md) · [**Why AGY Loop?**](#-why-agy-loop) · [**Quick Install**](#-installation) · [**Slash Commands**](#-slash-commands-modes--flags) · [**Headless CLI**](#-headless-cli-runner) · [**`loop.md` Guide**](#-agentsloopmd-hot-reload-guide) · [**Exit & Stop**](#-how-to-exit-or-stop-a-loop) · [**Architecture**](ARCHITECTURE.md)
 
 </div>
 
 ---
 
-**AGY Loop** brings a non-blocking, context-isolated loop scheduler (`/agy-loop:loop`) to **Antigravity Desktop** (Marketplace-ready) and **Antigravity CLI (`agy`)**. Instead of locking your prompt with shell `sleep` or dumping repetitive build, test, and CI logs into your main conversation, `agy-loop` delegates each check or fix pass to an isolated `loop-worker` (or `self`) background subagent and parks between iterations on Antigravity's native `schedule` tool at **zero token cost**.
+**AGY Loop** brings a non-blocking, context-isolated loop scheduler (`/agy-loop:loop`) to **Antigravity Desktop** (Marketplace-ready) and **Antigravity CLI (`agy`)**, plus a production **Headless CLI Runner** (`agy-loop run | ps | logs | stop | statusline`) for terminals, SSH, and CI/CD pipelines. Instead of locking your prompt with shell `sleep` or dumping repetitive build, test, and CI logs into your main conversation, `agy-loop` delegates each check or fix pass to an isolated `loop-worker` (or `self`) background subagent and parks between iterations on Antigravity's native `schedule` tool at **zero token cost** — or drives headless `agy` JSON / persistent `stream-json` turns directly from the command line.
 
 > Inspired by Claude Code's [`/loop` workflow](https://claude.com/resources/articles/getting-started-with-loops) and engineered around Antigravity's reactive subagent wakeup, sub-minute `DurationSeconds` timers, stateful `Idle` re-awakening, and Git worktree isolation.
 
@@ -66,10 +66,10 @@
 
 ### Requirements
 
-- **Antigravity CLI (`agy`)** `v1.5.0+` (verified against `v1.5.13` strict validator and `oneharness` tool registry) or **Antigravity Desktop**
-- **Zero Node.js / npm required** for native `agy plugin install` or the one-line `curl` installer (`Node.js >= 18` or `Bun` is only needed if you use the `npx` / `bunx` CLI bridge)
+- **Antigravity CLI (`agy`)** `v1.5.0+` (verified against `v1.5.14` strict validator, `oneharness` tool registry, and headless `json` / `stream-json` transports) or **Antigravity Desktop**
+- **Zero Node.js / npm required** for native `agy plugin install` or the one-line `curl` installer to run interactive **`/agy-loop:loop`**; **`Node.js >= 18`** powers the zero-dependency `npx agy-loop` CLI bridge and the headless **`agy-loop run | ps | logs | stop | statusline`** runner (`Bun` can also run the CLI bridge)
 
-`agy-loop` is packaged as a **pure, Marketplace-compatible dual-habitat plugin**: the repository root is simultaneously a strict v1 Antigravity native plugin (`plugin.json`, `hooks.json`, `skills/loop/SKILL.md`, `agents/loop-worker.md`) and a zero-dependency npm CLI installer (`bin/agy-loop.mjs`). Once installed:
+`agy-loop` is packaged as a **pure, Marketplace-compatible dual-habitat plugin**: the repository root is simultaneously a strict v1 Antigravity native plugin (`plugin.json`, `hooks.json`, `skills/loop/SKILL.md`, `agents/loop-worker.md`) and a zero-dependency npm CLI (`bin/agy-loop.mjs` + `lib/*.mjs`). Once installed:
 
 - In Antigravity's native plugin model, bundled skills register cleanly under the plugin namespace as **`/agy-loop:loop`** in both **Antigravity Desktop** and **Antigravity CLI (`agy`)**, keeping the plugin 100% self-contained without writing extra files outside `~/.gemini/config/plugins/`.
 - In Antigravity Desktop (**Customizations -> Plugins** / **Marketplace**), the plugin card also exposes 3 one-click starter prompt chips (`suggestedPrompts`) to launch common loops or inspect `/agy-loop:loop status`.
@@ -159,9 +159,100 @@ Flags can appear anywhere before `--` in `/agy-loop:loop` arguments (leading typ
 
 ## 🛡️ Reliability, Sandbox State & Cross-Engine Worker
 
-- **6-Tool Cross-Engine `loop-worker` (Desktop Cortex + CLI `oneharness`)**: `agents/loop-worker.md` pins the exact 6 tools verified across both Desktop Cortex and `agy v1.5.13` CLI `oneharness` (`view_file`, `write_to_file`, `replace_file_content`, `run_command`, `manage_task`, `search_web`). The 4 legacy Cortex-only tools (`multi_replace_file_content`, `list_dir`, `find_by_name`, `grep_search`) were removed because `oneharness` aborts agent loading when unmapped tools are absent from its registry; sandboxed `run_command` (`rg`/`grep`/`find`/`ls`) covers search and directory inspection cleanly.
-- **Sandbox-Safe Externalized State (`.agents/.agy-loop/`)**: Because `agy v1.5.7+` `auto` mode blocks sandboxed `run_command` writes to `~/.gemini/antigravity-cli/plugin_data/`, per-loop `state.json` and `events.jsonl` live under `<workspace>/.agents/.agy-loop/loops/<loop_id>/` (override via `AGY_LOOP_STATE_DIR`) with an auto-created `.gitignore` (`*`). `state-read` loads authoritative `iteration`, `next_hint`, `worker_id`, and `stop_requested` on every wake-up, eliminating `--cron` static-prompt drift and surviving `/compact`.
-- **3-Error Circuit Breaker & Delay Clamping**: Missing/unparseable 4-line worker footers increment `consecutive_errors`; 3 consecutive failures automatically mark the loop `circuit_broken`, clear remaining schedules, and halt with diagnostics. Dynamic `NEXT_DELAY_SEC` values default to `120s` if invalid and clamp to `[10s, 86400s]`.
+- **6-Tool Cross-Engine `loop-worker` (Desktop Cortex + CLI `oneharness`)**: `agents/loop-worker.md` pins the exact 6 tools verified across both Desktop Cortex and `agy v1.5.14` CLI `oneharness` (`view_file`, `write_to_file`, `replace_file_content`, `run_command`, `manage_task`, `search_web`). The 4 legacy Cortex-only tools (`multi_replace_file_content`, `list_dir`, `find_by_name`, `grep_search`) were removed because `oneharness` aborts agent loading when unmapped tools are absent from its registry; sandboxed `run_command` (`rg`/`grep`/`find`/`ls`) covers search and directory inspection cleanly.
+- **Sandbox-Safe Unified State (`.agents/.agy-loop/`)**: Because `agy v1.5.7+` `auto` mode blocks sandboxed `run_command` writes to `~/.gemini/antigravity-cli/plugin_data/`, per-loop `state.json` and `events.jsonl` live under `<workspace>/.agents/.agy-loop/loops/<loop_id>/` (override via `AGY_LOOP_STATE_DIR`) with an auto-created `.gitignore` (`*`). Both interactive `/agy-loop:loop` (`state-read`) and headless `agy-loop run` share this control plane, eliminating `--cron` static-prompt drift and surviving `/compact`.
+- **3-Error Circuit Breaker & Delay Clamping**: Missing/unparseable 4-line worker footers (or invalid headless outputs) increment `consecutive_errors`; 3 consecutive failures (`--max-errors 3`) automatically mark the loop `circuit_broken`, clear remaining schedules, and halt with diagnostics. Dynamic `NEXT_DELAY_SEC` values default to `120s` if invalid and clamp to `[10s, 86400s]`.
+
+---
+
+## 🤖 Headless CLI Runner
+
+**(`agy-loop run` · `ps` · `logs` · `stop` · `statusline`)**
+
+Run non-interactive loops from terminals, SSH sessions, cron jobs, or CI/CD pipelines using `Node.js >= 18` with **zero external npm dependencies** (`npx agy-loop run ...` or global `agy-loop run ...`). Headless runs share `.agents/loop.md` hot-reload and `<workspace>/.agents/.agy-loop/` state seamlessly with interactive `/agy-loop:loop`, inherit your local `agy` permission mode by default (`auto` in `v1.5.7+` unless `--mode`, `--sandbox`, or `--dangerously-skip-permissions` is specified), and enforce strict schema validation, model/fallback/verifier routing, hard token/duration budgets, and clean exit codes.
+
+### Quick Examples
+
+```bash
+# 1. Single-shot check (immediate or delayed with `in <delay>`)
+agy-loop run --once "Inspect git status and summarize any failing tests"
+agy-loop run in 20m "Verify staging smoke tests and report status"
+
+# 2. Adaptive CI loop with Gemini 4 model, effort, fallback & independent read-only verifier
+agy-loop run "Check PR CI status and fix failing checks" \
+  --model gemini-4-hydrogen-xhigh \
+  --effort high \
+  --fallback-model gemini-4-carbon-high \
+  --verifier-model gemini-4-neon-xhigh
+
+# 3. Persistent stream-json session (`--stateful`) with periodic context rotation (`--reset-every 6`)
+agy-loop run 2m "Run unit tests and fix failures until green" --stateful --reset-every 6
+
+# 4. Isolated Git branch/worktree execution (auto-cleaned if 0 commits & clean; preserved with merge hints if modified)
+agy-loop run "Refactor flaky auth tests and commit verified fixes" --worktree
+
+# 5. Zero-token shell preflight (`--probe` + `--probe-until-pass`)
+# Runs `npm test` before each turn; exits DONE (0 LLM tokens) as soon as the probe exits 0
+agy-loop run 30s "Fix remaining TypeScript errors" --probe "npm test" --probe-until-pass
+
+# 6. Hard token & wall-clock budgets with machine-readable JSON summary for CI
+agy-loop run --max 10 --max-tokens 250000 --max-duration 30m --json "Stabilize build"
+```
+
+### Headless Runner Options (`agy-loop run`)
+
+Supports the same interval grammar as `/agy-loop:loop` (`30s`, `1h30m`, `every 5m`, `in 20m`, trailing `every 2h`, or omit prompt to live-reload `.agents/loop.md`), plus:
+
+| Category | Key Options | Behavior & Defaults |
+| :--- | :--- | :--- |
+| **Transport & Rotation** | `--fresh` (default), `--stateful`, `--reset-every <N>` | `fresh` spawns `agy --output-format json` per pass; `--stateful` reuses a persistent `stream-json` process (rotating every `N` turns when `--reset-every` is set). |
+| **Budgets & Retries** | `--max <N>` (`20`), `--once`, `--max-duration <dur>`, `--max-tokens <N>`, `--max-retries <N>` (`3`), `--max-errors <N>` (`3`), `--turn-timeout <dur>` (`10m`) | Enforces hard iteration, wall-clock, and cumulative token budgets; retries `print_timeout` / transient `429` errors with jittered backoff (`30s -> 60s -> 120s`); trips circuit breaker on consecutive schema/runtime errors. |
+| **Model & Verifier Routing** | `--model <slug\|label>`, `--effort <low\|medium\|high\|xhigh\|max>`, `--fallback-model <slug\|label>`, `--verifier-model <slug\|label>` | Resolves model slugs or display names via `agy --output-format json models` (automatically omitting `--effort` for `Orchestrator` models), switches to `--fallback-model` on quota/rate-limit/capacity errors, and runs a read-only verifier pass before accepting `DONE`. |
+| **Permissions & Isolation** | `--mode <auto\|accept-edits\|plan>`, `--sandbox`, `--dangerously-skip-permissions`, `--allow-slash-commands`, `--settings <json\|path>`, `--add-dir <dir>`, `--worktree`, `--keep-worktree`, `--fail-on-denied` | Inherits local `agy` mode unless overridden; disables slash expansion unless `--allow-slash-commands` is passed; isolates edits in `<state>/worktrees/<loop_id>` (`agy-loop/<loop_id>`); treats soft-denied tool calls (`denied_actions[]`) as `BLOCKED` (exit `3`) under `--fail-on-denied`. |
+| **Preflight & Output** | `--probe <cmd>`, `--probe-timeout <dur>` (`60s`), `--probe-until-pass`, `--cwd <dir>`, `--json`, `--quiet`, `--` | Runs bounded shell `--probe` before each pass (injecting failure output tail or completing immediately at `0` tokens); emits final JSON summary under `--json`; `--` passes remaining tokens verbatim as prompt text. |
+
+### Observability & Lifecycle Commands
+
+> **Backward compatibility:** `agy-loop status` remains an alias for `agy-loop doctor` (diagnostics). Use **`agy-loop ps`** (or `list`) to inspect running and historical loops.
+
+```bash
+# List active loops in the current workspace (`--all` includes finished loops; `--global` queries cross-workspace index; `[stale]` flags dead PIDs)
+agy-loop ps [--all] [--global] [--json]
+
+# Inspect or tail structured iteration events & incremental token telemetry (`id`, prefix/suffix, or `latest`)
+agy-loop logs [id|latest] [-f] [-n N] [--json]
+
+# Stop one loop, matching prefix, or all active loops (immediately via control.json + SIGTERM, or gracefully `--after-current`)
+agy-loop stop <id|--all> [--after-current]
+
+# Print a compact <5ms status segment (0 subprocesses; silent when 0 live loops)
+agy-loop statusline [--global] [--no-color] [--json]
+```
+
+**Embed `agy-loop statusline` in Antigravity CLI (`~/.gemini/antigravity-cli/settings.json`):**
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "agy-loop statusline",
+    "stack_with_default": true
+  }
+}
+```
+
+*(If `agy-loop` is installed only as a plugin without global `npm install -g agy-loop`, set `"command": "node ~/.gemini/config/plugins/agy-loop/bin/agy-loop.mjs statusline"` for `<5ms` zero-`npx` latency. `"stack_with_default": true` renders active loop status beneath Antigravity's built-in status bar.)*
+
+### Headless Exit Codes (`agy-loop run`)
+
+| Exit Code | Outcome | Meaning |
+| :--- | :--- | :--- |
+| **`0`** | `DONE` / `--once` / `--probe-until-pass` | Objective completed with `DONE`, `--probe-until-pass` exited `0` (0 tokens), or a single `--once` pass finished cleanly (`DONE` or `CONTINUE`). |
+| **`1`** | `error` / `circuit_broken` | Runtime error (missing `agy`, `agy` Exit `1`, `verifier_error` at `--max`/`--once`) or consecutive contract/runtime errors reached `--max-errors` (`3` default). |
+| **`2`** | Usage / Config Error | Invalid CLI flags, conflicting options (`--stateful` + `--fresh`), invalid duration/budget, unrecognized `--model` / `--fallback-model` / `--verifier-model`, or `agy` config error (Exit `2`). |
+| **`3`** | `BLOCKED` | Worker reported `BLOCKED`, non-retryable quota/billing/spend-cap error hit, `--verifier-model` rejected at `--max`/`--once`, or soft-denied tool calls triggered `--fail-on-denied`. |
+| **`4`** | `max_reached` | Multi-iteration loop exhausted `--max`, `--max-duration`, or `--max-tokens` before reaching `DONE`. |
+| **`130`** | `stopped` | Interrupted via `SIGINT`/`SIGTERM` or terminated via `agy-loop stop`. |
 
 ---
 
@@ -217,19 +308,24 @@ Antigravity loads user-level customizations in `~/.gemini/config/` ahead of inst
 
 To prevent silent precedence collisions:
 
-- **Zero-Overhead `SessionStart` Auto-Detector (`hooks.json`)**: Runs `skills/loop/scripts/loop-helper.sh session-start` on session start. Strictly `protojson`-compliant for `agy v1.5.13+` (zero leaked stdin keys): returns `{}` in `<5ms` at **`0` token cost** when clean, and surfaces startup alerts when loose shadow files **or** `skills.json` `include_only`/`exclude` filters block `/agy-loop:loop` (matched with POSIX ERE parity).
+- **Zero-Overhead `SessionStart` Auto-Detector (`hooks.json`)**: Runs `skills/loop/scripts/loop-helper.sh session-start` on session start. Strictly `protojson`-compliant for `agy v1.5.13+` (verified on `v1.5.14`, zero leaked stdin keys): returns `{}` in `<5ms` at **`0` token cost** when clean, and surfaces startup alerts when loose shadow files **or** `skills.json` `include_only`/`exclude` filters block `/agy-loop:loop` (matched with POSIX ERE parity).
 - **One-Command Non-Destructive Cleanup**: Archive colliding loose files into `~/.gemini/config/.agy-loop-backup-<YYYYMMDD-HHMMSSZ>/` (unified UTC timestamp across `agy-loop.mjs`, `loop-helper.sh`, and `install.sh`; then run `/skills reload` in any open `agy` session):
   - **POSIX shell (zero Node/npm required)**: `sh ~/.gemini/config/plugins/agy-loop/install.sh --clean-shadow`
   - **Inside `agy` (works right away via plugin prefix)**: `/agy-loop:loop doctor --clean-shadow`
   - **Via npm CLI bridge**: `npx agy-loop doctor --clean-shadow`
 
-### CLI Bridge Subcommands (`npx agy-loop`)
+### CLI Subcommands (`agy-loop` / `npx agy-loop`)
 
 | Command | Description |
 |:---|:---|
+| `agy-loop run [interval] [prompt...] [options]` | Run headless loop via `fresh` (`json`) or `--stateful` (`stream-json`) transport with Gemini 4 routing, `--probe`, `--verifier-model`, `--worktree`, and budget/exit-code controls |
+| `agy-loop ps [--all] [--global] [--json]` | List active (or `--all` / `--global`) loops across interactive and headless engines, flagging `[stale]` dead PIDs (`list` alias supported; `status` remains aliased to `doctor`) |
+| `agy-loop logs [id\|latest] [-f] [-n N] [--json]` | Inspect or live-follow `events.jsonl` iteration timelines, incremental token telemetry, and soft-denial records |
+| `agy-loop stop <id\|prefix\|all\|--all> [--after-current]` | Stop specific or all active loops immediately (`control.json` + `SIGTERM` for live headless PIDs) or gracefully after the current turn (`--after-current`) |
+| `agy-loop statusline [--global] [--no-color] [--json]` | Emit a `<5ms` zero-subprocess status summary for `settings.json` `statusLine` integration (silent when 0 live loops) |
 | `npx agy-loop [install \| update]` | Install or update `agy-loop` via `agy plugin install` (warns if user-level shadow files exist) |
 | `npx agy-loop install --clean-shadow` | Install `agy-loop` and archive loose shadow files into `~/.gemini/config/.agy-loop-backup-<YYYYMMDD-HHMMSSZ>/` |
-| `npx agy-loop doctor [--json]` | Run full diagnostics (`agy v1.5.13` `agy.capabilities` matrix, enterprise `admin_settings.json` / `settings.json` / `hooks.json` audit, `SessionStart` `protojson` `hookSelfTest`, `loop-worker` 6-tool `agentToolsCheck`, shadows, ERE `skills.json` filters, `loop.md`, `activeLoops`, with `15s`/`30s` `spawnSync` timeout protection) |
+| `npx agy-loop doctor [--json]` | Run full diagnostics (`agy v1.5.14` `agy.capabilities` matrix, enterprise `admin_settings.json` / `settings.json` / `hooks.json` audit, `SessionStart` `protojson` `hookSelfTest`, `loop-worker` 6-tool `agentToolsCheck`, shadows, ERE `skills.json` filters, `loop.md`, `activeLoops` with `engine`/`stale`, and `15s`/`30s` `spawnSync` timeout protection; `status` alias preserved) |
 | `npx agy-loop doctor --clean-shadow [--json]` | Non-destructively archive loose shadow files into `~/.gemini/config/.agy-loop-backup-<YYYYMMDD-HHMMSSZ>/` and re-run diagnostics (`status --clean-shadow` alias supported; run `/skills reload` in open sessions) |
 | `npx agy-loop validate [--json]` | Run `agy plugin validate --strict` against the packaged plugin root |
 | `npx agy-loop uninstall` | Cleanly remove the plugin via `agy plugin uninstall agy-loop` (`remove` alias supported) |
@@ -260,10 +356,11 @@ curl -fsSL https://raw.githubusercontent.com/maxlee/agy-loop/main/uninstall.sh |
 
 ### Local Development & Verification
 
-See [**ARCHITECTURE.md**](ARCHITECTURE.md) for full details on the Three-Turn Reactive Lifecycle, Task & Pacing Resolution flow, 4-line Worker Output Contract, and Sandbox/Worktree isolation model.
+See [**ARCHITECTURE.md**](ARCHITECTURE.md) for full details on the Three-Turn Reactive Lifecycle, Task & Pacing Resolution flow, 4-line Worker Output Contract, Sandbox/Worktree isolation model, and the v1.2 Headless Dual-Transport Architecture.
 
 ```bash
 sh -n install.sh uninstall.sh skills/loop/scripts/loop-helper.sh  # Check POSIX shell syntax
+node --check bin/agy-loop.mjs lib/*.mjs                           # Check Node >= 18 ESM syntax
 npm test                                                          # Run isolated unit & integration tests
 agy plugin validate --strict .                                    # Strict Antigravity v1 plugin check (0 findings)
 ```

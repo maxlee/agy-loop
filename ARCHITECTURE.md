@@ -1,6 +1,6 @@
 # `agy-loop` Technical Architecture
 
-`agy-loop` implements a pure, Marketplace-compatible non-blocking `/agy-loop:loop` scheduler for **Google Antigravity Desktop** and **Antigravity CLI (`agy`)**. Rather than blocking an interactive turn with shell `sleep` or running noisy polling commands inside the primary conversation window, `agy-loop` splits scheduling, deterministic argument/state resolution, and single-pass task execution across crisp capability boundaries — never writing loose files to `~/.gemini/` outside the plugin bundle, while storing sandbox-safe per-loop state under `<workspace>/.agents/.agy-loop/` (automatically `.gitignore`d).
+`agy-loop` implements a pure, Marketplace-compatible non-blocking `/agy-loop:loop` scheduler **and** a zero-dependency Headless CLI Runner (`agy-loop run | ps | logs | stop | statusline`) for **Google Antigravity Desktop** and **Antigravity CLI (`agy`)**. Rather than blocking an interactive turn with shell `sleep` or running noisy polling commands inside the primary conversation window, `agy-loop` splits scheduling, deterministic argument/state resolution, and single-pass task execution across crisp capability boundaries — never writing loose files to `~/.gemini/` outside the plugin bundle, while sharing a unified, sandbox-safe per-loop state store under `<workspace>/.agents/.agy-loop/` (automatically `.gitignore`d) across both interactive sessions and headless runs.
 
 ---
 
@@ -10,9 +10,21 @@
 agy-loop/
 ├── plugin.json                              # Strict Antigravity v1 plugin manifest (additionalProperties: false)
 ├── hooks.json                               # SessionStart shadow & skills.json filter detector (0 tokens when clean)
-├── package.json                             # Zero-dependency npm CLI bridge manifest (Node >= 18 ESM)
+├── package.json                             # Zero-dependency npm CLI bridge & headless runner manifest (Node >= 18 ESM)
 ├── bin/
-│   └── agy-loop.mjs                         # npm <-> `agy plugin` installer, shadow cleaner & upgraded doctor CLI
+│   └── agy-loop.mjs                         # npm <-> `agy plugin` installer, shadow cleaner, doctor & v1.2 headless router
+├── lib/
+│   ├── duration.mjs                         # Single/compound duration parser, Go duration & compact token formatters
+│   ├── parse-run-args.mjs                   # `agy-loop run` CLI flag & interval parser (exit-2 validation)
+│   ├── schemas.mjs                          # Iteration & verifier JSON Schemas, prompt builders & stale-output guard
+│   ├── error-policy.mjs                     # AGY_ERROR parser, failure classifier, backoff & usage delta/budgets
+│   ├── models.mjs                           # `agy models` catalog parser, slug/label resolver & Orchestrator check
+│   ├── state-store.mjs                      # Unified .agents/.agy-loop/ store, loop.md resolver & global index
+│   ├── worktree.mjs                         # Headless Git worktree creation, inspection & cleanup/merge hints
+│   ├── json-client.mjs                      # Single-turn `agy --output-format json ... -p` transport client
+│   ├── stream-client.mjs                    # Persistent bidirectional `stream-json` NDJSON `StreamSession`
+│   ├── runner.mjs                           # Headless loop state machine, probe, verifier, budgets & signal handling
+│   └── cli-commands.mjs                     # `run`, `ps`/`list`, `logs`, `stop`, and `<5ms` `statusline` handlers
 ├── agents/
 │   └── loop-worker.md                       # Isolated single-pass subagent (flash, sandbox, 6 cross-engine tools)
 ├── skills/
@@ -27,7 +39,9 @@ agy-loop/
 ├── install.sh                               # Pure POSIX one-line & in-place (--clean-shadow) installer (UTC backups)
 ├── uninstall.sh                             # Pure POSIX clean uninstaller
 └── tests/
-    └── plugin.test.mjs                      # Isolated HOME unit, contract & strict-validator test suite
+    ├── plugin.test.mjs                      # Isolated HOME unit, contract, hook & strict-validator test suite
+    ├── headless.test.mjs                    # Mock-agy dual-transport, error policy, worktree, probe & CLI suite
+    └── live.test.mjs                        # Opt-in live `agy` CLI integration suite (AGY_LIVE_TEST=1)
 ```
 
 ### Component Overview & Separation of Responsibilities
@@ -46,9 +60,11 @@ agy-loop/
    - Provides hardened argument parsing (unconditional multi-token lifecycle dispatch, prefix `every` + compound durations like `1h30m`, fractional rejection, two-tier unknown `--flag` validation), sandbox-safe externalized state (`state-init`, `state-read`, `state-update`, `state-list`, `state-stop`), `loop.md` precedence lookup (`25,000`-byte UTF-8-safe cap), POSIX ERE `skills.json` inspection, `session-start`, and `doctor [--clean-shadow]`.
 4. **Zero-Overhead `SessionStart` Guard (`hooks.json`)**
    - Root `hooks.json` registers a `SessionStart` command hook invoking `sh ./skills/loop/scripts/loop-helper.sh session-start` (pure POSIX `sh`, zero Node.js required).
-   - Strictly `protojson`-compliant for `agy v1.5.13+` (never echoing stdin fields such as `artifactDirectoryPath`): outputs `{}` in `<5ms` at **`0` tokens** when clean, and injects an `injectSteps` alert only when Tier 3 shadow files or `skills.json` `include_only`/`exclude` filters block `/agy-loop:loop`.
+   - Strictly `protojson`-compliant for `agy v1.5.13+` (verified on `v1.5.14`, never echoing stdin fields such as `artifactDirectoryPath`): outputs `{}` in `<5ms` at **`0` tokens** when clean, and injects an `injectSteps` alert only when Tier 3 shadow files or `skills.json` `include_only`/`exclude` filters block `/agy-loop:loop`.
 5. **Dual-Habitat Distribution Shell (`plugin.json` + `bin/agy-loop.mjs` + `install.sh`)**
-   - Packages the repository root simultaneously as a native Antigravity v1 plugin (`agy plugin install https://github.com/maxlee/agy-loop`) and a zero-dependency npm CLI bridge (`npx agy-loop`) with unified UTC backup timestamps (`.agy-loop-backup-YYYYMMDD-HHMMSSZ`), `spawnSync` timeout protection (`15s`/`30s`, `AGY_LOOP_AGY_TIMEOUT_MS`), and an upgraded `doctor` suite (`agy v1.5.13` capability matrix, enterprise `admin_settings.json` / `settings.json` / `hooks.json` audit, `SessionStart` `protojson` `hookSelfTest`, `agentToolsCheck`, and `activeLoops`).
+   - Packages the repository root simultaneously as a native Antigravity v1 plugin (`agy plugin install https://github.com/maxlee/agy-loop`) and a zero-dependency npm CLI (`npx agy-loop`) with unified UTC backup timestamps (`.agy-loop-backup-YYYYMMDD-HHMMSSZ`), `spawnSync` timeout protection (`15s`/`30s`, `AGY_LOOP_AGY_TIMEOUT_MS`), and an upgraded `doctor` suite (`agy v1.5.14` capability matrix, enterprise `admin_settings.json` / `settings.json` / `hooks.json` audit, `SessionStart` `protojson` `hookSelfTest`, `agentToolsCheck`, and `activeLoops`).
+6. **Headless Runner & Observability Engine (`lib/*.mjs`)**
+   - Zero-dependency `Node >= 18` ESM layer driving `agy-loop run` across `fresh` (`--output-format json`) and `--stateful` (`--input-format stream-json --output-format stream-json`) transports, Gemini 4 model/effort/fallback/verifier routing, `AGY_ERROR` recovery, soft-denial auditing, zero-token `--probe` preflight, Git `--worktree` isolation, and unified observability (`ps`/`list`, `logs`, `stop`, and `<5ms` `statusline`). See [Section 7](#7-headless-dual-transport-architecture-v12).
 
 ---
 
@@ -211,20 +227,20 @@ Antigravity discovers skills and subagents in strict precedence order (highest t
 ### Guardrails Against Silent Discovery & Runtime Failures
 
 - **Pure Plugin Namespacing (`/agy-loop:loop`)**: Registers consistently across Desktop Marketplace and CLI (`agy`) without scattering files into `~/.gemini/config/`.
-- **Strict `protojson` `SessionStart` Hook (`hooks.json`)**: Under `agy v1.5.13`, plugin hooks use strict `protojson` unmarshaling and reject echoed stdin fields (such as `artifactDirectoryPath`). `loop-helper.sh session-start` emits `{}` (`0` tokens, `<5ms`) when clean, or strictly `{ "injectSteps": [...] }` when Tier 3 shadow files or `skills.json` `include_only`/`exclude` filters (matched with POSIX ERE parity against `bin/agy-loop.mjs`) block `/agy-loop:loop`.
+- **Strict `protojson` `SessionStart` Hook (`hooks.json`)**: Under `agy v1.5.13+` (verified on `v1.5.14`), plugin hooks use strict `protojson` unmarshaling and reject echoed stdin fields (such as `artifactDirectoryPath`). `loop-helper.sh session-start` emits `{}` (`0` tokens, `<5ms`) when clean, or strictly `{ "injectSteps": [...] }` when Tier 3 shadow files or `skills.json` `include_only`/`exclude` filters (matched with POSIX ERE parity against `bin/agy-loop.mjs`) block `/agy-loop:loop`.
 - **Unified UTC `--clean-shadow` Archiving**: `bin/agy-loop.mjs`, `loop-helper.sh`, and `install.sh` all archive colliding Tier 3 files into `~/.gemini/config/.agy-loop-backup-YYYYMMDD-HHMMSSZ/` with cross-filesystem fallback.
 - **Upgraded `doctor` Diagnostics (`npx agy-loop doctor [--json]`)**:
   - **`agy.capabilities`**: Parses `agy --version` into a version capability matrix (`printTimeout`, `sidecarHomeExpansion`, `worktreeDirtyCarry`, `autoModeDefault`, `dynamicWorkflows`, `githubUrlValidate`, `strictProtojsonHooks`).
   - **Enterprise & Policy Audit (`environment`, `environmentWarnings`)**: Non-secret read-only inspection of `~/.gemini/config/admin_settings.json` (`pluginsDisabled`, `marketplaceDisabled`, `remoteControlEnabled`), `~/.gemini/antigravity-cli/settings.json` (`agentMode`, `toolPermission`, `enableTerminalSandbox`, `modelProvider`), and static `hooks.json` matcher structure (`PreToolUse`/`PostToolUse` grouping).
-  - **Live Self-Tests & State**: `hookSelfTest` (runs `SessionStart` against synthetic `v1.5.13` `artifactDirectoryPath` stdin checking zero leaked keys), `agentToolsCheck` (validates `loop-worker.md` `model` tier and 6-tool cross-engine compatibility), `activeLoops` (`active_loops` in `loop-helper.sh doctor`), and `spawnSync` timeout guards (`15s` / `30s`, `AGY_LOOP_AGY_TIMEOUT_MS`).
-- **Strict v1 Native Plugin Layout**: Root `plugin.json`, root `hooks.json`, `skills/*/SKILL.md` (safely quoted YAML frontmatter), and `agents/*.md` validate with `0` findings (`components.hooks: 1`, `findings: []`) under `agy v1.5.13` `agy plugin validate --strict .`.
+  - **Live Self-Tests & State**: `hookSelfTest` (runs `SessionStart` against synthetic `v1.5.14` `artifactDirectoryPath` stdin checking zero leaked keys), `agentToolsCheck` (validates `loop-worker.md` `model` tier and 6-tool cross-engine compatibility), `activeLoops` (delegating to `lib/state-store.mjs` `listLoops` with `engine` & `stale` detection alongside `active_loops` in `loop-helper.sh doctor`), and `spawnSync` timeout guards (`15s` / `30s`, `AGY_LOOP_AGY_TIMEOUT_MS`).
+- **Strict v1 Native Plugin Layout**: Root `plugin.json`, root `hooks.json`, `skills/*/SKILL.md` (safely quoted YAML frontmatter), and `agents/*.md` validate with `0` findings (`components.hooks: 1`, `findings: []`) under `agy v1.5.14` `agy plugin validate --strict .` (including with `lib/` packaged in the repo root).
 
 ---
 
 ## 6. Subagent Tool Allowlist, Sandbox & Worktree Safety
 
 1. **6-Tool Cross-Engine Intersection (Desktop Cortex + CLI `oneharness`)**
-   - In `agy v1.5.13`, CLI `oneharness` (`DeclarativeConfigLoader.Load` / `ConstructFromRegistry`) treats unmapped tool names in `agents/*.md` as a **fatal component-load error** (`not found in registry`), whereas Desktop Cortex registers legacy tool identifiers (`view_file`, `write_to_file`, `replace_file_content`).
+   - In `agy v1.5.13+` (verified on `v1.5.14`), CLI `oneharness` (`DeclarativeConfigLoader.Load` / `ConstructFromRegistry`) treats unmapped tool names in `agents/*.md` as a **fatal component-load error** (`not found in registry`), whereas Desktop Cortex registers legacy tool identifiers (`view_file`, `write_to_file`, `replace_file_content`).
    - `agents/loop-worker.md` therefore pins the exact **6-tool cross-engine verified intersection**:
      `view_file`, `write_to_file`, `replace_file_content`, `run_command`, `manage_task`, and `search_web` (`send_message` is injected automatically).
    - `oneharness` forward-canonicalizes `view_file -> read_file`, `write_to_file -> write_file`, and `replace_file_content -> edit_file`. The 4 legacy Cortex-only tools (`multi_replace_file_content`, `list_dir`, `find_by_name`, `grep_search`) were removed because they do not exist in `oneharness`; directory listing and code search run cleanly via sandboxed `run_command` (`rg`, `grep`, `find`, `ls`).
@@ -238,3 +254,78 @@ Antigravity discovers skills and subagents in strict precedence order (highest t
    - `SKILL.md` records `worktree_branch` in `state.json`, surfaces branch name, `git diff --stat`, and `git cherry-pick` / `git merge` commands before teardown, and keeps the `branch` subagent `Idle` if unmerged commits await review (preventing accidental worktree deletion).
 5. **Bounded File & Quota Safeguards**
    - `loop-helper.sh resolve-task` enforces a `25,000`-byte UTF-8-safe cap (`truncated: true` triggers an explicit 1-line warning in `SKILL.md` without direct `read_file`/`view_file` bypass), `--max 20` caps default iterations, and the 3-error circuit breaker halts stuck loops automatically.
+
+---
+
+## 7. Headless Dual-Transport Architecture (`v1.2`)
+
+`agy-loop v1.2` extends the interactive scheduler into a deterministic, zero-dependency headless CLI runner (`agy-loop run | ps | logs | stop | statusline`) verified against **`agy v1.5.14`**, sharing the same `.agents/loop.md` precedence rules and `.agents/.agy-loop/` state store as `/agy-loop:loop`.
+
+```mermaid
+flowchart TD
+  Start["agy-loop run (parseRunArgs + fetchModelCatalog)"] --> Setup["Ensure .agents/.agy-loop + schemas + optional worktree"]
+  Setup --> BudgetStop{"Stop requested or budget exceeded?"}
+  BudgetStop -->|Yes| Finalize["Close StreamSession, finalize worktree, emit summary and exit code"]
+  BudgetStop -->|No| TaskRes["Resolve task (inline or live-reload loop.md)"]
+  TaskRes --> ProbeCheck{"--probe configured?"}
+  ProbeCheck -->|Pass with --probe-until-pass| DoneZero["Mark done (0 tokens, exit 0)"]
+  ProbeCheck -->|Fail or no --probe| ModeCheck{"Transport mode?"}
+  ModeCheck -->|fresh default| JsonTurn["runJsonTurn: agy --output-format json --json-schema ... -p prompt"]
+  ModeCheck -->|--stateful| StreamTurn["StreamSession: agy --input-format stream-json --output-format stream-json (no -p)"]
+  JsonTurn & StreamTurn --> ExitCheck{"Turn exitCode == 0 and no ERROR/timeout?"}
+  ExitCheck -->|Exit 1 or 2| FatalFail["fatal_config (exit 1 or 2, zero retries)"]
+  ExitCheck -->|Exit 3, ERROR, or timeout| Policy["classifyTurnFailure (AGY_ERROR): switch_fallback, retry, or blocked"]
+  Policy -->|retry or switch_fallback| Respawn["Backoff and respawn StreamSession with --conversation"]
+  Respawn --> ModeCheck
+  ExitCheck -->|Clean Exit 0| Audit["Check denied_actions and extractIterationOutcome (iteration nonce + finish step)"]
+  Audit -->|Invalid or stale| CircuitCheck["Increment consecutive_errors (circuit_broken at --max-errors)"]
+  Audit -->|DONE and --verifier-model| Verifier["Read-only runJsonTurn with VERIFIER_RESULT_SCHEMA"]
+  Verifier -->|Rejected or error, iter < max| ContinueLoop["Rewrite to CONTINUE with issues in next_hint"]
+  Verifier -->|Rejected or error at max/--once| FailClosed["Fail closed (blocked: exit 3 or exit 1)"]
+  Verifier -->|passed == true| DoneExit["Mark done (exit 0)"]
+  Audit -->|CONTINUE| ContinueLoop
+  ContinueLoop --> Sleep["Interruptible 500ms-polled sleep, then next iteration"]
+  Sleep --> BudgetStop
+```
+
+### 7.1 Dual-Transport Execution (`fresh` vs `--stateful`)
+
+1. **`fresh` Single-Turn JSON Transport (`lib/json-client.mjs`)**:
+   - Invokes `agy --output-format json --json-schema <iter-schema.json> --print-timeout <dur> [flags] -p "<prompt>"` per iteration with **all CLI flags strictly preceding `["-p", prompt]`**.
+   - Avoids `--agent loop-worker` (which exits `1` in `-p` mode because `mainAgent: false`) and instead carries the single-pass discipline directly in `buildWorkerPrompt` + `ITERATION_RESULT_SCHEMA` (root `"type": "object"`, required by `agy`).
+   - Uses string-aware outermost brace scanning (`parseJsonEnvelope`) when non-JSON lines precede/follow the JSON envelope, paired with an outer safety watchdog (`turnTimeoutSec + 60s`) and `AbortSignal` termination (`SIGTERM` + 5s `SIGKILL` fallback).
+2. **`--stateful` Persistent `stream-json` Transport (`lib/stream-client.mjs`)**:
+   - Spawns a long-lived bidirectional NDJSON process via `agy --input-format stream-json --output-format stream-json --json-schema <iter-schema.json> [flags]` — **never passing `-p` / `--print`** (which causes `agy` Exit `2`).
+   - Captures `conversation_id` on `event === "init"`, feeds each turn via `{"event":"user","message":{"content":...}}` over `stdin`, rotates processes cleanly every `--reset-every <N>` turns (seeding the fresh session's `next_hint` with `lastSummary` via `formatActionableSeedHint`), and closes gracefully via `stdin.end()`.
+   - **Cumulative Usage Delta Accounting (`computeUsageDelta`)**: `stream-json` emits cumulative session totals on each `result`; `StreamSession` subtracts `_prevTotals` (clamping each metric `>= 0`) so per-turn telemetry, `events.jsonl`, and `--max-tokens` reflect accurate incremental usage across respawns and `--reset-every` rotations.
+   - **Stale `structured_output` Guard (`extractIterationOutcome`)**: In `stream-json`, if a turn terminates without invoking the `finish` tool, `agy` can echo the previous turn's `structured_output`. Both `ITERATION_RESULT_SCHEMA` (requiring the current `iteration` integer nonce) and `StreamSession` (`step_update` tracking for `tool_name === "finish"`) guard against stale carryover, falling back to `parseFourLineFooter(result.response)` when valid or incrementing `consecutive_errors` otherwise.
+   - **Automatic `--conversation` Respawn on Exit `3`**: Because `agy` terminates the entire `stream-json` process if any turn fails or times out (Exit `3`), `runner.mjs` closes the failed session and spawns a fresh `StreamSession` with `--conversation <saved_id>` (and the new model if switching to `--fallback-model`).
+3. **Model Catalog & Minimal-Permission Flag Routing (`lib/models.mjs`, `buildAgyCommonFlags`)**:
+   - Queries `agy --output-format json models` (placing `--output-format json` before the `models` subcommand) and parses `JSONOutput.response` `<slug>\t<displayName>` lines, resolving either slug or display name and returning edit-distance suggestions (`exit 2`) if unknown.
+   - Automatically omits `--effort` whenever `isOrchestratorModel(model)` matches (rejected/ignored by `Orchestrator` models in `agy v1.5.14`).
+   - Passes `--disable-slash-commands` unless `--allow-slash-commands` is set, and omits `--mode` unless explicitly provided so the user's configured `agy` default mode (`auto` in `v1.5.7+`) is inherited.
+
+### 7.2 Unified Workspace State Store, Global Index & Stale PID Detection (`lib/state-store.mjs`)
+
+- **Bidirectional Interactive + Headless State**: Headless `agy-loop run` writes to the exact same `${AGY_LOOP_STATE_DIR:-<workspace>/.agents/.agy-loop}/loops/<loop_id>/` directory (`state.json`, `events.jsonl`, `control.json`, auto-`.gitignore` `*`) used by `loop-helper.sh`. Additive v1.2 fields (`engine`, `transport`, `pid`, `conversation_id`, `active_model`, `fallback_model`, `verifier_model`, `usage_totals`, `denied_actions_count`, `worktree_*`, `exit_reason`) are safely preserved or ignored by v1.1 POSIX helpers.
+- **Cross-Workspace Global Index**: Non-isolated runs perform best-effort atomic upserts into `~/.gemini/antigravity-cli/plugin_data/agy-loop/index.json` (200-entry cap, `AGY_LOOP_INDEX_PATH` override; automatically bypassed when `AGY_LOOP_STATE_DIR` isolates test environments) to power `agy-loop ps --global` and `agy-loop statusline --global`, refreshing live `state.json` from each recorded `state_dir` when readable.
+- **Stale PID Detection & Fast Statusline**: `isPidAlive(pid)` probes `process.kill(pid, 0)` (treating `EPERM` as alive and `ESRCH` as exited). Dead `engine: "headless"` processes marked `status: "running"` are flagged `stale: true` in `ps`, excluded from `agy-loop statusline` (`<5ms` pure FS read, zero subprocesses), and cleanly reconciled to `stopped` by `agy-loop stop`.
+
+### 7.3 `AGY_ERROR` Policy, Soft-Denial Auditing, Verifier Gate, `--probe` & `--worktree`
+
+1. **`AGY_ERROR` Parsing & Exit `0/1/2/3` Policy (`lib/error-policy.mjs`)**:
+   - Scans `stderr` for `AGY_ERROR: {...}` envelopes and classifies non-zero turn exits, `stream-json` `status: "ERROR"` / `print_timeout` results, and `timedOut` watchdog aborts via `classifyTurnFailure`:
+     - **Exit `1` / `2`**: `fatal_config` — fast fail with `0` retries (propagating `agy`'s exit code `1` or `2`).
+     - **Exit `3` + quota / `429` / `RESOURCE_EXHAUSTED` / capacity**: switches immediately to `--fallback-model` (`5s` delay, respawning `stream-json` with `--conversation` if stateful).
+     - **Non-retryable quota / spend cap / weekly limit**: marks loop `BLOCKED` (`exitCode: 3`).
+     - **`print_timeout`, outer watchdog `timedOut`, or `retryable: true`**: retries up to `--max-retries` (`3` default) with jittered exponential backoff (`30s -> 60s -> 120s`, ±15%).
+     - **Budgets & Circuit Breaker**: `checkBudgets` enforces `--max`, `--max-duration`, and `--max-tokens` (`max_reached`, `exitCode: 4`, while `--once` normal completion exits `0`) and trips `circuit_broken` (`exitCode: 1`) at `consecutive_errors >= --max-errors`.
+2. **Soft-Denial (`denied_actions[]`) Auditing**:
+   - Headless `agy` can deny unapproved or policy-restricted tools silently while still exiting `0`. `runner.mjs` inspects `result.denied_actions[]`, increments `denied_actions_count`, logs events to `events.jsonl`, emits warnings by default, and transitions immediately to `BLOCKED` (`exitCode: 3`) when `--fail-on-denied` is enabled.
+3. **Independent `--verifier-model` Gate (Fail-Closed)**:
+   - When the worker emits `DONE` and `--verifier-model` is configured, `runner.mjs` executes an independent read-only `runJsonTurn` (`mode: "auto"`, `sandbox: true`, `dangerouslySkipPermissions: false`, `allowSlashCommands: false`) using `VERIFIER_RESULT_SCHEMA` (`{ passed, summary, issues[] }`) seeded with `git status` and `git diff --stat`. If `passed === false` or the verifier errors/returns invalid JSON, `runner.mjs` fails closed: when `iteration < maxIterations`, it rewrites the iteration to `CONTINUE` with concrete `issues` (or verifier error details) injected into `next_hint`; when `iteration >= maxIterations` (including `--once`), it halts with `status: "blocked"` (`verifier_rejected` exit `3`, or `verifier_error` exit `1`).
+4. **Zero-Token `--probe` Preflight**:
+   - Executes `--probe "<cmd>"` with bounded `--probe-timeout` (`60s` default) before invoking the model. Under `--probe-until-pass`, exit `0` finishes immediately as `DONE` (`0` LLM tokens, `exitCode: 0`); otherwise, the bounded output tail is wrapped in `<<<PROBE_OUTPUT` delimiters inside `buildWorkerPrompt` as untrusted diagnostic data.
+5. **Headless Git `--worktree` Lifecycle (`lib/worktree.mjs`)**:
+   - Creates an isolated branch `agy-loop/<loop_id>` at `<stateRoot>/worktrees/<loop_id>` and runs both `agy` turns and `--probe` inside `worktreePath`.
+   - On completion or interrupt, `finalizeHeadlessWorktree` removes untouched worktrees (`0` commits ahead and clean tree, unless `--keep-worktree` is set) or preserves branches with commits/edits and prints ready-to-run `git merge` / `git cherry-pick` and cleanup commands.
