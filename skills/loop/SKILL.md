@@ -10,15 +10,15 @@ Act as a **non-blocking Loop Orchestrator** whenever the user invokes `/agy-loop
 ## Core Non-Blocking Invariants
 
 1. **NEVER use shell `sleep`, `watch`, or busy-wait loops** to pause between iterations.
-2. **Respect Asynchronous Turn Boundaries**: Both `invoke_subagent` (and `send_message`) and `schedule` run asynchronously in the background. After calling either primitive, **end your turn immediately** so the session parks at **zero token cost** and the user's main chat prompt stays unlocked.
-3. **Cross-Surface Tool Compatibility**: Across Antigravity CLI (`agy`) and Antigravity Desktop/IDE, file reads appear as `read_file` or `view_file`; shell execution uses `run_command`; background schedules use `schedule` and `manage_task`; subagents use `invoke_subagent`, `send_message`, and `manage_subagents`.
-4. **Helper Script Location**: Resolve `scripts/loop-helper.sh` relative to this `SKILL.md` directory (`<skill_dir>/scripts/loop-helper.sh`). Pass the user's workspace root as `<workspace_dir>` when calling `resolve-task` or `doctor`.
+2. **Respect Asynchronous Turn Boundaries**: Both `invoke_subagent` (`send_message`) and `schedule` run asynchronously in the background. After calling either primitive, **end your turn immediately** so the session parks at **zero token cost** and the main chat prompt stays unlocked.
+3. **Cross-Surface Tool Compatibility**: Across Antigravity CLI (`agy`) and Desktop/IDE, file reads appear as `read_file` or `view_file`; shell commands use `run_command`; schedules use `schedule` and `manage_task`; subagents use `invoke_subagent`, `send_message`, and `manage_subagents`.
+4. **Helper & Externalized State**: Resolve `<skill_dir>/scripts/loop-helper.sh` relative to this `SKILL.md` directory and pass the user's workspace root as `<workspace_dir>`. Runtime state persists in sandbox-writable `<workspace_dir>/.agents/.agy-loop/loops/<loop_id>/` (auto-gitignored).
 
 ---
 
 ## Phase 0: Lifecycle & Diagnostic Subcommands (`status` | `stop` | `doctor` | `help`)
 
-First, normalize user arguments safely via `run_command` using a single-quoted heredoc so quotes, `$()`, backticks, and `$VAR` in the user's prompt never undergo shell expansion:
+Normalize user arguments safely via `run_command` using a single-quoted heredoc so quotes, `$()`, backticks, and `$VAR` never undergo shell expansion:
 
 ```sh
 sh "<skill_dir>/scripts/loop-helper.sh" parse --stdin <<'AGY_LOOP_ARGS'
@@ -26,70 +26,73 @@ sh "<skill_dir>/scripts/loop-helper.sh" parse --stdin <<'AGY_LOOP_ARGS'
 AGY_LOOP_ARGS
 ```
 
-- If `loop-helper.sh` exits with code `2` (`{"error":"..."}`), report the validation error concisely and stop.
+- If `loop-helper.sh` exits `2` (`{"error":"..."}`), report the validation error concisely and stop.
+- If `parse` JSON includes a non-empty `"warnings"` array (e.g., unrecognized mid/trailing `--flag` kept in prompt), surface a brief 1-line notice to the user before continuing.
 - Handle lifecycle actions immediately without starting a loop:
 
-### 1. `{"action":"status"}` (`/agy-loop:loop status` or `list`)
-1. Call `manage_task(Action="list")` to inspect active `schedule` timers and cron jobs.
-2. Call `manage_subagents(Action="list")` to inspect `Running` or `Idle` `loop-worker` / loop `self` subagents.
-3. Present a concise status summary showing active loop `TaskId`s, cadence/mode, iteration progress, and active/idle subagent `ConversationId`s (or state that no `/agy-loop:loop` tasks are currently active).
+### 1. `{"action":"status", ...}` (`/agy-loop:loop status [--all] [--json]` or `list`)
+1. Run `sh "<skill_dir>/scripts/loop-helper.sh" state-list "<workspace_dir>"` (pass `--all` if `all == true`), `manage_task(Action="list")`, and `manage_subagents(Action="list")` in parallel.
+2. Correlate `loop_id`, `iteration`/`max_iterations`, `status`/`stop_mode`, `TaskId`, `ConversationId`, and `worktree_branch` into one concise status table (or note that no loops are active).
 
-### 2. `{"action":"stop","target":"all"|<id>}` (`/agy-loop:loop stop [id|all|--all]`, `cancel`, or conversational stop)
-1. Call `manage_task(Action="list")` and call `manage_task(Action="kill", TaskId=...)` on matching loop timer/cron schedules (or the specific `<target>` `TaskId`).
-2. Call `manage_subagents(Action="list")`:
-   - If the user asked to stop *after* the current pass finishes, leave a `Running` worker alone and stop once it reports back.
-   - Otherwise, call `manage_subagents(Action="kill", ConversationIds=[...])` on active or `Idle` loop subagents. *(Caution: killing a `Workspace: "branch"` / `--worktree` subagent deletes its temporary worktree — surface any unmerged branch/diff info first if needed.)*
-3. Confirm all cancelled `TaskId`s and subagents in one concise message.
+### 2. `{"action":"stop", ...}` (`/agy-loop:loop stop [id1 id2|all] [--after-current]`)
+1. Run `sh "<skill_dir>/scripts/loop-helper.sh" state-stop "<workspace_dir>" "<target>"` (append `--after-current` when `after_current == true`; iterate each ID in `targets` if `targets` is present) to get exact linked `task_id` and `worker_id` pairs (`stopped[]`). Also check `manage_task(Action="list")` / `manage_subagents(Action="list")` if needed for untracked loops.
+2. Kill each linked `task_id` via `manage_task(Action="kill", TaskId=...)`.
+3. If `after_current == true` (or user asked to stop after the current pass finishes): leave any `Running` worker alone so Turn B finalizes cleanly when it returns; otherwise kill linked `worker_id`s via `manage_subagents(Action="kill", ConversationIds=[...])`. *(Caution: killing a `branch` / `--worktree` subagent deletes its worktree — surface branch, `git diff --stat`, and merge commands first and keep `Idle` if unmerged commits await review.)*
+4. Confirm all stopped `loop_id`s, `TaskId`s, and subagents concisely.
 
-### 3. `{"action":"doctor"}` or `{"action":"doctor","clean_shadow":true}` (`/agy-loop:loop doctor [--clean-shadow]`)
-1. If `"clean_shadow": true`, run `sh "<skill_dir>/scripts/loop-helper.sh" doctor --clean-shadow "<workspace_dir>"` to non-destructively move any shadowing user-level customizations into `~/.gemini/config/.agy-loop-backup-<UTC-timestamp>/`. Report `cleaned_shadows`, `backup_dir`, resulting `ok` status, and **remind the user to run `/skills reload`** so the current session picks up the unshadowed plugin skill and `loop-worker` subagent.
-2. Otherwise, run `sh "<skill_dir>/scripts/loop-helper.sh" doctor "<workspace_dir>"` and report `ok`, any user-level shadow paths overriding the plugin (`~/.gemini/config/skills/loop`, `~/.gemini/config/agents/loop-worker.md`, `~/.gemini/antigravity-cli/skills/loop`, `~/.gemini/skills/loop` — recommend `/agy-loop:loop doctor --clean-shadow`, `sh ~/.gemini/config/plugins/agy-loop/install.sh --clean-shadow`, or `npx agy-loop doctor --clean-shadow` followed by `/skills reload`), any `skills.json` `"include_only"` / `"exclude"` filter warnings, and the active `loop.md` path (inspect with `read_file` / `view_file` if requested).
+### 3. `{"action":"doctor", ...}` (`/agy-loop:loop doctor [--clean-shadow]`)
+1. If `"clean_shadow": true`, run `sh "<skill_dir>/scripts/loop-helper.sh" doctor --clean-shadow "<workspace_dir>"` to archive shadowing `~/.gemini/...` files into `~/.gemini/config/.agy-loop-backup-<UTC>/`. Report `cleaned_shadows`, `backup_dir`, `ok`, `active_loops`, and **remind the user to run `/skills reload`**.
+2. Otherwise, run `sh "<skill_dir>/scripts/loop-helper.sh" doctor "<workspace_dir>"` and report `ok`, `shadows` (suggest `--clean-shadow` + `/skills reload` if non-empty), `skill_filter_warnings`, `active_loop_md`, and `active_loops`.
 
 ### 4. `{"action":"help"}` (`/agy-loop:loop help`, `--help`, or `-h`)
-Print a concise usage summary of `/agy-loop:loop` (5 modes: fixed interval `/agy-loop:loop 30s <task>` or `<task> every 5m`, dynamic self-paced `/agy-loop:loop <task>`, live-reloading `loop.md` `/agy-loop:loop` or `/agy-loop:loop 15m`, delayed one-shot `/agy-loop:loop in 20m <task>` or `--once`, and lifecycle `/agy-loop:loop status|stop|doctor [--clean-shadow]|help`; plus flags `--max <N>`, `--stateful`, `--worktree`, `--share`, `--model <inherit|flash_lite|flash|pro>`, `--self`, `--cron`, `--exact`, `--daemon`, `--once`) and end your turn without dispatching a worker.
+Print a concise usage summary covering:
+- **5 modes**: fixed interval (`30s <task>`, `every 5m <task>`, `<task> every 2h`, compound durations like `1h30m` / `2m30s`), dynamic self-paced (`/agy-loop:loop <task>`), live-reloading `loop.md` (`/agy-loop:loop` or `/agy-loop:loop 15m`), delayed one-shot (`in 20m <task>` or `--once`), and lifecycle (`status [--all]`, `stop [<id1> <id2>|all] [--after-current]`, `doctor [--clean-shadow]`, `help`).
+- **Flags**: `--max <N>`, `--stateful`, `--fresh`, `--worktree`, `--share`, `--model <inherit|flash_lite|flash|pro>`, `--self`, `--cron`, `--exact`, `--daemon`, `--once`, and `--` (end of options).
+End your turn without dispatching a worker.
 
 ---
 
 ## Three-Turn Reactive Loop Protocol (`{"action":"run", ...}`)
 
 Every running loop operates across three short, non-blocking reactive turns:
-
-1. **Turn A — Initial Dispatch Turn** (user runs `/loop ...`)
-2. **Turn B — Subagent Completion Wake-Up Turn** (`loop-worker` / `self` returns 4-line footer)
-3. **Turn C — Timer / Cron Wake-Up Turn** (`schedule` delivers `[LOOP_WAKEUP]` prompt)
+1. **Turn A** — Initial Dispatch Turn (user runs `/agy-loop:loop ...`)
+2. **Turn B** — Subagent Completion Wake-Up Turn (worker returns 4-line footer)
+3. **Turn C** — Timer / Cron Wake-Up Turn (`schedule` delivers `[LOOP_WAKEUP]`)
 
 ### Turn A: Initial Dispatch Turn
 
-Using the JSON output from `loop-helper.sh parse`:
-
-1. **Resolve Initial Task Instructions**:
+1. **Persist Initial Loop State (`state-init`)**:
+   Pipe the `parse` `run` JSON via single-quoted heredoc to obtain the authoritative `loop_id` (and initialize `<workspace_dir>/.agents/.agy-loop/.gitignore`):
+   ```sh
+   sh "<skill_dir>/scripts/loop-helper.sh" state-init "<workspace_dir>" --stdin <<'AGY_LOOP_PARSE'
+   <parse_run_json>
+   AGY_LOOP_PARSE
+   ```
+2. **Resolve Initial Task Instructions**:
    - **`task_source == "inline"`**: Use `prompt` directly.
    - **`task_source == "loop_md_or_default"`**: Run:
      ```sh
      sh "<skill_dir>/scripts/loop-helper.sh" resolve-task "<workspace_dir>"
      ```
-     *(Checks `<workspace_dir>/.agents/loop.md` -> `<workspace_dir>/loop.md` -> `~/.gemini/config/loop.md` -> built-in branch/PR maintenance fallback, capped at `25,000` bytes; you may also read with `read_file` or `view_file`.)*
-2. **Confirm Subagent Target (`delegate`)**:
-   - Keep `delegate: "loop-worker"` by default (lightweight `flash`, `sandbox`, 9 verified Cortex tools).
-   - Use `delegate: "self"` when `parse` set `"delegate": "self"` (`--self` flag or inline prompt starting with `/` such as `/loop 20m /code-review`) **or** when the task requires MCP server tools, web/browser tools, or another skill unavailable on `loop-worker`.
-3. **Branch: Delayed One-Shot vs Immediate Iteration #1**:
-   - **Delayed One-Shot (`once == true` and `interval_sec != null`, e.g., `/loop in 20m <task>` or `/loop --once 10m <task>`)**:
-     - Do **not** invoke the subagent yet.
-     - Call `schedule(DurationSeconds=interval_sec, Prompt="<[LOOP_WAKEUP] state block with iteration=1, max_iterations=1, ...>")`.
-     - Print a 1-line confirmation (`Scheduled one-shot check-in in <interval_label> (TaskId: <id>). Main prompt is free.`) and **end your turn immediately**.
-   - **Standard Loop (or immediate `--once` without `interval_sec`)**:
-     - If `use_cron == true` (`--cron` passed with a clean `>= 60s` `cron_expr`) and `max_iterations > 1`, you may register `schedule(CronExpression=cron_expr, MaxIterations=max_iterations - 1, ExactTiming=exact_timing, IsDaemon=is_daemon, Prompt="<[LOOP_WAKEUP] state block>")` and record its `cron_task_id` (or register it when Iteration #1 completes).
-     - Call `invoke_subagent` with:
-       - `TypeName`: `delegate` (`"loop-worker"` or `"self"`)
-       - `Workspace`: `workspace` (`"inherit"`, `"branch"` for `--worktree`, or `"share"` for `--share`)
-       - `Model`: `model` (omit if `null` so `loop-worker` uses its `flash` default or `self` inherits)
-       - `Prompt`: Build from the **Worker Dispatch Template** below (`Iteration: 1 / <max_iterations>`, `NEXT_HINT: None`).
-     - Save the returned subagent conversation ID as `worker_id` whenever `state_mode == "stateful"` or `workspace == "branch"`.
-     - Print a single launch line (e.g., `Dispatched Loop #1/<max_iterations> to <delegate> (<pacing>, <state_mode>, workspace=<workspace>). Main prompt is free.`) and **end your turn immediately**. Do **not** wait or call `schedule` for Iteration #2 before Iteration #1 returns!
+     *(Always resolve via `resolve-task` — do NOT bypass with direct `read_file`/`view_file` so `.agents/loop.md -> loop.md -> ~/.gemini/config/loop.md -> builtin` precedence and the `25,000`-byte cap are preserved.)* If `"truncated": true`, explicitly print a 1-line warning to the user.
+3. **Confirm Subagent Target (`delegate`)**:
+   - Keep `delegate: "loop-worker"` by default (lightweight `flash`, `sandbox`, 6 cross-engine verified tools: `view_file`, `write_to_file`, `replace_file_content`, `run_command`, `manage_task`, `search_web`).
+   - Use `delegate: "self"` when `parse` set `"delegate": "self"` (`--self` or `/` prompt) or when MCP/browser/other skills unavailable on `loop-worker` are needed.
+4. **Branch: Delayed One-Shot vs Immediate Iteration #1**:
+   - **Delayed One-Shot (`once == true` and `interval_sec != null`)**:
+     - Call `schedule(DurationSeconds=interval_sec, Prompt="<[LOOP_WAKEUP] block>")`.
+     - Persist `task_id`: `sh "<skill_dir>/scripts/loop-helper.sh" state-update "<workspace_dir>" "<loop_id>" --task-id "<task_id>" --event scheduled`.
+     - Print 1 line (`Scheduled one-shot [<loop_id>] in <interval_label> (TaskId: <id>). Main prompt is free.`) and **end your turn immediately**.
+   - **Standard Loop (or immediate `--once`)**:
+     - If `use_cron == true` and `max_iterations > 1`, you may register `schedule(CronExpression=cron_expr, MaxIterations=max_iterations - 1, ExactTiming=exact_timing, IsDaemon=is_daemon, Prompt="<[LOOP_WAKEUP] block>")` and capture `cron_task_id` (or register after Iteration #1).
+     - Call `invoke_subagent` (`TypeName`: `delegate`, `Workspace`: `workspace`, `Model`: `model` if non-null, `Prompt`: Worker Dispatch Template below for Iteration `1/<max_iterations>`, `NEXT_HINT: None`).
+     - Record `worker_id` (and `task_id` if cron registered) in `state.json`:
+       ```sh
+       sh "<skill_dir>/scripts/loop-helper.sh" state-update "<workspace_dir>" "<loop_id>" --worker-id "<worker_id>" [--task-id "<cron_task_id>"] --event dispatch
+       ```
+     - Print 1 launch line (`Dispatched Loop [<loop_id>] #1/<max_iterations> to <delegate> (<pacing>, <state_mode>, workspace=<workspace>). Main prompt is free.`) and **end your turn immediately**.
 
 #### Worker Dispatch Template
-
-Pass this concise, self-contained prompt to `loop-worker` or `self`:
 
 ```text
 [AGY-LOOP ITERATION <N>/<MAX>]
@@ -102,10 +105,10 @@ Task Objective:
 Rules:
 - Execute ONE check/build/test/remediation pass only. Never run sleep, watch, or polling loops.
 - If you edit files, run the relevant verification command once in this turn before reporting.
-- If Workspace is "branch" (--worktree), stage & commit verified fixes locally (or report branch + git diff --stat) without pushing unless explicitly requested.
+- If Workspace is "branch" (--worktree), distinguish pre-existing dirty files (inherited in v1.5.5+) from your edits, commit verified fixes locally without pushing, and report branch + git diff --stat in SUMMARY.
 - End your message with these exact 4 plain-text lines (no markdown code fences around them):
 LOOP_STATUS: DONE | CONTINUE | BLOCKED
-NEXT_DELAY_SEC: <integer seconds: 30-60 active, 120-300 normal CI wait, 600-1800 quiet green, 0 if DONE/BLOCKED>
+NEXT_DELAY_SEC: <integer seconds: 30-60 active, 120-300 CI wait, 600-1800 quiet green, 0 if DONE/BLOCKED>
 SUMMARY: <concise 1-line summary of observed state and actions taken>
 NEXT_HINT: <brief focus point for next iteration, or None>
 ```
@@ -116,52 +119,67 @@ NEXT_HINT: <brief focus point for next iteration, or None>
 
 When awakened by the subagent's completion message for Iteration `N`:
 
-1. **Extract the 4-Line Output Contract**:
-   Parse `LOOP_STATUS`, `NEXT_DELAY_SEC`, `SUMMARY`, and `NEXT_HINT` from the tail of the worker's response. *(If a `self` worker omitted the footer, infer status conservatively and fall back to `NEXT_DELAY_SEC: 120` in dynamic mode.)*
-2. **Terminal Outcomes (`LOOP_STATUS == DONE`, `LOOP_STATUS == BLOCKED`, or `N >= max_iterations`)**:
-   - **Cancel Remaining Schedules**: If `cron_task_id` or any loop timer is active, call `manage_task(Action="list")` / `manage_task(Action="kill", TaskId=...)` so no orphan wake-ups fire.
-   - **Subagent & Worktree Cleanup**:
-     - If `workspace == "branch"` (`--worktree`): report the worker's branch/commit/diff status clearly before killing `worker_id` (since killing a `branch` subagent deletes its isolated worktree; keep it `Idle` if unmerged commits need user review/merge).
-     - Otherwise, if `worker_id` is `Idle` (`--stateful`), call `manage_subagents(Action="kill", ConversationIds=[worker_id])` to tidy up.
-   - **Final User Report**:
-     - `DONE`: `[Loop #<N>/<Max>] DONE: <SUMMARY>` followed by a concise outcome wrap-up.
-     - `BLOCKED`: `[Loop #<N>/<Max>] BLOCKED: <SUMMARY>` and ask the user for the needed decision, approval, or credential.
-     - `N >= max_iterations` (while still `CONTINUE`): `[Loop #<N>/<Max>] Reached max iterations (<Max>): <SUMMARY>` and ask if the user wants to run another batch.
-   - Stop and end your turn.
-3. **Continue Outcome (`LOOP_STATUS == CONTINUE` and `N < max_iterations`)**:
-   - **Select Delay**:
-     - `pacing == "fixed"`: `delay_sec = interval_sec` (display `interval_label`).
-     - `pacing == "dynamic"`: `delay_sec = max(10, NEXT_DELAY_SEC)` (format cleanly, e.g., `45s`, `2m`, `10m`).
-   - **Print Exactly One Compact Progress Line**:
-     ```text
-     [Loop #<N>/<Max>] <SUMMARY> | Next wake-up in <delay_label> (<self-paced | fixed <interval_label> | cron <cron_expr>>)
+1. **Read Authoritative State & Extract 4-Line Contract**:
+   - Call `sh "<skill_dir>/scripts/loop-helper.sh" state-read "<workspace_dir>" "<loop_id>"` to check `stop_requested`, `consecutive_errors`, `task_id`, `max_iterations`, and `workspace`.
+   - Parse `LOOP_STATUS`, `NEXT_DELAY_SEC`, `SUMMARY`, and `NEXT_HINT` from the tail of the worker's response.
+2. **Consecutive-Error Circuit Breaker**:
+   - **Missing/Invalid 4-Line Footer or Unrecoverable Worker Failure**: Run `sh "<skill_dir>/scripts/loop-helper.sh" state-update "<workspace_dir>" "<loop_id>" --increment-errors`.
+     - If updated `consecutive_errors >= 3`: mark `"status": "circuit_broken"` via `state-update`, cancel any active `task_id` schedule (`manage_task(Action="kill", TaskId=...)`), preserve `branch` worktree if needed, report `[Loop <loop_id> #N/<Max>] CIRCUIT_BROKEN: 3 consecutive worker contract/runtime failures` with diagnostic details, and stop.
+     - If `consecutive_errors < 3`: continue with fallback `LOOP_STATUS = CONTINUE` and `NEXT_DELAY_SEC = 120` (do NOT pass `--reset-errors`).
+   - **Valid 4-Line Footer**: Reset error count via `--reset-errors` in `state-update`.
+3. **Delay Validation & Clamping**:
+   - Parse `NEXT_DELAY_SEC` as an integer; if missing, non-integer, or `< 0`, default to `120`.
+   - `pacing == "fixed"`: `delay_sec = interval_sec`.
+   - `pacing == "dynamic"`: clamp `delay_sec = min(86400, max(10, NEXT_DELAY_SEC))`.
+4. **Worktree Preservation (`agy v1.5.5+`)**:
+   - If `workspace == "branch"`, record the branch name (`worktree_branch`) via `state-update`.
+   - Before killing a `branch` subagent, surface `worktree_branch`, `git diff --stat`, and ready-to-run `git cherry-pick` / `git merge` commands. Keep the `branch` subagent `Idle` if unmerged commits await user review (killing deletes its worktree).
+5. **Terminal Outcomes (`stop_requested == true`, `LOOP_STATUS == DONE`, `LOOP_STATUS == BLOCKED`, or `N >= max_iterations`)**:
+   - Cancel remaining schedules (`manage_task(Action="kill", TaskId=...)` using `task_id`/`cron_task_id`).
+   - Persist terminal state (`"stopped"`, `"done"`, `"blocked"`, or `"max_reached"`) via `state-update --stdin <<'AGY_LOOP_PATCH'`.
+   - Clean up non-`branch` `Idle` subagent (`manage_subagents(Action="kill", ConversationIds=[worker_id])`); for `branch`, follow Step 4 above.
+   - Report final summary (`DONE`, `BLOCKED` with needed decision/credential, `Stopped`, or `Reached max iterations`) and **end your turn**.
+6. **Continue Outcome (`LOOP_STATUS == CONTINUE` and `N < max_iterations`)**:
+   - Schedule next wake-up:
+     - **`use_cron == false` (default)**: Call `schedule(DurationSeconds=delay_sec, Prompt="<[LOOP_WAKEUP] block>")` and capture `next_task_id`.
+     - **`use_cron == true`**: If `task_id` (`cron_task_id`) is not active yet, call `schedule(CronExpression=cron_expr, MaxIterations=max_iterations - N, ExactTiming=exact_timing, IsDaemon=is_daemon, Prompt="<[LOOP_WAKEUP] block>")` and capture `next_task_id`; otherwise reuse existing `task_id`.
+   - Persist state atomically via single-quoted heredoc so quotes, backticks, and `$()` in `SUMMARY`/`NEXT_HINT` are 100% shell-safe:
+     ```sh
+     sh "<skill_dir>/scripts/loop-helper.sh" state-update "<workspace_dir>" "<loop_id>" --increment-iteration --reset-errors --stdin <<'AGY_LOOP_PATCH'
+     {"task_id":"<next_task_id>","worker_id":<worker_id_or_null>,"worktree_branch":<branch_or_null>,"last_status":"<LOOP_STATUS>","last_delay_sec":<delay_sec>,"last_summary":"<json_escaped_summary>","next_hint":"<json_escaped_next_hint>","event":"iteration_complete"}
+     AGY_LOOP_PATCH
      ```
-   - **Schedule Non-Blocking Wake-Up**:
-     - **Default Chained One-Shot Timer (`use_cron == false`)** *(prevents overlapping runs and supports sub-minute `DurationSeconds`)*:
-       Call `schedule(DurationSeconds=delay_sec, Prompt="<[LOOP_WAKEUP] state block>")` embedding all state needed for Iteration `N + 1`:
-       ```text
-       [LOOP_WAKEUP]
-       skill_dir: <skill_dir>
-       workspace_dir: <workspace_dir>
-       iteration: <N + 1>
-       max_iterations: <max_iterations>
-       pacing: <fixed|dynamic>
-       interval_sec: <interval_sec|null>
-       interval_label: <interval_label|null>
-       use_cron: false
-       cron_task_id: null
-       state_mode: <fresh|stateful>
-       worker_id: <worker_id|null>
-       workspace: <inherit|branch|share>
-       model: <model|null>
-       delegate: <loop-worker|self>
-       task_source: <inline|loop_md_or_default>
-       inline_prompt: <inline prompt if task_source == inline, else empty>
-       next_hint: <NEXT_HINT>
-       ```
-     - **Cron Mode (`use_cron == true`)**:
-       If `cron_task_id` has not been created yet, call `schedule(CronExpression=cron_expr, MaxIterations=max_iterations - N, ExactTiming=exact_timing, IsDaemon=is_daemon, Prompt="<[LOOP_WAKEUP] state block with cron_task_id placeholder>")` and retain `cron_task_id`, `worker_id`, `iteration = N + 1`, and `NEXT_HINT`. If `cron_task_id` is already active, do not create a duplicate timer.
+     *(Omit `--reset-errors` if Step 2 already incremented `consecutive_errors` for a recoverable missing-footer turn.)*
+   - Print **exactly one compact progress line**:
+     ```text
+     [Loop <loop_id> #<N>/<Max>] <SUMMARY> | Next wake-up in <delay_label> (<self-paced | fixed <interval_label> | cron <cron_expr>>)
+     ```
    - **End your turn immediately**.
+
+#### Compact `[LOOP_WAKEUP]` Schedule Prompt
+
+Put `loop_id`, `skill_dir`, and `workspace_dir` at top, keeping concise fallback metadata below in case `state.json` is absent:
+```text
+[LOOP_WAKEUP]
+loop_id: <loop_id>
+skill_dir: <skill_dir>
+workspace_dir: <workspace_dir>
+fallback_iteration: <N + 1>
+fallback_max_iterations: <max_iterations>
+fallback_pacing: <fixed|dynamic>
+fallback_interval_sec: <interval_sec|null>
+fallback_interval_label: <interval_label|null>
+fallback_use_cron: <false|true>
+fallback_cron_task_id: <cron_task_id|null>
+fallback_state_mode: <fresh|stateful>
+fallback_worker_id: <worker_id|null>
+fallback_workspace: <inherit|branch|share>
+fallback_model: <model|null>
+fallback_delegate: <loop-worker|self>
+fallback_task_source: <inline|loop_md_or_default>
+fallback_inline_prompt: <inline prompt or empty>
+fallback_next_hint: <NEXT_HINT>
+```
 
 ---
 
@@ -169,17 +187,22 @@ When awakened by the subagent's completion message for Iteration `N`:
 
 When awakened by a `[LOOP_WAKEUP]` notification from `schedule`:
 
-1. **Overlap Guard (`use_cron == true`)**: Check `manage_subagents(Action="list")` if a prior cron tick could still be executing. If the loop worker is still `Running`, skip starting an overlapping pass and end your turn.
-2. **Hot-Reload `loop.md` When Applicable**:
-   - If `task_source == "loop_md_or_default"`, re-run `sh "<skill_dir>/scripts/loop-helper.sh" resolve-task "<workspace_dir>"` (or re-read via `read_file` / `view_file`) **on every wake-up** so live edits to `.agents/loop.md`, `loop.md`, or `~/.gemini/config/loop.md` apply immediately without restarting `/loop`.
+1. **Read Authoritative State FIRST**:
+   Call `sh "<skill_dir>/scripts/loop-helper.sh" state-read "<workspace_dir>" "<loop_id>"` to load authoritative `iteration`, `max_iterations`, `worker_id`, `task_id`, `next_hint`, `consecutive_errors`, `stop_requested`, `status`, `task_source`, `inline_prompt`, `state_mode`, `workspace`, `model`, `delegate`, and `use_cron` (eliminating `--cron` static-prompt drift and surviving context compaction). *(Use `fallback_*` fields only if the state file is missing.)*
+2. **Stop / Status Guard**:
+   If `stop_requested == true` or `status != "running"`, cancel any remaining `task_id` via `manage_task(Action="kill", TaskId=...)` and **end your turn cleanly** without dispatching.
+3. **Overlap Guard (`use_cron == true`)**:
+   Check `manage_subagents(Action="list")`. If `worker_id` is still `Running`, skip this tick and **end your turn immediately without incrementing `iteration`** in `state.json`.
+4. **Hot-Reload `loop.md` Strictly via Helper**:
+   - If `task_source == "loop_md_or_default"`, re-run `sh "<skill_dir>/scripts/loop-helper.sh" resolve-task "<workspace_dir>"` on every wake-up (do NOT bypass with `read_file`/`view_file`). If `"truncated": true`, print a 1-line truncation warning.
    - If `task_source == "inline"`, use `inline_prompt`.
-3. **Dispatch Iteration `N` Asynchronously**:
-   - **`state_mode == "stateful"` with an existing `Idle` `worker_id`**: Call `send_message(Recipient=worker_id, Message="<Worker Dispatch Template for Iteration N/Max>")` to re-awaken the subagent with its prior debugging context preserved. *(If `worker_id` is missing or `Killed`, spawn a fresh one with `invoke_subagent` and update `worker_id`.)*
-   - **`state_mode == "fresh"` (or Iteration #1 of a delayed one-shot)**: Call `invoke_subagent` (`TypeName: delegate`, `Workspace: workspace`, `Model: model`) with a clean context window.
-4. **End your turn immediately** while the worker executes in the background.
+5. **Dispatch Iteration `N` Asynchronously**:
+   - **`state_mode == "stateful"` with an `Idle` `worker_id`**: Call `send_message(Recipient=worker_id, Message="<Worker Dispatch Template for Iteration N/Max>")` using authoritative `next_hint`. *(If `worker_id` is missing or `Killed`, spawn via `invoke_subagent` and update `worker_id` via `state-update`.)*
+   - **`state_mode == "fresh"` (or delayed one-shot Iteration #1)**: Call `invoke_subagent` (`TypeName: delegate`, `Workspace: workspace`, `Model: model`) and record `worker_id` via `state-update`.
+6. **End your turn immediately** while the worker runs in the background.
 
 ---
 
 ## Progressive Disclosure References
 
-Need ready-to-copy `.agents/loop.md` templates, advanced flag combinations (`--worktree`, `--stateful`, `--self`, `--cron`), or CLI TUI keyboard controls (`/tasks`, `/agents`, `Ctrl+K`, `Alt+J`, `Esc`)? Read `references/examples-and-loop-md.md` (relative to this skill directory) via `read_file` or `view_file`.
+For copy-paste `.agents/loop.md` templates, advanced flag recipes (`every`, `1h30m`, `--worktree`, `--stateful`, `--self`, `--cron`), or CLI TUI controls (`/tasks`, `/agents`, `Ctrl+K`, `Alt+J`, `Esc`), read `references/examples-and-loop-md.md` via `read_file` or `view_file`.

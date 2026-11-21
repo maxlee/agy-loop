@@ -60,10 +60,12 @@ Live edits to any `loop.md` file take effect automatically on the next scheduled
 
 ## 2. Advanced `/agy-loop:loop` Recipes
 
-### Sub-Minute Local Service / Health Readiness (`DurationSeconds`)
-Beats 1-minute cron floors using non-overlapping one-shot timers:
+### Sub-Minute & Compound Duration Local Readiness (`DurationSeconds`)
+Beats 1-minute cron floors using non-overlapping one-shot timers, and supports prefix `every` plus compound durations (`1h30m`, `2m30s`, `1d12h`):
 ```text
 /agy-loop:loop 20s "curl -fsS http://localhost:8080/healthz && curl -fsS http://localhost:8080/readyz" --max 15
+/agy-loop:loop every 2m30s check staging canary health
+/agy-loop:loop 1h30m audit nightly backup status
 ```
 
 ### Multi-Turn Stateful Bug Hunting (`--stateful`)
@@ -73,9 +75,15 @@ Re-awakens the same `Idle` `loop-worker` via `send_message` so hypotheses ruled 
 ```
 
 ### Risk-Free Experimental Fix in an Isolated Git Worktree (`--worktree`)
-Runs inside `Workspace: "branch"` so uncommitted edits in your active terminal remain untouched while you keep coding or chatting:
+Runs inside `Workspace: "branch"` so uncommitted edits in your active terminal remain untouched while you keep coding or chatting. In `agy v1.5.5+`, worktrees carry over pre-existing dirty files from the parent checkout; `agy-loop` tracks `worktree_branch` in `.agents/.agy-loop/` and surfaces `git diff --stat` plus `git cherry-pick` / `git merge` commands before teardown:
 ```text
 /agy-loop:loop 5m refactor flaky integration test in tests/sync.spec.ts until green --worktree --stateful --max 8
+```
+
+### Escaping Command Flags (`--` & Two-Tier Validation)
+Unrecognized flags in leading option slots or close typos (`--statefull`, `--max-iter`) fail fast with Exit `2`, while command flags embedded mid/trailing prompt (`gh pr checks --required`) pass through with a non-blocking warning (or pass `--` to treat everything after as literal prompt text):
+```text
+/agy-loop:loop 3m -- gh pr checks --required
 ```
 
 ### Delegating to Nested Slash Skills or MCP Tools (`--self` or `/skill`)
@@ -106,9 +114,9 @@ While `/agy-loop:loop` runs asynchronously in the background, users have full in
 
 | Control | Where to Use | Effect |
 | :--- | :--- | :--- |
-| `/agy-loop:loop status` | Main chat prompt | Lists active `schedule` timers/crons (`manage_task`) and `Running`/`Idle` loop subagents (`manage_subagents`). |
-| `/agy-loop:loop stop [id\|all]` | Main chat prompt | Programmatically cancels active loop schedules and terminates loop subagents. |
-| `/agy-loop:loop doctor [--clean-shadow]` | Main chat prompt | Checks shadow files in `~/.gemini/...` (and optionally backs them up), `skills.json` filters, and active `loop.md`. |
+| `/agy-loop:loop status [--all]` | Main chat prompt | Lists active (or all) persisted `.agents/.agy-loop/` loops correlated with `manage_task` timers/crons and `manage_subagents` workers. |
+| `/agy-loop:loop stop [<id1> <id2>\|all] [--after-current]` | Main chat prompt | Cancels linked `schedule` timers and terminates loop subagents (or drains gracefully after the current pass with `--after-current`). |
+| `/agy-loop:loop doctor [--clean-shadow]` | Main chat prompt | Checks shadow files in `~/.gemini/...` (optionally archiving to UTC backup), `skills.json` filters, active `loop.md`, and `active_loops`. |
 | `/agy-loop:loop help` | Main chat prompt | Prints concise `/agy-loop:loop` modes, flags, and lifecycle reference without starting a loop. |
 | `/tasks` -> `k` | `agy` TUI panel | Opens background task manager; highlight a scheduled timer or cron job and press `k` to kill future wake-ups (`x` removes finished entries). |
 | `/agents` -> `k` | `agy` TUI panel | Opens subagent manager; highlight a `Running` or `Idle` `loop-worker` and press `k` to terminate it immediately (cleans up temporary `--worktree` branches). |

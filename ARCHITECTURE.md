@@ -1,6 +1,6 @@
 # `agy-loop` Technical Architecture
 
-`agy-loop` implements a pure, Marketplace-compatible non-blocking `/agy-loop:loop` scheduler for **Google Antigravity Desktop** and **Antigravity CLI (`agy`)**. Rather than blocking an interactive turn with shell `sleep` or running noisy polling commands inside the primary conversation window, `agy-loop` splits scheduling, deterministic argument/file resolution, and single-pass task execution across crisp capability boundaries without writing files outside the plugin bundle.
+`agy-loop` implements a pure, Marketplace-compatible non-blocking `/agy-loop:loop` scheduler for **Google Antigravity Desktop** and **Antigravity CLI (`agy`)**. Rather than blocking an interactive turn with shell `sleep` or running noisy polling commands inside the primary conversation window, `agy-loop` splits scheduling, deterministic argument/state resolution, and single-pass task execution across crisp capability boundaries — never writing loose files to `~/.gemini/` outside the plugin bundle, while storing sandbox-safe per-loop state under `<workspace>/.agents/.agy-loop/` (automatically `.gitignore`d).
 
 ---
 
@@ -9,22 +9,22 @@
 ```text
 agy-loop/
 ├── plugin.json                              # Strict Antigravity v1 plugin manifest (additionalProperties: false)
-├── hooks.json                               # SessionStart shadow-collision detector (0 tokens when clean)
+├── hooks.json                               # SessionStart shadow & skills.json filter detector (0 tokens when clean)
 ├── package.json                             # Zero-dependency npm CLI bridge manifest (Node >= 18 ESM)
 ├── bin/
-│   └── agy-loop.mjs                         # npm <-> `agy plugin` installer, shadow cleaner & doctor CLI
+│   └── agy-loop.mjs                         # npm <-> `agy plugin` installer, shadow cleaner & upgraded doctor CLI
 ├── agents/
-│   └── loop-worker.md                       # Isolated single-pass subagent (flash, sandbox, 9 Cortex tools)
+│   └── loop-worker.md                       # Isolated single-pass subagent (flash, sandbox, 6 cross-engine tools)
 ├── skills/
 │   └── loop/
-│       ├── SKILL.md                         # Session orchestrator skill (/agy-loop:loop, < 24 KB)
+│       ├── SKILL.md                         # Session orchestrator skill (/agy-loop:loop, < 18 KB target / < 24 KB cap)
 │       ├── scripts/
-│       │   └── loop-helper.sh               # Pure POSIX sh parser, loop.md resolver, session-start & doctor (0755)
+│       │   └── loop-helper.sh               # Pure POSIX sh parser, state-* store, loop.md resolver, hook & doctor (0755)
 │       └── references/
 │           └── examples-and-loop-md.md      # Progressive-disclosure recipes, templates & TUI controls
 ├── assets/
 │   └── logo.svg                             # 128x128 square Marketplace icon
-├── install.sh                               # Pure POSIX one-line & in-place (--clean-shadow) installer
+├── install.sh                               # Pure POSIX one-line & in-place (--clean-shadow) installer (UTC backups)
 ├── uninstall.sh                             # Pure POSIX clean uninstaller
 └── tests/
     └── plugin.test.mjs                      # Isolated HOME unit, contract & strict-validator test suite
@@ -34,19 +34,21 @@ agy-loop/
 
 1. **Layer 1: Session Orchestrator (`skills/loop/SKILL.md`)**
    - Activated in the primary session when the user runs `/agy-loop:loop` (or clicks one of the 3 `suggestedPrompts` chips in Antigravity Desktop, or invokes a standalone `/loop` copy if deployed manually).
-   - Owns **control flow only**: normalizing arguments via `loop-helper.sh`, dispatching asynchronous subagents (`invoke_subagent` or `send_message`), evaluating the 4-line worker footer, printing a single `[Loop #N/Max]` summary line, scheduling the next wake-up via `schedule`, and cancelling finished schedules via `manage_task`.
-   - Keeps its Markdown body well below Antigravity's `24,000`-byte `SKILL.md` truncation ceiling by offloading extended templates and TUI guides to `skills/loop/references/examples-and-loop-md.md`.
+   - Owns **control flow only**: normalizing arguments and persisting `loop_id` state via `loop-helper.sh`, dispatching asynchronous subagents (`invoke_subagent` or `send_message`), validating the 4-line worker footer (enforcing `[10, 86400]` dynamic delay clamping and the 3-consecutive-error circuit breaker), printing a single `[Loop <loop_id> #N/Max]` summary line, scheduling the next wake-up via `schedule`, and cancelling finished schedules via `manage_task`.
+   - Keeps its Markdown body strictly `< 18,000` bytes (well below Antigravity's `24,000`-byte `SKILL.md` truncation ceiling) by offloading extended templates and TUI guides to `skills/loop/references/examples-and-loop-md.md`.
 2. **Layer 2: Isolated Iteration Worker (`agents/loop-worker.md` & `self`)**
    - Executes inside a clean subagent context window (`subagent: true`, `mainAgent: false`, `model: flash`, `commandExecutionPolicy: sandbox`).
-   - Enforces **Single-Pass Discipline**: runs exactly one check, build, test, or fix+verify pass per wake-up, never calls `sleep` or `watch`, and returns a structured 4-line plain-text footer.
-   - Automatically delegates to the built-in full-capability **`self`** subagent instead of `loop-worker` whenever `--self` is passed, when the inline prompt starts with `/` (invoking a nested slash skill such as `/code-review`), or when MCP server tools are required.
+   - Pins the **6-tool cross-engine intersection** (`view_file`, `write_to_file`, `replace_file_content`, `run_command`, `manage_task`, `search_web`) compatible with both **Antigravity Desktop (Cortex)** and **Antigravity CLI (`oneharness`)**.
+   - Enforces **Single-Pass Discipline**: runs exactly one check, build, test, or fix+verify pass per wake-up, distinguishes `agy v1.5.5+` inherited dirty files in `Workspace: branch` worktrees, fails fast with `LOOP_STATUS: BLOCKED` on repeated permission/sandbox denials, and returns a structured 4-line plain-text footer.
+   - Automatically delegates to the built-in full-capability **`self`** subagent instead of `loop-worker` whenever `--self` is passed, when the inline prompt starts with `/` (invoking a nested slash skill such as `/code-review`), or when MCP/browser tools are required.
 3. **Deterministic POSIX Control Plane (`skills/loop/scripts/loop-helper.sh`)**
-   - Pure `#!/bin/sh` (`set -eu`, `0755`, zero Node/Python runtime dependencies) invoked by the orchestrator and `SessionStart` hook so interval math, flag validation, cron eligibility checks, JSON escaping, `loop.md` precedence lookup, `session-start` shadow detection, and `doctor [--clean-shadow]` diagnostics behave identically across models and OSes.
-4. **Zero-Overhead `SessionStart` Shadow Detector (`hooks.json`)**
+   - Pure `#!/bin/sh` (`set -eu`, `0755`, zero Node/Python runtime dependencies) invoked by the orchestrator and `SessionStart` hook.
+   - Provides hardened argument parsing (unconditional multi-token lifecycle dispatch, prefix `every` + compound durations like `1h30m`, fractional rejection, two-tier unknown `--flag` validation), sandbox-safe externalized state (`state-init`, `state-read`, `state-update`, `state-list`, `state-stop`), `loop.md` precedence lookup (`25,000`-byte UTF-8-safe cap), POSIX ERE `skills.json` inspection, `session-start`, and `doctor [--clean-shadow]`.
+4. **Zero-Overhead `SessionStart` Guard (`hooks.json`)**
    - Root `hooks.json` registers a `SessionStart` command hook invoking `sh ./skills/loop/scripts/loop-helper.sh session-start` (pure POSIX `sh`, zero Node.js required).
-   - Stays completely silent at **`0` tokens** (`{}` in `<5ms`) when clean, and injects an inline `user_markdown` (`systemMessage.metadata.user_markdown`) alert banner only when pre-existing user-level files in `~/.gemini/` would shadow `/loop` or `loop-worker`.
+   - Strictly `protojson`-compliant for `agy v1.5.13+` (never echoing stdin fields such as `artifactDirectoryPath`): outputs `{}` in `<5ms` at **`0` tokens** when clean, and injects an `injectSteps` alert only when Tier 3 shadow files or `skills.json` `include_only`/`exclude` filters block `/agy-loop:loop`.
 5. **Dual-Habitat Distribution Shell (`plugin.json` + `bin/agy-loop.mjs` + `install.sh`)**
-   - Because `agy plugin install <name>` resolves names against the Antigravity Marketplace rather than the npm registry, `agy-loop` packages the repository root simultaneously as a native Antigravity v1 plugin (`agy plugin install https://github.com/maxlee/agy-loop`) and a zero-dependency npm CLI bridge (`npx agy-loop`) that delegates to `agy plugin install <pluginRoot>` while supporting both install-time and in-place `--clean-shadow` backup (`sh ~/.gemini/config/plugins/agy-loop/install.sh --clean-shadow` and `npx agy-loop doctor --clean-shadow`).
+   - Packages the repository root simultaneously as a native Antigravity v1 plugin (`agy plugin install https://github.com/maxlee/agy-loop`) and a zero-dependency npm CLI bridge (`npx agy-loop`) with unified UTC backup timestamps (`.agy-loop-backup-YYYYMMDD-HHMMSSZ`), `spawnSync` timeout protection (`15s`/`30s`, `AGY_LOOP_AGY_TIMEOUT_MS`), and an upgraded `doctor` suite (`agy v1.5.13` capability matrix, enterprise `admin_settings.json` / `settings.json` / `hooks.json` audit, `SessionStart` `protojson` `hookSelfTest`, `agentToolsCheck`, and `activeLoops`).
 
 ---
 
@@ -59,16 +61,19 @@ sequenceDiagram
   actor User
   participant Main as Main Session (loop SKILL.md)
   participant Helper as POSIX Helper (loop-helper.sh)
+  participant State as State Store (.agents/.agy-loop/)
   participant Worker as Subagent (loop-worker / self)
   participant Sched as Native Scheduler (schedule / manage_task)
 
   rect rgb(15, 23, 42)
-  Note over User,Sched: Turn 1 - Non-Blocking Dispatch Turn
+  Note over User,Sched: Turn A - Non-Blocking Dispatch Turn
   User->>Main: /agy-loop:loop check PR CI and fix failures --stateful
-  Main->>Helper: sh scripts/loop-helper.sh parse ...
-  Helper-->>Main: JSON spec (pacing=dynamic, state_mode=stateful, max=20)
+  Main->>Helper: parse --stdin & state-init --stdin
+  Helper->>State: Create .gitignore + loops/<loop_id>/state.json (iter=1)
+  Helper-->>Main: loop_id (lp_...)
   Main->>Worker: invoke_subagent (Iteration 1/20, clean context)
-  Main-->>User: Dispatched Loop #1/20 - Yield turn immediately
+  Main->>Helper: state-update (worker_id, task_id)
+  Main-->>User: Dispatched Loop [lp_...] #1/20 - Yield turn immediately
   end
 
   par Worker executes single pass in isolated context
@@ -79,30 +84,35 @@ sequenceDiagram
   end
 
   rect rgb(15, 23, 42)
-  Note over User,Sched: Turn 2 - Reactive Subagent Wake-up Turn
+  Note over User,Sched: Turn B - Reactive Subagent Wake-up Turn
   Worker-->>Main: Completion message + 4-line contract (CONTINUE, 45s)
-  alt LOOP_STATUS == CONTINUE and iteration < max_iterations
-    Main->>Sched: schedule(DurationSeconds=45, state-carrying Prompt)
+  Main->>Helper: state-read (check stop_requested, consecutive_errors)
+  alt Valid contract & CONTINUE & iteration < max_iterations
+    Main->>Main: Clamp delay to [10, 86400] (dynamic) or interval_sec (fixed)
+    Main->>Sched: schedule(DurationSeconds=45, compact [LOOP_WAKEUP] with loop_id)
     Sched-->>Main: Scheduled TaskId
-    Main-->>User: [Loop #1/20] SUMMARY | Next wake-up in 45s - Yield turn
-  else LOOP_STATUS == DONE or BLOCKED or iteration == max_iterations
-    Main->>Sched: manage_task(Action="kill", TaskId) if active cron/timer exists
-    Main-->>User: Final summary & clean stop
+    Main->>Helper: state-update --increment-iteration --reset-errors --stdin
+    Main-->>User: [Loop lp_... #1/20] SUMMARY | Next wake-up in 45s - Yield turn
+  else 3 consecutive errors or DONE or BLOCKED or stop_requested or max_iterations
+    Main->>Sched: manage_task(Action="kill", TaskId)
+    Main->>Helper: state-update (terminal status: done|blocked|stopped|max_reached|circuit_broken)
+    Main-->>User: Final summary, worktree diff/merge instructions (if branch) & clean stop
   end
   end
 
   Note over Sched: Background timer sleeps at 0 tokens/sec (User can keep chatting)
 
   rect rgb(15, 23, 42)
-  Note over User,Sched: Turn 3 - Timer Wake-up Turn (Repeats Turn 2 -> Turn 3)
-  Sched-->>Main: High-priority wake-up Prompt (Iteration 2/20, NEXT_HINT, worker_id)
+  Note over User,Sched: Turn C - Timer / Cron Wake-up Turn (Repeats Turn B -> Turn C)
+  Sched-->>Main: [LOOP_WAKEUP] (loop_id, skill_dir, workspace_dir + fallback)
+  Main->>Helper: state-read (authoritative iteration, next_hint, worker_id, stop_requested)
   Main->>Helper: resolve-task (re-reads loop.md when task_source != inline)
   Main->>Worker: send_message to Idle worker_id (or invoke_subagent if fresh)
   Main-->>User: Yield turn immediately
   end
 ```
 
-*(For one-shot invocations such as `/agy-loop:loop in 20m <task>` or `/agy-loop:loop --once 10m <task>`, Turn 1 schedules `DurationSeconds` directly with `max_iterations = 1` before dispatching the single subagent pass when the timer fires.)*
+*(For one-shot invocations such as `/agy-loop:loop in 20m <task>` or `/agy-loop:loop --once 10m <task>`, Turn A creates `state.json`, schedules `DurationSeconds` directly with `max_iterations = 1`, records `task_id`, and dispatches the single subagent pass when the timer fires.)*
 
 ---
 
@@ -110,23 +120,24 @@ sequenceDiagram
 
 ```mermaid
 flowchart TD
-  Start["User invokes /agy-loop:loop (or starter chip)"] --> Parse["loop-helper.sh parse"]
+  Start["User invokes /agy-loop:loop (or starter chip)"] --> Parse["loop-helper.sh parse --stdin"]
   Parse --> ActionCheck{"Lifecycle action?"}
 
-  ActionCheck -->|status or list| StatusAct["manage_task list + manage_subagents list"]
-  ActionCheck -->|stop or cancel| StopAct["manage_task kill + manage_subagents kill"]
-  ActionCheck -->|doctor| DoctorAct["loop-helper.sh doctor (shadows, --clean-shadow, skills.json, loop.md)"]
+  ActionCheck -->|status or list| StatusAct["state-list + manage_task list + manage_subagents list"]
+  ActionCheck -->|stop or cancel| StopAct["state-stop (--after-current) + manage_task kill + manage_subagents kill"]
+  ActionCheck -->|doctor| DoctorAct["loop-helper.sh doctor / agy-loop doctor (shadows, skills.json, active_loops, capabilities, policy, protojson)"]
   ActionCheck -->|help or --help| HelpAct["Print concise /agy-loop:loop usage, modes & flags"]
-  ActionCheck -->|run| TaskCheck{"Inline prompt provided?"}
+  ActionCheck -->|run| StateInit["state-init -> loop_id + .agents/.agy-loop/.gitignore"]
+  StateInit --> TaskCheck{"Inline prompt provided?"}
 
-  subgraph TaskRes["Task Resolution (Re-evaluated on Every Tick)"]
+  subgraph TaskRes["Task Resolution (Strictly via resolve-task on Every Tick)"]
     TaskCheck -->|Yes| InlineTask["Use inline prompt (task_source: inline)"]
     TaskCheck -->|No| CheckAgentsLoop{"Exists .agents/loop.md?"}
-    CheckAgentsLoop -->|Yes| AgentsLoop["Read .agents/loop.md (capped at 25,000 B)"]
+    CheckAgentsLoop -->|Yes| AgentsLoop["Read .agents/loop.md (25,000 B cap + truncate warn)"]
     CheckAgentsLoop -->|No| CheckRootLoop{"Exists ./loop.md?"}
-    CheckRootLoop -->|Yes| RootLoop["Read ./loop.md (capped at 25,000 B)"]
+    CheckRootLoop -->|Yes| RootLoop["Read ./loop.md (25,000 B cap + truncate warn)"]
     CheckRootLoop -->|No| CheckGlobalLoop{"Exists ~/.gemini/config/loop.md?"}
-    CheckGlobalLoop -->|Yes| GlobalLoop["Read ~/.gemini/config/loop.md (capped at 25,000 B)"]
+    CheckGlobalLoop -->|Yes| GlobalLoop["Read ~/.gemini/config/loop.md (25,000 B cap + truncate warn)"]
     CheckGlobalLoop -->|No| BuiltinLoop["Built-in branch, test & PR maintenance fallback"]
   end
 
@@ -134,7 +145,7 @@ flowchart TD
 
   subgraph WorkerRoute["Subagent & Isolation Routing"]
     RouteCheck -->|Yes| SelfAgent["Delegate: built-in self subagent"]
-    RouteCheck -->|No| LoopWorker["Delegate: loop-worker (flash, sandbox, 9 Cortex tools)"]
+    RouteCheck -->|No| LoopWorker["Delegate: loop-worker (flash, sandbox, 6 cross-engine tools)"]
     SelfAgent & LoopWorker --> IsoMode["State: fresh vs --stateful (Idle send_message) | Workspace: inherit, branch (--worktree), or share (--share)"]
   end
 
@@ -142,26 +153,26 @@ flowchart TD
 
   subgraph PacingRes["Non-Blocking Schedule Strategy"]
     PacingCheck -->|"in DELAY or --once"| OneShot["schedule(DurationSeconds) -> single pass (max = 1)"]
-    PacingCheck -->|Dynamic self-paced| SelfPaced["Run pass -> chain schedule(DurationSeconds = NEXT_DELAY_SEC)"]
+    PacingCheck -->|Dynamic self-paced| SelfPaced["Run pass -> chain schedule(DurationSeconds = clamp(10..86400, NEXT_DELAY_SEC))"]
     PacingCheck -->|Fixed interval| CronCheck{"--cron passed and clean >= 60s cron divisor?"}
-    CronCheck -->|Yes| CronSched["schedule(CronExpression, MaxIterations, ExactTiming, IsDaemon)"]
+    CronCheck -->|Yes| CronSched["schedule(CronExpression) + state-read anti-drift + Running overlap guard"]
     CronCheck -->|No| ChainedFixed["Run pass -> chain non-overlapping schedule(DurationSeconds)"]
   end
 ```
 
 ### Why Chained `DurationSeconds` Is the Default Over Raw Cron
 
-Even when a fixed interval is `>= 60s` (for example `/agy-loop:loop 5m run integration suite`), `loop-helper.sh` computes `cron_expr` (`*/5 * * * *`) but keeps `use_cron: false` unless `--cron` is explicitly passed:
+Even when a fixed interval is `>= 60s` (for example `/agy-loop:loop 5m run integration suite` or `/agy-loop:loop every 2m30s check build`), `loop-helper.sh` computes `cron_expr` (`*/5 * * * *`) when cleanly mappable but keeps `use_cron: false` unless `--cron` is explicitly passed:
 
 1. **Zero Overlapping Runs**: Chaining a one-shot `schedule(DurationSeconds=...)` *after* the subagent finishes guarantees Iteration `N+1` never starts while Iteration `N` is still compiling or running tests.
-2. **Sub-Minute & Non-Divisor Precision**: `DurationSeconds` handles `15s`, `30s`, `45s`, `90s`, or `7m` natively without rounding to 5-field cron boundaries.
-3. **Opt-In Wall-Clock Cron (`--cron`)**: When wall-clock cadence is desired (`1m` -> `* * * * *`, `Nm` dividing `60` -> `*/N * * * *`, `60m`/`1h` -> `0 * * * *`, `Nh` dividing `24` -> `0 */N * * *`, `24h`/`1d` -> `0 0 * * *`), `--cron` enables `CronExpression` with optional `--exact` (`ExactTiming: true`) and `--daemon` (`IsDaemon: true`).
+2. **Sub-Minute, Compound & Non-Divisor Precision**: `DurationSeconds` handles `15s`, `30s`, `2m30s`, `1h30m`, or `7m` natively without rounding to 5-field cron boundaries (fractional inputs like `1.5m` fail fast with Exit `2` suggesting `90s` / `1m30s`).
+3. **Opt-In Wall-Clock Cron (`--cron`)**: When wall-clock cadence is desired (`1m` -> `* * * * *`, `Nm` dividing `60` -> `*/N * * * *`, `60m`/`1h` -> `0 * * * *`, `Nh` dividing `24` -> `0 */N * * *`, `24h`/`1d` -> `0 0 * * *`), `--cron` enables `CronExpression` with optional `--exact` (`ExactTiming: true`) and `--daemon` (`IsDaemon: true`). In v1.1, Turn C reads `iteration`, `next_hint`, `worker_id`, and `stop_requested` from `.agents/.agy-loop/loops/<loop_id>/state.json` via `state-read`, completely eliminating static cron prompt drift.
 
 ---
 
-## 4. Worker-to-Orchestrator Output Contract & State Carrier
+## 4. Worker Output Contract, Circuit Breaker & Externalized State Store
 
-### 4-Line Plain-Text Footer Contract
+### 4-Line Plain-Text Footer Contract, Delay Clamp & Circuit Breaker
 
 Every `loop-worker` (or loop-delegated `self`) execution ends with four plain-text key-value lines **without surrounding Markdown code fences**:
 
@@ -172,25 +183,22 @@ SUMMARY: <concise 1-line summary of current state and actions taken>
 NEXT_HINT: <brief context or focus point for the next iteration, or None>
 ```
 
-- **Why Fence-Free Plain Text**: Early prototypes wrapped the footer in nested triple-backtick blocks inside `SKILL.md` / agent prompts, which broke Markdown block boundaries and brittle parsers whenever summaries contained backticks. Key-anchored plain text at the tail of the worker message parses reliably in every turn.
-- **Adaptive `NEXT_DELAY_SEC` Bands**:
-  - `30` to `60`: Active local build, imminent job completion, or verifying a freshly pushed fix.
-  - `120` to `300`: Normal polling while waiting on external CI/deployment queues.
-  - `600` to `1800`: Everything green and quiet during background branch tending.
+- **Why Fence-Free Plain Text**: Key-anchored plain text at the tail of the worker message avoids nested Markdown fence breakages whenever summaries contain backticks.
+- **Delay Validation & Clamping (`[10, 86400]`)**: Turn B parses `NEXT_DELAY_SEC` as an integer (falling back to `120`s if missing, non-integer, or negative) and clamps dynamic self-paced delays to `min(86400, max(10, NEXT_DELAY_SEC))`.
+- **3-Error Consecutive Circuit Breaker**: If a worker omits a valid 4-line contract or fails unrecoverably, Turn B increments `consecutive_errors` in `state.json` (`--increment-errors`) and resets to `0` (`--reset-errors`) on valid passes. Reaching `consecutive_errors >= 3` marks `status: "circuit_broken"`, cancels active schedules, and stops cleanly with diagnostics.
 
-### Stateless-Safe Wake-Up `Prompt` Carrier
+### Sandbox-Safe Externalized State Store (`.agents/.agy-loop/`) & `--cron` Drift Elimination
 
-Because long sessions may undergo context compaction (`/compact` or automatic watermark compaction) while a loop runs over hours, the orchestrator embeds compact loop metadata directly inside each `schedule` wake-up `Prompt`:
+In `agy v1.5.7+` default `auto` mode, OS-sandboxed `run_command` grants write access only to workspace roots, `ArtifactDirectoryPath`, and OS temp/caches — blocking writes to `~/.gemini/antigravity-cli/plugin_data/`. To guarantee zero sandbox denials while surviving `/compact` context compaction and eliminating `--cron` static-prompt drift:
 
-- `iteration` (`N+1`) and `max_iterations`
-- `pacing`, `interval_sec`, and `cron_task_id` (so an active `--cron` job can always be killed via `manage_task` upon `DONE` or `BLOCKED`)
-- `state_mode`, `worker_id` (for `--stateful` `send_message` re-awakening), `workspace`, `delegate`, and `model`
-- `task_source` (`inline` prompt text vs `loop_md_or_default` trigger to re-run `loop-helper.sh resolve-task`)
-- `NEXT_HINT` from Iteration `N`
+- **Workspace-Scoped Isolation**: `loop-helper.sh` stores per-loop state under `${AGY_LOOP_STATE_DIR:-<workspace>/.agents/.agy-loop}/loops/<loop_id>/` (`state.json` + append-only `events.jsonl`) using UTC + random hex IDs (`lp_YYYYMMDDTHHMMSSZ_<4hex>`, validated against `^lp_[A-Za-z0-9_-]{4,64}$`).
+- **Zero Git Pollution**: `state-init` automatically writes `*` into `<state_root>/.gitignore` (backed by `.agents/.agy-loop/` in repo `.gitignore`) so neither `git status` nor `agy v1.5.5+` dirty-file worktrees pick up runtime state files.
+- **Atomic & Shell-Safe Updates**: All `state.json` updates write to `state.json.tmp.$$` + `mv`, and `SKILL.md` passes arbitrary `SUMMARY`/`NEXT_HINT` payloads via single-quoted heredoc (`state-update --stdin <<'AGY_LOOP_PATCH'`) so backticks, quotes, and `$()` never undergo shell expansion.
+- **Authoritative Control Plane + Compact Wake-Up Fallback**: Turn C calls `state-read` first to obtain authoritative `iteration`, `max_iterations`, `worker_id`, `next_hint`, `stop_requested`, and `status` (fixing `--cron` static prompt staleness), while `[LOOP_WAKEUP]` retains compact `fallback_*` metadata below `loop_id` in case the state file is absent.
 
 ---
 
-## 5. Customization Precedence & Shadowing Model
+## 5. Customization Precedence, Shadowing & `doctor` Diagnostics
 
 Antigravity discovers skills and subagents in strict precedence order (highest to lowest):
 
@@ -200,29 +208,33 @@ Antigravity discovers skills and subagents in strict precedence order (highest t
 4. **Built-in Customizations** (`~/.gemini/antigravity-cli/builtin/`)
 5. **Installed Plugins & Global Declared JSON** (`~/.gemini/config/plugins/agy-loop/`)
 
-### Guardrails Against Silent Discovery Failures
+### Guardrails Against Silent Discovery & Runtime Failures
 
-- **Pure Plugin Namespacing (`/agy-loop:loop`) for Marketplace Parity**: Native Antigravity plugins expose bundled skills under the `/<plugin>:<skill>` namespace (`/agy-loop:loop`) across both Antigravity Desktop Marketplace and Antigravity CLI (`agy`). Keeping `agy-loop` strictly self-contained inside the plugin bundle avoids writing standalone shortcut copies into `~/.gemini/config/skills/`, guaranteeing identical behavior across Marketplace, `agy plugin install`, `install.sh`, and `npx agy-loop`.
-- **Why Native `agy plugin install` Needs Runtime Shadow Detection**: `agy plugin install https://github.com/maxlee/agy-loop` stages `agy-loop` into Tier 5 (`~/.gemini/config/plugins/agy-loop/`) silently without removing or warning about pre-existing Tier 3 files (`~/.gemini/config/skills/loop/SKILL.md`, `~/.gemini/config/agents/loop-worker.md`, `~/.gemini/antigravity-cli/skills/loop`, or `~/.gemini/skills/loop`). When loose Tier 3 files exist, bare `/loop` resolves to the stale Tier 3 `SKILL.md`, and because Antigravity registers plugin subagents by un-namespaced `name` (`loop-worker`, rejecting `agy-loop:loop-worker`), Tier 3 `agents/loop-worker.md` also overrides `TypeName: "loop-worker"` even when the user invokes `/agy-loop:loop`.
-- **Root `hooks.json` (`SessionStart` Shadow-Collision Detector)**: Root `hooks.json` binds `SessionStart` to `sh ./skills/loop/scripts/loop-helper.sh session-start` (pure POSIX `sh`, zero Node/npm required). On clean machines it exits `0` in `<5ms` with `{}` (`0` tokens, zero UI noise). When one or more Tier 3 shadow paths exist, it returns `injectSteps` with an inline `user_markdown` (`systemMessage.metadata.user_markdown`) banner and concise model notice naming the colliding paths and one-command fixes.
-- **Non-Destructive `--clean-shadow` Archiving (Install-Time, In-Place & In-Session)**: Colliding Tier 3 files are moved into `~/.gemini/config/.agy-loop-backup-<timestamp>/` (preserving relative paths so `skills/loop` and `agents/loop-worker.md` never collide) rather than deleted destructively. Users can trigger cleanup via in-place POSIX `sh ~/.gemini/config/plugins/agy-loop/install.sh --clean-shadow` (which detects execution inside the installed plugin root and skips redundant self-copy), inside `agy` via `/agy-loop:loop doctor --clean-shadow` (`loop-helper.sh doctor --clean-shadow`), or via `npx agy-loop doctor --clean-shadow` / `npx agy-loop install --clean-shadow` (followed by `/skills reload` in active sessions).
-- **`skills.json` Allowlist Audit**: Both `loop-helper.sh doctor` and `npx agy-loop doctor` inspect workspace `.agents/skills.json` and global `~/.gemini/config/skills.json` for `"include_only"` or `"exclude"` rules that filter out `"loop"`.
-- **Strict v1 Native Plugin Layout**: Antigravity's native v1 plugin loader discovers root `plugin.json`, root `hooks.json`, `skills/*/SKILL.md`, and `agents/*.md` (ignoring legacy `commands/`, root `AGENTS.md`, and nested `hooks/hooks.json`), and skips any `SKILL.md` with unquoted YAML special characters (`"<task>"`, `[--max N]`). `agy-loop` uses root `hooks.json` and quoted YAML strings in `skills/loop/SKILL.md`, validating cleanly with `0` warnings and `0` notes (`hooks: 1`, `findings: []`) under `agy plugin validate --strict .`.
+- **Pure Plugin Namespacing (`/agy-loop:loop`)**: Registers consistently across Desktop Marketplace and CLI (`agy`) without scattering files into `~/.gemini/config/`.
+- **Strict `protojson` `SessionStart` Hook (`hooks.json`)**: Under `agy v1.5.13`, plugin hooks use strict `protojson` unmarshaling and reject echoed stdin fields (such as `artifactDirectoryPath`). `loop-helper.sh session-start` emits `{}` (`0` tokens, `<5ms`) when clean, or strictly `{ "injectSteps": [...] }` when Tier 3 shadow files or `skills.json` `include_only`/`exclude` filters (matched with POSIX ERE parity against `bin/agy-loop.mjs`) block `/agy-loop:loop`.
+- **Unified UTC `--clean-shadow` Archiving**: `bin/agy-loop.mjs`, `loop-helper.sh`, and `install.sh` all archive colliding Tier 3 files into `~/.gemini/config/.agy-loop-backup-YYYYMMDD-HHMMSSZ/` with cross-filesystem fallback.
+- **Upgraded `doctor` Diagnostics (`npx agy-loop doctor [--json]`)**:
+  - **`agy.capabilities`**: Parses `agy --version` into a version capability matrix (`printTimeout`, `sidecarHomeExpansion`, `worktreeDirtyCarry`, `autoModeDefault`, `dynamicWorkflows`, `githubUrlValidate`, `strictProtojsonHooks`).
+  - **Enterprise & Policy Audit (`environment`, `environmentWarnings`)**: Non-secret read-only inspection of `~/.gemini/config/admin_settings.json` (`pluginsDisabled`, `marketplaceDisabled`, `remoteControlEnabled`), `~/.gemini/antigravity-cli/settings.json` (`agentMode`, `toolPermission`, `enableTerminalSandbox`, `modelProvider`), and static `hooks.json` matcher structure (`PreToolUse`/`PostToolUse` grouping).
+  - **Live Self-Tests & State**: `hookSelfTest` (runs `SessionStart` against synthetic `v1.5.13` `artifactDirectoryPath` stdin checking zero leaked keys), `agentToolsCheck` (validates `loop-worker.md` `model` tier and 6-tool cross-engine compatibility), `activeLoops` (`active_loops` in `loop-helper.sh doctor`), and `spawnSync` timeout guards (`15s` / `30s`, `AGY_LOOP_AGY_TIMEOUT_MS`).
+- **Strict v1 Native Plugin Layout**: Root `plugin.json`, root `hooks.json`, `skills/*/SKILL.md` (safely quoted YAML frontmatter), and `agents/*.md` validate with `0` findings (`components.hooks: 1`, `findings: []`) under `agy v1.5.13` `agy plugin validate --strict .`.
 
 ---
 
 ## 6. Subagent Tool Allowlist, Sandbox & Worktree Safety
 
-1. **Verified Internal Cortex Tool Allowlist (Anti-Hang & Least Privilege)**
-   - In Antigravity plugins, omitting `tools:` in `agents/<name>.md` restricts a plugin subagent to read-only defaults (no shell or file-edit capability), while listing an unmapped or misspelled tool name can cause the subagent process to hang on startup.
-   - `agents/loop-worker.md` pins the exact 9 verified internal Cortex tools required for inspection, editing, and verification (`send_message` is injected automatically):
-     `view_file`, `write_to_file`, `replace_file_content`, `multi_replace_file_content`, `list_dir`, `find_by_name`, `grep_search`, `run_command`, and `manage_task`.
-   - Note that `loop-worker` is intentionally **not** granted `schedule` or `invoke_subagent`, making recursive self-scheduling or runaway subagent fan-out structurally impossible inside `loop-worker`.
+1. **6-Tool Cross-Engine Intersection (Desktop Cortex + CLI `oneharness`)**
+   - In `agy v1.5.13`, CLI `oneharness` (`DeclarativeConfigLoader.Load` / `ConstructFromRegistry`) treats unmapped tool names in `agents/*.md` as a **fatal component-load error** (`not found in registry`), whereas Desktop Cortex registers legacy tool identifiers (`view_file`, `write_to_file`, `replace_file_content`).
+   - `agents/loop-worker.md` therefore pins the exact **6-tool cross-engine verified intersection**:
+     `view_file`, `write_to_file`, `replace_file_content`, `run_command`, `manage_task`, and `search_web` (`send_message` is injected automatically).
+   - `oneharness` forward-canonicalizes `view_file -> read_file`, `write_to_file -> write_file`, and `replace_file_content -> edit_file`. The 4 legacy Cortex-only tools (`multi_replace_file_content`, `list_dir`, `find_by_name`, `grep_search`) were removed because they do not exist in `oneharness`; directory listing and code search run cleanly via sandboxed `run_command` (`rg`, `grep`, `find`, `ls`).
+   - `loop-worker` is intentionally **not** granted `schedule` or `invoke_subagent`, making recursive self-scheduling or runaway fan-out structurally impossible.
 2. **CLI Roster Hygiene (`mainAgent: false`)**
-   - Setting `subagent: true` and `mainAgent: false` keeps `loop-worker` available to `invoke_subagent` and visible inside `/agents` when active, without cluttering `agy agents` or `agy --agent <name>` primary session selectors.
+   - Keeps `loop-worker` available to `invoke_subagent` and `/agents` without cluttering `agy agents` or `agy --agent <name>` primary session selectors.
 3. **Sandbox Execution (`commandExecutionPolicy: sandbox`)**
-   - Shell commands executed by `loop-worker` run under Antigravity's OS sandbox policy by default while inheriting parent workspace approvals (with interactive `Ctrl+K` fast-path approval and `Alt+J` live transcript teleport in `agy` CLI).
-4. **Git Worktree Isolation (`--worktree` -> `Workspace: "branch"`)**
-   - Passing `--worktree` spawns the worker inside an isolated Git branch worktree rather than the user's active checkout (`inherit`). Experimental refactors or multi-step fixes never dirty uncommitted edits in the main terminal; verified commits or diffs can be merged cleanly once `DONE`, and killing the subagent (`manage_subagents` or `/agents` + `k`) automatically cleans up temporary worktree state.
+   - Shell commands execute under Antigravity's OS sandbox policy (with `Ctrl+K` fast-path approval and `Alt+J` transcript teleport in `agy` CLI), and `loop-worker` returns `LOOP_STATUS: BLOCKED` immediately on repeated permission/sandbox denials.
+4. **Git Worktree Isolation & Preservation (`--worktree` -> `Workspace: "branch"`, `v1.5.5+`)**
+   - In `agy v1.5.5+`, `Workspace: "branch"` worktrees inherit staged, unstaged, and untracked changes from the parent checkout. `loop-worker` distinguishes pre-existing dirty files from its own verified edits and commits fixes locally without pushing.
+   - `SKILL.md` records `worktree_branch` in `state.json`, surfaces branch name, `git diff --stat`, and `git cherry-pick` / `git merge` commands before teardown, and keeps the `branch` subagent `Idle` if unmerged commits await review (preventing accidental worktree deletion).
 5. **Bounded File & Quota Safeguards**
-   - `loop-helper.sh resolve-task` caps `loop.md` reads at `25,000` bytes (`truncated: true` metadata flag) so an accidentally huge Markdown file cannot blow up worker context, and `--max 20` enforces a default iteration circuit breaker against unattended quota burn.
+   - `loop-helper.sh resolve-task` enforces a `25,000`-byte UTF-8-safe cap (`truncated: true` triggers an explicit 1-line warning in `SKILL.md` without direct `read_file`/`view_file` bypass), `--max 20` caps default iterations, and the 3-error circuit breaker halts stuck loops automatically.

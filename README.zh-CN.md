@@ -29,20 +29,20 @@
 ```text
 > /agy-loop:loop check current PR CI status and fix failures --stateful
 
-⏺ 已派发 Loop #1/20 至后台 loop-worker（stateful，sandbox 隔离）。主输入框已释放，可随时继续对话。
+⏺ 已派发 Loop [lp_20261121T101500Z_a3f9] #1/20 至后台 loop-worker（dynamic，stateful，workspace=inherit）。主输入框已释放，可随时继续对话。
 
   [42s 后 · 子代理完成响应式唤醒]
-⏺ [Loop #1/20] 修复 src/render.test.ts 快照断言并推送提交 9c41e2b，CI 重新运行中 | Next wake-up in 45s (self-paced)
+⏺ [Loop lp_20261121T101500Z_a3f9 #1/20] 修复 src/render.test.ts 快照断言并推送提交 9c41e2b，CI 重新运行中 | Next wake-up in 45s (self-paced)
 
 > 顺便帮我解释一下 src/auth.ts 里的 token 缓存逻辑
 ⏺ src/auth.ts 使用以 SHA-256 为键的 LRU Map 缓存已验签的 JWT Claims……
   （后台定时器以 0 token/s 静默等待，主对话上下文始终保持清爽。）
 
   [45s 后 · 定时器唤醒 -> 第 2 轮检查]
-⏺ [Loop #2/20] 单元测试与 Lint 已绿灯，等待 e2e 矩阵完成（4/5 通过） | Next wake-up in 90s (self-paced)
+⏺ [Loop lp_20261121T101500Z_a3f9 #2/20] 单元测试与 Lint 已绿灯，等待 e2e 矩阵完成（4/5 通过） | Next wake-up in 90s (self-paced)
 
   [90s 后 · 定时器唤醒 -> 第 3 轮检查]
-⏺ [Loop #3/20] DONE: PR #42 全部 5 项 CI 检查已绿灯通过，定时任务已自动清理。
+⏺ [Loop lp_20261121T101500Z_a3f9 #3/20] DONE: PR #42 全部 5 项 CI 检查已绿灯通过，定时任务已自动清理。
 ```
 
 ---
@@ -54,11 +54,11 @@
 | **等待机制** | Shell `sleep` 阻塞回合 | 内置会话 Cron 队列 | 原生非阻塞 `schedule` 定时器与 Cron |
 | **主会话可用性** | 等待期锁死，无法输入 | 轮次间隙可正常对话 | 轮次间隙**及子代理执行期间**均可自由对话 |
 | **上下文隔离** | 构建/测试日志塞满主窗口 | 共享主会话历史记录 | 独立 `loop-worker` / `self` 干净窗口，主窗口仅留单行摘要 |
-| **最小时间粒度** | `1s`（阻塞前台） | `1m` Cron 下限（`30s` 会向上取整为 `1m`） | 秒级 `DurationSeconds`（支持 `15s`、`30s`、`45s` 等亚分钟精度） |
-| **动态退避调速** | 仅固定间隔 | 模型估算 `1m–1h` 延迟 | 子代理实测反馈 `NEXT_DELAY_SEC`（活跃 `30–60s`、排队 `120–300s`、空闲绿灯 `600–1800s`） |
+| **最小时间粒度** | `1s`（阻塞前台） | `1m` Cron 下限（`30s` 会向上取整为 `1m`） | 秒级 `DurationSeconds`（`15s`、`30s`）与复合时长（`1h30m`、`2m30s`） |
+| **动态退避与熔断** | 仅固定间隔 | 模型估算 `1m–1h` 延迟 | `NEXT_DELAY_SEC` 限幅 `[10s, 86400s]`、3 次异常熔断与 `loop_id` 状态层 |
 | **`loop.md` 热重载** | 不支持 | `.claude/loop.md` 与 `~/.claude/loop.md` | 每轮实时重读：`.agents/loop.md` -> `loop.md` -> `~/.gemini/config/loop.md` -> 内置维护兜底 |
 | **多轮修 Bug 记忆** | 全量日志堆积膨胀 | 混杂在主对话历史中 | 可选 `--stateful` 通过 `send_message` 唤醒 `Idle` 子代理，隔离保留排查上下文 |
-| **高风险代码修改隔离** | 直接修改当前工作区 | 直接修改当前工作区 | 可选 `--worktree`（`branch` 独立 Git Worktree）或 `--share` 副本 |
+| **高风险代码修改隔离** | 直接修改当前工作区 | 直接修改当前工作区 | 可选 `--worktree`（`branch` 工作树 + 清理前汇报 diff/merge）或 `--share` 副本 |
 
 ---
 
@@ -66,7 +66,7 @@
 
 ### 环境要求
 
-- **Antigravity CLI (`agy`)** `v1.5.0+`（已通过 `cli-1.5.9` 严格插件规范校验）或 **Antigravity 桌面端**
+- **Antigravity CLI (`agy`)** `v1.5.0+`（已通过 `v1.5.13` 严格插件规范校验与 `oneharness` 工具注册表验证）或 **Antigravity 桌面端**
 - **原生安装零 Node.js / npm 依赖**（使用 `agy plugin install` 或一行 `curl` 脚本安装无需任何运行时；仅使用 `npx` / `bunx` 桥接器时需 `Node.js >= 18` 或 `Bun`）
 
 `agy-loop` 采用**纯原生、兼容 Marketplace 的双栖包架构**：仓库根目录既是符合严格 v1 规范的 Antigravity 原生插件（`plugin.json`、`hooks.json`、`skills/loop/SKILL.md`、`agents/loop-worker.md`），也是零外部依赖的 npm CLI 桥接器（`bin/agy-loop.mjs`）。安装完成后：
@@ -83,7 +83,7 @@ npx agy-loop
 bunx agy-loop
 ```
 
-如果你此前手动创建过 `~/.gemini/config/skills/loop` 或 `~/.gemini/config/agents/loop-worker.md`，由于 Antigravity 加载个人全局目录的优先级高于插件目录，旧文件会遮蔽（Shadow）插件版本。追加 `--clean-shadow` 即可安装 `agy-loop` 并将旧文件自动安全归档至 `~/.gemini/config/.agy-loop-backup-<timestamp>/`：
+如果你此前手动创建过 `~/.gemini/config/skills/loop` 或 `~/.gemini/config/agents/loop-worker.md`，由于 Antigravity 加载个人全局目录的优先级高于插件目录，旧文件会遮蔽（Shadow）插件版本。追加 `--clean-shadow` 即可安装 `agy-loop` 并将旧文件自动安全归档至 `~/.gemini/config/.agy-loop-backup-<YYYYMMDD-HHMMSSZ>/`：
 
 ```bash
 npx agy-loop install --clean-shadow
@@ -131,28 +131,37 @@ agy plugin install .
 
 | 运行模式 | 命令示例 | 行为说明 |
 | :--- | :--- | :--- |
-| **1. 固定间隔 + 任务提示词** | `/agy-loop:loop 30s curl -fsS http://localhost:8080/health`<br>`/agy-loop:loop 5m check the deploy`<br>`/agy-loop:loop check PR #42 comments every 2h` | 按固定周期（`s`、`m`、`h`、`d`）执行。默认使用防重叠的单次 `DurationSeconds` 链式定时器（支持 `30s` 亚分钟及 `90s`、`7m` 等非整除间隔）；传入 `--cron` 时切换为 5 段式 `CronExpression`。 |
-| **2. 动态自适应节奏（Self-Paced）** | `/agy-loop:loop check CI and fix failures`<br>`/agy-loop:loop run pytest and fix failing tests --stateful` | 省略时间间隔。每轮结束后由 `loop-worker` 根据现场状态返回 `NEXT_DELAY_SEC`（构建/验证期 `30–60s`、等待 CI 队列 `120–300s`、全绿静默巡检退避至 `600–1800s`）。 |
-| **3. `loop.md` 热重载维护巡检** | `/agy-loop:loop`<br>`/agy-loop:loop 15m` | 省略内联提示词。每轮唤醒时按 `.agents/loop.md` -> `loop.md` -> `~/.gemini/config/loop.md` -> 内置分支维护策略的顺序动态读取指令（`/agy-loop:loop` 为自适应间隔，`/agy-loop:loop 15m` 为固定间隔）。 |
+| **1. 固定间隔 + 任务提示词** | `/agy-loop:loop 30s curl -fsS http://localhost:8080/health`<br>`/agy-loop:loop every 5m check the deploy`<br>`/agy-loop:loop 1h30m check backup`<br>`/agy-loop:loop check PR #42 comments every 2h` | 按固定周期（`s`、`m`、`h`、`d`）执行，支持前置 `every <dur>`、后缀 `every` 与复合时长（`1h30m`、`2m30s`；小数 `1.5m` 将退出码 `2` 报错）。默认使用防重叠 `DurationSeconds` 链式定时器，传入 `--cron` 时切换 5 段式 `CronExpression`。 |
+| **2. 动态自适应节奏（Self-Paced）** | `/agy-loop:loop check CI and fix failures`<br>`/agy-loop:loop run pytest and fix failing tests --stateful` | 省略时间间隔。每轮结束后由 `loop-worker` 返回 `NEXT_DELAY_SEC`（缺失或非正整数回退 `120s`，并严格限幅至 `[10s, 86400s]`）。 |
+| **3. `loop.md` 热重载维护巡检** | `/agy-loop:loop`<br>`/agy-loop:loop 15m` | 省略内联提示词。每轮唤醒强制通过 `resolve-task` 按 `.agents/loop.md` -> `loop.md` -> `~/.gemini/config/loop.md` -> 内置策略读取（上限 `25,000` 字节，超长截断时主动提醒）。 |
 | **4. 单次延时检查（One-Shot）** | `/agy-loop:loop in 20m verify staging smoke tests`<br>`/agy-loop:loop --once 10m check if docker build finished` | 创建单次非阻塞 `DurationSeconds` 定时器（`max_iterations = 1`），到点唤醒子代理执行一轮检查并汇报结果后自动结束。 |
-| **5. 生命周期管理与诊断** | `/agy-loop:loop status`（或 `list`）<br>`/agy-loop:loop stop [id\|all]`（或 `cancel`）<br>`/agy-loop:loop doctor [--clean-shadow]`<br>`/agy-loop:loop help` | 查看当前活跃定时器与子代理列表、按 ID 或全量终止循环（联动 `manage_task` 与 `manage_subagents`）、诊断（或配合 `--clean-shadow` 无损归档）同名全局遮蔽文件、检查 `skills.json` 过滤规则及当前生效的 `loop.md`，或输出速查帮助。 |
+| **5. 生命周期管理与诊断** | `/agy-loop:loop status [--all]`（或 `list`）<br>`/agy-loop:loop stop [<id1> <id2>\|all] [--after-current]`<br>`/agy-loop:loop doctor [--clean-shadow]`<br>`/agy-loop:loop help` | 关联 `.agents/.agy-loop/` `loop_id` 状态与定时器/子代理列表、按多目标或 `--after-current` 优雅停止循环、诊断（或归档）遮蔽文件/`skills.json`/`active_loops`，或输出速查帮助。 |
 
 ### 参数（Flags）完整参考
 
-所有参数均可放置在 `/agy-loop:loop` 命令的任意位置：
+所有参数均可放置在 `--` 之前的任意位置（前置位未知参数或近拼写错字如 `--statefull`、`--max-iter` 会直接 Exit `2` 拦截；提示词中段/尾部的真实命令参数如 `gh pr checks --required` 会透传并输出一条提示，也可使用 `--` 显式截止参数解析）：
 
 | 参数 | 默认值 | 说明 |
 | :--- | :--- | :--- |
 | `--max <N>` | `20`（`--once` 时为 `1`） | 最大循环轮数安全上限，达标前若触顶将自动停止并汇总，防止无人值守时消耗过多配额。 |
 | `--stateful` | `fresh` | 跨轮次复用同一个 `loop-worker` 会话 ID，通过 `send_message` 唤醒处于 `Idle` 状态的子代理，在不污染主窗口的前提下保留多轮排障记忆。 |
-| `--worktree` | `inherit` | 在独立 Git 分支工作树（`Workspace: "branch"`）中运行子代理，确保实验性修复不会污染你正在编辑的本地工作区。 |
+| `--worktree` | `inherit` | 在独立 Git 分支工作树（`Workspace: "branch"`）中运行。`agy v1.5.5+` 会继承父工作区脏改动，编排器会记录 `worktree_branch` 并在清理前汇报 `git diff --stat` 与合并命令。 |
 | `--share` | `inherit` | 在共享工作副本（`Workspace: "share"`）中运行子代理。 |
 | `--model <tier>` | `flash`（`loop-worker`） | 覆盖子代理模型档位：支持 `inherit`、`flash_lite`、`flash`、`pro`。 |
 | `--self` | `loop-worker` | 改用内置全功能 `self` 子代理执行每轮任务（当提示词以 `/` 开头调用其他斜杠技能如 `/agy-loop:loop 20m /code-review` 或需使用 MCP 工具时也会自动启用）。 |
-| `--cron` | `false` | 当固定间隔 `>= 60s` 且可精确映射为标准 5 段 Cron（`1m`、`60m` 约数、`24h` 约数、`1d`）时，启用原生 `CronExpression` 周期调度。 |
+| `--cron` | `false` | 当固定间隔 `>= 60s` 且可精确映射为标准 5 段 Cron（`1m`、`60m` 约数、`24h` 约数、`1d`）时，启用原生 `CronExpression` 周期调度，并结合 `state-read` 彻底消除静态 Prompt 漂移。 |
 | `--exact` | `false` | 配合 `--cron` 开启 `ExactTiming: true`，在整分时刻精确触发，关闭防惊群随机抖动（Jitter）。 |
 | `--daemon` | `false` | 配合 `--cron` 开启 `IsDaemon: true`，作为常驻后台任务在当前前台目标完成后继续按周期触发。 |
 | `--once` | `false` | 仅延时执行单轮检查（`max_iterations = 1`），汇报后立即退出。 |
+| `--` | — | 选项截止分隔符：其后所有参数原样作为任务提示词，不再触发 flag 解析或未知参数告警。 |
+
+---
+
+## 🛡️ 可靠性、沙箱安全状态层与双引擎 Worker
+
+- **6 工具双引擎交集 `loop-worker`（桌面端 Cortex + CLI `oneharness`）**：`agents/loop-worker.md` 精确声明了在桌面端与 `agy v1.5.13` CLI `oneharness` 均受支持的 6 个工具（`view_file`、`write_to_file`、`replace_file_content`、`run_command`、`manage_task`、`search_web`）。已移除 4 个仅存在于旧 Cortex、在 `oneharness` 注册表中缺失并导致加载中断的工具（`multi_replace_file_content`、`list_dir`、`find_by_name`、`grep_search`）；目录枚举与代码检索统一由沙箱内 `run_command`（`rg`/`grep`/`find`/`ls`）完成。
+- **沙箱安全外部化状态控制面（`.agents/.agy-loop/`）**：由于 `agy v1.5.7+` 默认 `auto` 沙箱禁止 `run_command` 写入 `~/.gemini/antigravity-cli/plugin_data/`，循环状态落盘于 `<workspace>/.agents/.agy-loop/loops/<loop_id>/{state.json,events.jsonl}`（支持 `AGY_LOOP_STATE_DIR` 覆盖，并自动创建内容为 `*` 的 `.gitignore` 避免污染仓库或 `v1.5.5+` worktree）。每轮唤醒先经 `state-read` 读取权威 `iteration`、`next_hint`、`worker_id` 与 `stop_requested`，彻底根除 `--cron` 静态 Prompt 漂移并抵御上下文压缩丢失。
+- **连续 3 次异常熔断与延迟限幅**：若子代理未输出合法 4 行契约或发生不可恢复错误，累计 `consecutive_errors` 达 3 次自动置为 `circuit_broken`、清理定时器并告警停止；动态 `NEXT_DELAY_SEC` 缺失/非法时默认 `120s`，并强制限幅至 `[10s, 86400s]`。
 
 ---
 
@@ -187,7 +196,7 @@ agy plugin install .
 除满足条件自动退出外，你可以随时通过以下 4 种方式干净终止循环：
 
 1. **斜杠命令一键停止（`/agy-loop:loop stop`）**
-   输入 `/agy-loop:loop stop`（或 `/agy-loop:loop stop <taskId>`、`/agy-loop:loop cancel`），编排器会自动调用 `manage_task(Action="kill")` 销毁后台 `schedule` 定时器/Cron，并通过 `manage_subagents(Action="kill")` 终止运行中或空闲的 `loop-worker`。
+   输入 `/agy-loop:loop stop`（或 `/agy-loop:loop stop <id1> <id2>`、`/agy-loop:loop stop <id> --after-current`、`/agy-loop:loop cancel`），编排器会先调用 `state-stop` 更新 `.agents/.agy-loop/` 状态，再通过 `manage_task(Action="kill")` 与 `manage_subagents(Action="kill")` 精确清理关联定时器和子代理（有未合并提交的 `branch` 工作树会优先保留以便人工合入）。
 2. **自然语言对话停止**
    直接在输入框发送：`取消当前的 loop 定时任务`（或 `等当前这一轮子代理返回后停止 loop`）。
 3. **CLI 交互式管理面板（`/tasks` 与 `/agents`）**
@@ -196,7 +205,7 @@ agy plugin install .
 4. **键盘中断当前回合（`Esc`）**
    在 `agy` CLI 中直接按 **`Esc`** 键可立即中断主代理当前正在执行的派发动作，控制权回到输入框且不会退出 CLI（连按两次 `Ctrl+C` 会退出整个 CLI）。
 
-**内置自动退出保护**：当子代理返回 `LOOP_STATUS: DONE`（目标达成）、`LOOP_STATUS: BLOCKED`（缺少权限或需人工决策），或循环次数达到 `--max <N>`（默认 `20` 轮）时，调度器会自动清理残留定时任务并结束循环。
+**内置自动退出保护**：当子代理返回 `LOOP_STATUS: DONE`（目标达成）、`LOOP_STATUS: BLOCKED`（缺少权限、沙箱拦截或需人工决策）、循环次数达到 `--max <N>`（默认 `20` 轮），或连续 3 次未按契约返回/运行时报错触发熔断（`circuit_broken`）时，调度器会自动清理残留定时任务并结束循环。
 
 ---
 
@@ -208,8 +217,8 @@ Antigravity 加载个人全局配置目录 `~/.gemini/config/` 的优先级高�
 
 为彻底避免静默遮蔽：
 
-- **零开销 `SessionStart` 自动检测钩子（`hooks.json`）**：会话启动时自动运行纯 POSIX 脚本 `skills/loop/scripts/loop-helper.sh session-start`。环境干净时 `<5ms` 直接返回 `{}`（**`0` Token 开销**、零界面打扰）；一旦检测到同名散落文件，会在启动会话时自动弹出路径提示与修复命令。
-- **一行命令无损归档清理**：将冲突的旧文件安全移入 `~/.gemini/config/.agy-loop-backup-<timestamp>/`（清理后在已打开的 `agy` 会话中执行一次 `/skills reload`）：
+- **零开销 `SessionStart` 自动检测钩子（`hooks.json`）**：会话启动时自动运行纯 POSIX 脚本 `skills/loop/scripts/loop-helper.sh session-start`。严格遵守 `agy v1.5.13+` `protojson` 规范（零 stdin 字段回显），环境干净时 `<5ms` 直接返回 `{}`（**`0` Token 开销**、零界面打扰）；检测到同名散落文件**或** `skills.json` 的 `include_only`/`exclude` 过滤拦截（POSIX ERE 正则对齐）时会在启动会话时自动弹出告警与修复命令。
+- **一行命令无损归档清理**：将冲突的旧文件安全移入统一 UTC 时间戳目录 `~/.gemini/config/.agy-loop-backup-<YYYYMMDD-HHMMSSZ>/`（清理后在已打开的 `agy` 会话中执行一次 `/skills reload`）：
   - **纯 POSIX Shell（零 Node/npm 依赖）**：`sh ~/.gemini/config/plugins/agy-loop/install.sh --clean-shadow`
   - **在 `agy` 会话内直接执行（通过插件前缀即可立即调起）**：`/agy-loop:loop doctor --clean-shadow`
   - **通过 npm CLI 桥接器**：`npx agy-loop doctor --clean-shadow`
@@ -219,9 +228,9 @@ Antigravity 加载个人全局配置目录 `~/.gemini/config/` 的优先级高�
 | 命令 | 用途说明 |
 | :--- | :--- |
 | `npx agy-loop [install \| update]` | 调用 `agy plugin install` 安装或更新插件（自动检测同名全局遮蔽文件并告警） |
-| `npx agy-loop install --clean-shadow` | 安装 `agy-loop` 并将遮蔽插件的用户级散落文件自动归档至 `~/.gemini/config/.agy-loop-backup-<timestamp>/` |
-| `npx agy-loop doctor [--json]` | 检查 `agy` 版本、插件启用状态（`agy plugin list --json`）、同名遮蔽文件、`skills.json` 的 `include_only`/`exclude` 过滤规则及当前生效的 `loop.md`（支持 `status` 别名） |
-| `npx agy-loop doctor --clean-shadow [--json]` | 无损归档同名遮蔽文件至 `~/.gemini/config/.agy-loop-backup-<timestamp>/` 并重新执行健康检查（支持 `status --clean-shadow` 别名；活跃会话请执行 `/skills reload`） |
+| `npx agy-loop install --clean-shadow` | 安装 `agy-loop` 并将遮蔽插件的用户级散落文件自动归档至 `~/.gemini/config/.agy-loop-backup-<YYYYMMDD-HHMMSSZ>/` |
+| `npx agy-loop doctor [--json]` | 完整健康巡检：含 `agy v1.5.13` 特性矩阵（`agy.capabilities`）、企业策略 `admin_settings.json`/`settings.json`/`hooks.json` 审计、`SessionStart` `protojson` 自检（`hookSelfTest`）、`loop-worker` 6 工具校验（`agentToolsCheck`）、遮蔽文件、ERE `skills.json` 过滤、`loop.md`、`activeLoops` 与 `15s`/`30s` `spawnSync` 超时保护 |
+| `npx agy-loop doctor --clean-shadow [--json]` | 无损归档同名遮蔽文件至 `~/.gemini/config/.agy-loop-backup-<YYYYMMDD-HHMMSSZ>/` 并重新执行健康检查（支持 `status --clean-shadow` 别名；活跃会话请执行 `/skills reload`） |
 | `npx agy-loop validate [--json]` | 对插件目录执行 `agy plugin validate --strict` 官方严格校验 |
 | `npx agy-loop uninstall` | 调用 `agy plugin uninstall agy-loop` 干净卸载插件（支持 `remove` 别名） |
 

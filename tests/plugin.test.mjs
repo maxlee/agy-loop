@@ -46,16 +46,20 @@ const VERIFIED_CORTEX_TOOLS = new Set([
   "ask_question",
 ]);
 
-const REQUIRED_LOOP_WORKER_TOOLS = [
-  "view_file",
-  "write_to_file",
-  "replace_file_content",
+const BROKEN_ONEHARNESS_TOOLS = [
   "multi_replace_file_content",
   "list_dir",
   "find_by_name",
   "grep_search",
+];
+
+const REQUIRED_LOOP_WORKER_TOOLS = [
+  "view_file",
+  "write_to_file",
+  "replace_file_content",
   "run_command",
   "manage_task",
+  "search_web",
 ];
 
 function makeSandbox(t) {
@@ -81,79 +85,90 @@ import fs from "node:fs";
 const args = process.argv.slice(2);
 const logFile = process.env.MOCK_AGY_LOG;
 const stateFile = process.env.MOCK_AGY_STATE;
+const mockVersion = process.env.MOCK_AGY_VERSION || "1.5.9";
+const mockPluginVersion = process.env.MOCK_AGY_PLUGIN_VERSION || "1.1.0";
+const sleepMs = Number.parseInt(process.env.MOCK_AGY_SLEEP_MS || "0", 10);
 
-if (logFile) {
-  fs.appendFileSync(logFile, JSON.stringify({ args, home: process.env.HOME }) + "\\n");
-}
-
-function readState() {
-  try {
-    return JSON.parse(fs.readFileSync(stateFile, "utf8"));
-  } catch {
-    return { installed: false, target: null };
+function handleArgs() {
+  if (logFile) {
+    fs.appendFileSync(logFile, JSON.stringify({ args, home: process.env.HOME }) + "\\n");
   }
-}
 
-function writeState(next) {
-  if (stateFile) {
-    fs.writeFileSync(stateFile, JSON.stringify(next));
+  function readState() {
+    try {
+      return JSON.parse(fs.readFileSync(stateFile, "utf8"));
+    } catch {
+      return { installed: false, target: null };
+    }
   }
-}
 
-if (args[0] === "--version") {
-  process.stdout.write("1.5.9\\n");
-  process.exit(0);
-}
-
-if (args[0] === "plugin" && args[1] === "install") {
-  const target = args[2] || "";
-  writeState({ installed: true, target });
-  process.stdout.write(\`Installed plugin agy-loop from \${target}\\n\`);
-  process.exit(0);
-}
-
-if (args[0] === "plugin" && args[1] === "uninstall") {
-  writeState({ installed: false, target: null });
-  process.stdout.write(\`Uninstalled plugin \${args[2] || ""}\\n\`);
-  process.exit(0);
-}
-
-if (args[0] === "plugin" && args[1] === "list" && args.includes("--json")) {
-  const state = readState();
-  const list = state.installed
-    ? [
-        {
-          name: "agy-loop",
-          enabled: true,
-          version: "1.0.0",
-          source: "antigravity",
-          path: \`\${process.env.HOME}/.gemini/config/plugins/agy-loop\`,
-          skills: ["loop"],
-        },
-      ]
-    : [];
-  process.stdout.write(JSON.stringify(list, null, 2) + "\\n");
-  process.exit(0);
-}
-
-if (args[0] === "plugin" && args[1] === "validate") {
-  const targetDir = args[args.length - 1];
-  const payload = {
-    dir: targetDir,
-    manifest: "plugin.json",
-    name: "agy-loop",
-    findings: [],
-  };
-  if (args.includes("--json")) {
-    process.stdout.write(JSON.stringify(payload, null, 2) + "\\n");
-  } else {
-    process.stdout.write("Plugin validation passed (0 findings)\\n");
+  function writeState(next) {
+    if (stateFile) {
+      fs.writeFileSync(stateFile, JSON.stringify(next));
+    }
   }
-  process.exit(0);
+
+  if (args[0] === "--version") {
+    process.stdout.write(\`\${mockVersion}\\n\`);
+    process.exit(0);
+  }
+
+  if (args[0] === "plugin" && args[1] === "install") {
+    const target = args[2] || "";
+    writeState({ installed: true, target });
+    process.stdout.write(\`Installed plugin agy-loop from \${target}\\n\`);
+    process.exit(0);
+  }
+
+  if (args[0] === "plugin" && args[1] === "uninstall") {
+    writeState({ installed: false, target: null });
+    process.stdout.write(\`Uninstalled plugin \${args[2] || ""}\\n\`);
+    process.exit(0);
+  }
+
+  if (args[0] === "plugin" && args[1] === "list" && args.includes("--json")) {
+    const state = readState();
+    const list = state.installed
+      ? [
+          {
+            name: "agy-loop",
+            enabled: true,
+            version: mockPluginVersion,
+            source: "antigravity",
+            path: \`\${process.env.HOME}/.gemini/config/plugins/agy-loop\`,
+            skills: ["loop"],
+          },
+        ]
+      : [];
+    process.stdout.write(JSON.stringify(list, null, 2) + "\\n");
+    process.exit(0);
+  }
+
+  if (args[0] === "plugin" && args[1] === "validate") {
+    const targetDir = args[args.length - 1];
+    const payload = {
+      dir: targetDir,
+      manifest: "plugin.json",
+      name: "agy-loop",
+      findings: [],
+    };
+    if (args.includes("--json")) {
+      process.stdout.write(JSON.stringify(payload, null, 2) + "\\n");
+    } else {
+      process.stdout.write("Plugin validation passed (0 findings)\\n");
+    }
+    process.exit(0);
+  }
+
+  process.stderr.write(\`Unexpected mock agy args: \${args.join(" ")}\\n\`);
+  process.exit(1);
 }
 
-process.stderr.write(\`Unexpected mock agy args: \${args.join(" ")}\\n\`);
-process.exit(1);
+if (Number.isFinite(sleepMs) && sleepMs > 0) {
+  setTimeout(handleArgs, sleepMs);
+} else {
+  handleArgs();
+}
 `;
   fs.writeFileSync(mockAgyPath, mockAgyScript, { mode: 0o755 });
 
@@ -245,6 +260,7 @@ test("plugin.json, package.json, and assets/logo.svg satisfy strict schema and p
   assert.equal(pluginJson.$schema, "https://antigravity.google/schemas/v1/plugin.json");
   assert.equal(pluginJson.name, "agy-loop");
   assert.equal(pluginJson.displayName, "AGY Loop");
+  assert.equal(pluginJson.version, "1.1.0");
   assert.doesNotMatch(
     pluginJson.displayName,
     /Antigravity|Gemini|Claude|Cursor|Plugin/i,
@@ -351,9 +367,21 @@ test(
     for (const reqTool of REQUIRED_LOOP_WORKER_TOOLS) {
       assert.ok(
         toolLines.includes(reqTool),
-        `loop-worker.md missing expected Cortex tool '${reqTool}'`
+        `loop-worker.md missing expected dual-engine tool '${reqTool}'`
       );
     }
+    for (const brokenTool of BROKEN_ONEHARNESS_TOOLS) {
+      assert.equal(
+        toolLines.includes(brokenTool),
+        false,
+        `loop-worker.md must NOT include oneharness-broken tool '${brokenTool}'`
+      );
+    }
+    assert.deepEqual(
+      [...toolLines].sort(),
+      [...REQUIRED_LOOP_WORKER_TOOLS].sort(),
+      "loop-worker.md tools must match exact 6-tool dual-engine intersection"
+    );
 
     assert.match(body, /LOOP_STATUS:\s*DONE\s*\|\s*CONTINUE\s*\|\s*BLOCKED/);
     assert.match(body, /NEXT_DELAY_SEC:/);
@@ -363,7 +391,7 @@ test(
 );
 
 test(
-  "skills/loop/SKILL.md has quoted YAML frontmatter and stays well under 24,000 byte cap",
+  "skills/loop/SKILL.md has quoted YAML frontmatter, stays under 18,000 bytes, and forbids resolve-task bypass",
   { skip: !fs.existsSync(skillMdPath) ? "skills/loop/SKILL.md not present yet" : false },
   () => {
     const raw = fs.readFileSync(skillMdPath, "utf8");
@@ -378,10 +406,29 @@ test(
 
     const bodyBytes = Buffer.byteLength(body, "utf8");
     assert.ok(
+      bodyBytes < 18000,
+      `SKILL.md body (${bodyBytes} bytes) must be strictly under the 18,000 byte budget`
+    );
+    assert.ok(
       bodyBytes < 24000,
       `SKILL.md body (${bodyBytes} bytes) must be strictly under the 24,000 byte cap`
     );
     assert.ok(bodyBytes > 500, "SKILL.md body should contain full orchestration protocol");
+    assert.doesNotMatch(
+      body,
+      /you may also read with\s+`?read_file`?\s+or\s+`?view_file`?/i,
+      "SKILL.md must not reintroduce Turn A resolve-task bypass"
+    );
+    assert.doesNotMatch(
+      body,
+      /or re-read via\s+`?read_file`?\s*\/\s*`?view_file`?/i,
+      "SKILL.md must not reintroduce Turn C resolve-task bypass"
+    );
+    assert.match(
+      body,
+      /do NOT bypass with (?:direct )?`?read_file`?\/`?view_file`?/i,
+      "SKILL.md must explicitly forbid bypassing resolve-task"
+    );
   }
 );
 
@@ -1252,3 +1299,807 @@ test(
     }
   }
 );
+
+test("loop-helper.sh v1.1 parser handles lifecycle subcommands, compound/prefix durations, Option A flags, and quotes", (t) => {
+  const { workspace, envWithMockAgy } = makeSandbox(t);
+  const runParse = (argStr, useStdin = false) =>
+    useStdin
+      ? spawnSync("sh", [helperShPath, "parse", "--stdin"], {
+          cwd: workspace,
+          env: envWithMockAgy,
+          input: argStr,
+          encoding: "utf8",
+        })
+      : spawnSync("sh", [helperShPath, "parse", argStr], {
+          cwd: workspace,
+          env: envWithMockAgy,
+          encoding: "utf8",
+        });
+
+  // Lifecycle subcommands
+  const lifecycleOk = [
+    ["status --json", { action: "status", json: true }],
+    ["status --all", { action: "status", all: true }],
+    ["status --all --json", { action: "status", all: true, json: true }],
+    ["list --all --json", { action: "status", all: true, json: true }],
+    ["stop id1 id2", { action: "stop", target: "id1", targets: ["id1", "id2"] }],
+    ["stop id1 --after-current", { action: "stop", target: "id1", after_current: true }],
+    [
+      "stop id1 id2 --after-current",
+      { action: "stop", target: "id1", targets: ["id1", "id2"], after_current: true },
+    ],
+  ];
+  for (const [input, expected] of lifecycleOk) {
+    const res = runParse(input);
+    assert.equal(res.status, 0, `Expected exit 0 for '${input}': ${res.stdout} ${res.stderr}`);
+    assert.deepEqual(JSON.parse(res.stdout), expected, `Mismatch for '${input}'`);
+  }
+
+  for (const badLifecycle of [
+    "status badarg",
+    "help flags",
+    "clean-shadow extra",
+    "stop all id1",
+    "stop --badflag",
+  ]) {
+    const res = runParse(badLifecycle);
+    assert.equal(res.status, 2, `Expected exit 2 for '${badLifecycle}', got ${res.status}`);
+    assert.ok(JSON.parse(res.stdout).error, `Expected JSON error for '${badLifecycle}'`);
+  }
+
+  // Durations & prefix `every`
+  const every5m = JSON.parse(runParse("every 5m check").stdout);
+  assert.equal(every5m.pacing, "fixed");
+  assert.equal(every5m.interval_sec, 300);
+  assert.equal(every5m.interval_label, "5m");
+  assert.equal(every5m.cron_expr, "*/5 * * * *");
+  assert.equal(every5m.prompt, "check");
+
+  const every5Min = JSON.parse(runParse("every 5 minutes check").stdout);
+  assert.equal(every5Min.pacing, "fixed");
+  assert.equal(every5Min.interval_sec, 300);
+  assert.equal(every5Min.interval_label, "5m");
+  assert.equal(every5Min.prompt, "check");
+
+  const everyHourComma = JSON.parse(runParse("every hour, check").stdout);
+  assert.equal(everyHourComma.pacing, "fixed");
+  assert.equal(everyHourComma.interval_sec, 3600);
+  assert.equal(everyHourComma.interval_label, "1h");
+  assert.equal(everyHourComma.cron_expr, "0 * * * *");
+  assert.equal(everyHourComma.prompt, "check");
+
+  const compound1h30m = JSON.parse(runParse("1h30m check").stdout);
+  assert.equal(compound1h30m.pacing, "fixed");
+  assert.equal(compound1h30m.interval_sec, 5400);
+  assert.equal(compound1h30m.interval_label, "1h30m");
+  assert.equal(compound1h30m.cron_expr, null);
+  assert.equal(compound1h30m.prompt, "check");
+
+  const every2m30s = JSON.parse(runParse("every 2m30s check").stdout);
+  assert.equal(every2m30s.pacing, "fixed");
+  assert.equal(every2m30s.interval_sec, 150);
+  assert.equal(every2m30s.interval_label, "2m30s");
+  assert.equal(every2m30s.prompt, "check");
+
+  for (const badDur of [
+    "1.5m check",
+    "every 0.5h check",
+    "0m check",
+    "1h0m check",
+    "1m2m check",
+  ]) {
+    const res = runParse(badDur);
+    assert.equal(res.status, 2, `Expected exit 2 for invalid duration '${badDur}'`);
+    assert.ok(JSON.parse(res.stdout).error);
+  }
+
+  // Option A two-tier unknown --flag policy
+  for (const badFlagCase of [
+    "--statefull check",
+    "check --statefull",
+    "5m check --work-tree",
+    "--unknown 5m check",
+  ]) {
+    const res = runParse(badFlagCase);
+    assert.equal(res.status, 2, `Expected exit 2 for '${badFlagCase}'`);
+    assert.ok(JSON.parse(res.stdout).error);
+  }
+
+  const midFlagRes = runParse("30s gh pr checks --required");
+  assert.equal(midFlagRes.status, 0, midFlagRes.stderr);
+  const midFlagJson = JSON.parse(midFlagRes.stdout);
+  assert.equal(midFlagJson.interval_sec, 30);
+  assert.equal(midFlagJson.prompt, "gh pr checks --required");
+  assert.ok(Array.isArray(midFlagJson.warnings) && midFlagJson.warnings.length > 0);
+  assert.match(midFlagJson.warnings[0], /--required/);
+
+  const endOfOptsRes = runParse("30s -- --statefull");
+  assert.equal(endOfOptsRes.status, 0, endOfOptsRes.stderr);
+  const endOfOptsJson = JSON.parse(endOfOptsRes.stdout);
+  assert.equal(endOfOptsJson.interval_sec, 30);
+  assert.equal(endOfOptsJson.prompt, "--statefull");
+  assert.equal(endOfOptsJson.warnings, undefined);
+
+  // Quote consistency (single quoted token vs multi-token embedded quotes)
+  for (const useStdin of [false, true]) {
+    const singleDoubleQ = JSON.parse(runParse('30s "npm test"', useStdin).stdout);
+    assert.equal(singleDoubleQ.prompt, "npm test");
+
+    const singleSingleQ = JSON.parse(runParse("30s 'npm test'", useStdin).stdout);
+    assert.equal(singleSingleQ.prompt, "npm test");
+
+    const multiEmbedded = JSON.parse(runParse('check "PR #42" CI', useStdin).stdout);
+    assert.equal(multiEmbedded.prompt, 'check "PR #42" CI');
+  }
+});
+
+test("loop-helper.sh externalized state store supports init/read/update/list/stop, git cleanliness, traversal guard, and AGY_LOOP_STATE_DIR", (t) => {
+  const { root, workspace, envWithMockAgy } = makeSandbox(t);
+  const runHelper = (args, customEnv = envWithMockAgy, stdinText = undefined, cwd = workspace) =>
+    spawnSync("sh", [helperShPath, ...args], {
+      cwd,
+      env: customEnv,
+      input: stdinText,
+      encoding: "utf8",
+    });
+
+  // 1. Initialize real git repo to prove .agents/.agy-loop/.gitignore keeps git status clean
+  const gitEnv = { ...envWithMockAgy, GIT_CONFIG_NOSYSTEM: "1" };
+  const runGit = (args) =>
+    spawnSync("git", ["-c", "commit.gpgsign=false", ...args], {
+      cwd: workspace,
+      env: gitEnv,
+      encoding: "utf8",
+    });
+
+  const gitInit = runGit(["init"]);
+  assert.equal(gitInit.status, 0, gitInit.stderr);
+  assert.equal(runGit(["config", "user.email", "test@example.com"]).status, 0);
+  assert.equal(runGit(["config", "user.name", "Test User"]).status, 0);
+  fs.writeFileSync(path.join(workspace, "README.md"), "repo\n");
+  assert.equal(runGit(["add", "README.md"]).status, 0);
+  const gitCommit = runGit(["commit", "-m", "init"]);
+  assert.equal(gitCommit.status, 0, gitCommit.stderr);
+
+  const parsedRun = runHelper(["parse", "/loop 30s check CI --max 5 --worktree --model flash"]);
+  assert.equal(parsedRun.status, 0, parsedRun.stderr);
+
+  const initRes = runHelper(["state-init", workspace, "--stdin"], envWithMockAgy, parsedRun.stdout);
+  assert.equal(initRes.status, 0, initRes.stdout + initRes.stderr);
+  const state1 = JSON.parse(initRes.stdout);
+  assert.equal(state1.schema_version, 1);
+  assert.equal(state1.status, "running");
+  assert.equal(state1.iteration, 1);
+  assert.equal(state1.consecutive_errors, 0);
+  assert.equal(state1.stop_requested, false);
+  assert.equal(state1.max_iterations, 5);
+  assert.equal(state1.workspace, "branch");
+  assert.equal(state1.model, "flash");
+  assert.match(state1.loop_id, /^lp_\d{8}T\d{6}Z_[0-9a-f]{4}$/);
+  assert.match(state1.created_at, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/);
+  assert.match(state1.updated_at, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/);
+
+  const stateRoot = path.join(workspace, ".agents", ".agy-loop");
+  assert.equal(fs.readFileSync(path.join(stateRoot, ".gitignore"), "utf8"), "*\n");
+  const loopDir1 = path.join(stateRoot, "loops", state1.loop_id);
+  assert.equal(fs.existsSync(path.join(loopDir1, "state.json")), true);
+  assert.equal(fs.existsSync(path.join(loopDir1, "events.jsonl")), true);
+
+  // 2. Adversarial shell metacharacters in state-update --stdin + CLI flags
+  const pwnPath = path.join(workspace, "state-pwned");
+  const advSummary = `Passed $(touch "${pwnPath}") & \`id\` $HOME 'single' "double"\nsecond line`;
+  const advHint = `Inspect $(echo nope) && \`uname\` "next"\nhint line 2`;
+  const updateRes = runHelper(
+    [
+      "state-update",
+      workspace,
+      state1.loop_id,
+      "--stdin",
+      "--increment-iteration",
+      "--increment-errors",
+      "--task-id",
+      "task-42",
+      "--worker-id",
+      "conv-99",
+      "--worktree-branch",
+      "feat/fix-ci",
+    ],
+    envWithMockAgy,
+    JSON.stringify({
+      last_status: "CONTINUE",
+      last_delay_sec: 30,
+      last_summary: advSummary,
+      next_hint: advHint,
+      event: "iteration_complete",
+    })
+  );
+  assert.equal(updateRes.status, 0, updateRes.stdout + updateRes.stderr);
+  assert.equal(fs.existsSync(pwnPath), false, "Adversarial command substitution must not execute");
+
+  const readRes = runHelper(["state-read", workspace, state1.loop_id]);
+  assert.equal(readRes.status, 0, readRes.stderr);
+  const readState1 = JSON.parse(readRes.stdout);
+  assert.equal(readState1.iteration, 2);
+  assert.equal(readState1.consecutive_errors, 1);
+  assert.equal(readState1.task_id, "task-42");
+  assert.equal(readState1.worker_id, "conv-99");
+  assert.equal(readState1.worktree_branch, "feat/fix-ci");
+  assert.equal(readState1.last_summary, advSummary);
+  assert.equal(readState1.next_hint, advHint);
+
+  const resetErrRes = runHelper(["state-update", workspace, state1.loop_id, "--reset-errors"]);
+  assert.equal(resetErrRes.status, 0, resetErrRes.stderr);
+  assert.equal(JSON.parse(resetErrRes.stdout).consecutive_errors, 0);
+
+  const eventsLines = fs
+    .readFileSync(path.join(loopDir1, "events.jsonl"), "utf8")
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  assert.ok(eventsLines.length >= 2);
+  assert.equal(eventsLines[0].event, "init");
+  assert.equal(eventsLines[1].event, "iteration_complete");
+
+  // git status --porcelain must remain completely empty after state-init + state-update
+  const gitStatus = runGit(["status", "--porcelain"]);
+  assert.equal(gitStatus.status, 0, gitStatus.stderr);
+  assert.equal(gitStatus.stdout, "", `Expected clean git working tree, got:\n${gitStatus.stdout}`);
+
+  // 3. state-list (--active vs --all) and state-stop (--after-current, single id, all)
+  const run2Json = runHelper(["parse", "1m build check"]).stdout;
+  const state2 = JSON.parse(runHelper(["state-init", workspace, "--stdin"], envWithMockAgy, run2Json).stdout);
+  const state3 = JSON.parse(runHelper(["state-init", workspace, "--stdin"], envWithMockAgy, run2Json).stdout);
+
+  const stopAfterRes = runHelper(["state-stop", workspace, state1.loop_id, "--after-current"]);
+  assert.equal(stopAfterRes.status, 0, stopAfterRes.stderr);
+  const stopAfterJson = JSON.parse(stopAfterRes.stdout);
+  assert.equal(stopAfterJson.stopped.length, 1);
+  assert.equal(stopAfterJson.stopped[0].status, "running");
+  assert.equal(stopAfterJson.stopped[0].stop_requested, true);
+  assert.equal(stopAfterJson.stopped[0].stop_mode, "after_current");
+
+  const stopNowRes = runHelper(["state-stop", workspace, state1.loop_id]);
+  assert.equal(stopNowRes.status, 0, stopNowRes.stderr);
+  const stopNowJson = JSON.parse(stopNowRes.stdout);
+  assert.equal(stopNowJson.stopped.length, 1);
+  assert.equal(stopNowJson.stopped[0].status, "stopped");
+  assert.equal(stopNowJson.stopped[0].stop_mode, "immediate");
+
+  const listActive = JSON.parse(runHelper(["state-list", workspace, "--active"]).stdout);
+  assert.equal(listActive.loops.length, 2);
+  assert.equal(listActive.loops.some((l) => l.loop_id === state1.loop_id), false);
+  assert.equal(listActive.loops.some((l) => l.loop_id === state2.loop_id), true);
+  assert.equal(listActive.loops.some((l) => l.loop_id === state3.loop_id), true);
+
+  const listAll = JSON.parse(runHelper(["state-list", workspace, "--all"]).stdout);
+  assert.equal(listAll.loops.length, 3);
+
+  const stopAllRes = runHelper(["state-stop", workspace, "all"]);
+  assert.equal(stopAllRes.status, 0, stopAllRes.stderr);
+  assert.equal(JSON.parse(stopAllRes.stdout).stopped.length, 2);
+  assert.equal(JSON.parse(runHelper(["state-list", workspace, "--active"]).stdout).loops.length, 0);
+
+  // 4. Path traversal & invalid loop_id rejection
+  for (const badId of ["../escape", "badid"]) {
+    for (const subcmd of [
+      ["state-read", workspace, badId],
+      ["state-update", workspace, badId, "--increment-errors"],
+      ["state-stop", workspace, badId],
+    ]) {
+      const badRes = runHelper(subcmd);
+      assert.equal(badRes.status, 2, `Expected exit 2 for ${subcmd.join(" ")}`);
+      assert.ok(JSON.parse(badRes.stdout).error);
+    }
+  }
+
+  // 5. AGY_LOOP_STATE_DIR override
+  const customStateDir = path.join(root, "custom-state-store");
+  const cleanWs = path.join(root, "clean-ws");
+  fs.mkdirSync(cleanWs, { recursive: true });
+  const envOverride = { ...envWithMockAgy, AGY_LOOP_STATE_DIR: customStateDir };
+
+  const ovInit = runHelper(["state-init", cleanWs, "--stdin"], envOverride, run2Json);
+  assert.equal(ovInit.status, 0, ovInit.stderr);
+  const ovState = JSON.parse(ovInit.stdout);
+  assert.equal(fs.existsSync(path.join(cleanWs, ".agents", ".agy-loop")), false);
+  assert.equal(
+    fs.existsSync(path.join(customStateDir, "loops", ovState.loop_id, "state.json")),
+    true
+  );
+  const ovList = JSON.parse(runHelper(["state-list", cleanWs, "--active"], envOverride).stdout);
+  assert.equal(ovList.loops.length, 1);
+  assert.equal(ovList.loops[0].loop_id, ovState.loop_id);
+
+  // 6. Preserve exit code 2 on state-init, state-update, and state-stop errors
+  const badInitJson = runHelper(["state-init", cleanWs, "--stdin"], envWithMockAgy, "{invalid");
+  assert.equal(badInitJson.status, 2);
+  assert.ok(JSON.parse(badInitJson.stdout).error);
+
+  const badInitAction = runHelper(
+    ["state-init", cleanWs, "--stdin"],
+    envWithMockAgy,
+    JSON.stringify({ action: "status" })
+  );
+  assert.equal(badInitAction.status, 2);
+  assert.ok(JSON.parse(badInitAction.stdout).error);
+
+  const cleanLoopRes = runHelper(["state-init", cleanWs, "--stdin"], envWithMockAgy, run2Json);
+  assert.equal(cleanLoopRes.status, 0, cleanLoopRes.stderr);
+  const cleanLoop = JSON.parse(cleanLoopRes.stdout);
+
+  for (const [args, stdinPayload] of [
+    [["state-update", cleanWs, cleanLoop.loop_id, "--status", "bogus"], undefined],
+    [["state-update", cleanWs, cleanLoop.loop_id, "--unknown-flag"], undefined],
+    [["state-update", cleanWs, cleanLoop.loop_id, "--stdin"], "not-json"],
+  ]) {
+    const updErr = runHelper(args, envWithMockAgy, stdinPayload);
+    assert.equal(updErr.status, 2, `Expected exit 2 for ${args.join(" ")}`);
+    assert.ok(JSON.parse(updErr.stdout).error);
+  }
+
+  const corruptId = "lp_20261121T000000Z_dead";
+  const corruptDir = path.join(cleanWs, ".agents", ".agy-loop", "loops", corruptId);
+  fs.mkdirSync(corruptDir, { recursive: true });
+  fs.writeFileSync(path.join(corruptDir, "state.json"), "{corrupt");
+  const stopCorruptRes = runHelper(["state-stop", cleanWs, corruptId]);
+  assert.equal(stopCorruptRes.status, 2);
+  assert.ok(JSON.parse(stopCorruptRes.stdout).error);
+
+  // 7. state-stop with glob-metacharacter workspace directory (ws[1] alongside sibling ws1)
+  const globRoot = path.join(root, "glob-test");
+  const wsBracket = path.join(globRoot, "ws[1]");
+  const wsSibling = path.join(globRoot, "ws1");
+  fs.mkdirSync(wsBracket, { recursive: true });
+  fs.mkdirSync(wsSibling, { recursive: true });
+
+  const brInitRes = runHelper(["state-init", wsBracket, "--stdin"], envWithMockAgy, run2Json);
+  assert.equal(brInitRes.status, 0, brInitRes.stderr);
+  const brLoop = JSON.parse(brInitRes.stdout);
+
+  // Create identical loop_id state in sibling ws1 to prove ws[1] never globs into ws1
+  const siblingLoopDir = path.join(wsSibling, ".agents", ".agy-loop", "loops", brLoop.loop_id);
+  fs.mkdirSync(siblingLoopDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(siblingLoopDir, "state.json"),
+    JSON.stringify({ ...brLoop, workspace_dir: wsSibling }) + "\n"
+  );
+
+  const stopBrSingle = runHelper(["state-stop", wsBracket, brLoop.loop_id]);
+  assert.equal(stopBrSingle.status, 0, stopBrSingle.stderr);
+  assert.equal(JSON.parse(stopBrSingle.stdout).stopped.length, 1);
+  assert.equal(JSON.parse(runHelper(["state-list", wsBracket, "--active"]).stdout).loops.length, 0);
+  assert.equal(JSON.parse(runHelper(["state-list", wsSibling, "--active"]).stdout).loops.length, 1);
+
+  const brInit2 = JSON.parse(runHelper(["state-init", wsBracket, "--stdin"], envWithMockAgy, run2Json).stdout);
+  const stopBrAll = runHelper(["state-stop", wsBracket, "all"]);
+  assert.equal(stopBrAll.status, 0, stopBrAll.stderr);
+  assert.equal(JSON.parse(stopBrAll.stdout).stopped.length, 1);
+  assert.equal(JSON.parse(stopBrAll.stdout).stopped[0].loop_id, brInit2.loop_id);
+  assert.equal(JSON.parse(runHelper(["state-list", wsBracket, "--active"]).stdout).loops.length, 0);
+  assert.equal(JSON.parse(runHelper(["state-list", wsSibling, "--active"]).stdout).loops.length, 1);
+});
+
+test("v1.1 3-way UTC backup parity, skills.json regex matrix, SessionStart protojson, and upgraded doctor diagnostics", (t) => {
+  const { root, home, workspace, envWithMockAgy } = makeSandbox(t);
+  const cliPath = path.join(REPO_ROOT, "bin", "agy-loop.mjs");
+  const installSh = path.join(REPO_ROOT, "install.sh");
+  const utcBackupRegex = /^\.agy-loop-backup-\d{8}-\d{6}Z$/;
+
+  // 1. UTC backup timestamp parity across bin/agy-loop.mjs, loop-helper.sh, and install.sh
+  const seedShadow = (targetHome) => {
+    const dir = path.join(targetHome, ".gemini", "config", "skills", "loop");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "SKILL.md"), "shadow\n");
+  };
+
+  // 1a. bin/agy-loop.mjs
+  const sbCli = makeSandbox(t);
+  seedShadow(sbCli.home);
+  const cliClean = spawnSync(process.execPath, [cliPath, "doctor", "--clean-shadow", "--json"], {
+    cwd: sbCli.workspace,
+    env: sbCli.envWithMockAgy,
+    encoding: "utf8",
+  });
+  assert.equal(cliClean.status, 0, cliClean.stderr);
+  assert.match(path.basename(JSON.parse(cliClean.stdout).backupDir), utcBackupRegex);
+
+  // 1b. loop-helper.sh
+  const sbHelper = makeSandbox(t);
+  seedShadow(sbHelper.home);
+  const helperClean = spawnSync("sh", [helperShPath, "doctor", "--clean-shadow", sbHelper.workspace], {
+    cwd: sbHelper.workspace,
+    env: sbHelper.envWithMockAgy,
+    encoding: "utf8",
+  });
+  assert.equal(helperClean.status, 0, helperClean.stderr);
+  assert.match(path.basename(JSON.parse(helperClean.stdout).backup_dir), utcBackupRegex);
+
+  // 1c. install.sh
+  const sbInstall = makeSandbox(t);
+  seedShadow(sbInstall.home);
+  const shClean = spawnSync("sh", [installSh, "--clean-shadow"], {
+    cwd: sbInstall.workspace,
+    env: sbInstall.envWithMockAgy,
+    encoding: "utf8",
+  });
+  assert.equal(shClean.status, 0, shClean.stderr);
+  const installBackups = fs
+    .readdirSync(path.join(sbInstall.home, ".gemini", "config"))
+    .filter((n) => n.startsWith(".agy-loop-backup-"));
+  assert.equal(installBackups.length, 1);
+  assert.match(installBackups[0], utcBackupRegex);
+
+  // 2. skills.json regex & depth parity across bin/agy-loop.mjs and loop-helper.sh
+  assert.equal(
+    spawnSync(process.execPath, [cliPath, "install", "--json"], {
+      cwd: workspace,
+      env: envWithMockAgy,
+      encoding: "utf8",
+    }).status,
+    0
+  );
+
+  fs.mkdirSync(path.join(workspace, ".agents"), { recursive: true });
+  const skillsJsonPath = path.join(workspace, ".agents", "skills.json");
+  const regexParityMatrix = [
+    {
+      name: "include_only ^loop$",
+      content: JSON.stringify({ include_only: ["^loop$"] }),
+      expectWarning: false,
+    },
+    {
+      name: "exclude ^loop$",
+      content: JSON.stringify({ exclude: ["^loop$"] }),
+      expectWarning: true,
+    },
+    {
+      name: "include_only agy-.*",
+      content: JSON.stringify({ include_only: ["agy-.*"] }),
+      expectWarning: false,
+    },
+    {
+      name: "exclude agy-.*",
+      content: JSON.stringify({ exclude: ["agy-.*"] }),
+      expectWarning: true,
+    },
+    {
+      name: "include_only (foo|loop)",
+      content: JSON.stringify({ include_only: ["(foo|loop)"] }),
+      expectWarning: false,
+    },
+    {
+      name: "exclude (foo|loop)",
+      content: JSON.stringify({ exclude: ["(foo|loop)"] }),
+      expectWarning: true,
+    },
+    {
+      name: "nested unrelated include_only/exclude ignored",
+      content: JSON.stringify({
+        nested: { deep: { include_only: ["lint"], exclude: ["loop"] } },
+        entries: [{ path: "skills", metadata: { exclude: ["loop"] } }],
+      }),
+      expectWarning: false,
+    },
+    {
+      name: "malformed regexes in include_only do not crash awk",
+      content: JSON.stringify({ include_only: ["[", "(", "*bad"] }),
+      expectWarning: true,
+    },
+    {
+      name: "malformed regexes in exclude do not crash awk",
+      content: JSON.stringify({ exclude: ["[", "(", "*bad"] }),
+      expectWarning: false,
+    },
+    {
+      name: "escaped caret class [\\^] in exclude does not crash awk or match",
+      content: JSON.stringify({ exclude: ["[\\^]"] }),
+      expectWarning: false,
+    },
+    {
+      name: "escaped caret class [\\^a]oop in exclude does not invert or match loop",
+      content: JSON.stringify({ exclude: ["[\\^a]oop"] }),
+      expectWarning: false,
+    },
+    {
+      name: "escaped caret class [\\^a]oop in include_only omits loop",
+      content: JSON.stringify({ include_only: ["[\\^a]oop"] }),
+      expectWarning: true,
+    },
+    {
+      name: "large bounded quantifier l{300} in exclude does not crash RE_DUP_MAX",
+      content: JSON.stringify({ exclude: ["l{300}"] }),
+      expectWarning: false,
+    },
+  ];
+
+  for (const sc of regexParityMatrix) {
+    fs.writeFileSync(skillsJsonPath, sc.content);
+    const cliRes = spawnSync(process.execPath, [cliPath, "doctor", "--json"], {
+      cwd: workspace,
+      env: envWithMockAgy,
+      encoding: "utf8",
+    });
+    assert.equal(cliRes.status, 0, `${sc.name}: ${cliRes.stderr}`);
+    const cliDoc = JSON.parse(cliRes.stdout);
+    assert.equal(
+      cliDoc.skillFilterWarnings.length > 0,
+      sc.expectWarning,
+      `bin/agy-loop.mjs mismatch for ${sc.name}`
+    );
+
+    const helperRes = spawnSync("sh", [helperShPath, "doctor", workspace], {
+      cwd: workspace,
+      env: envWithMockAgy,
+      encoding: "utf8",
+    });
+    assert.equal(helperRes.status, 0, `${sc.name}: ${helperRes.stderr}`);
+    const helperDoc = JSON.parse(helperRes.stdout);
+    assert.equal(
+      helperDoc.skill_filter_warnings.length > 0,
+      sc.expectWarning,
+      `loop-helper.sh mismatch for ${sc.name}`
+    );
+  }
+  fs.rmSync(skillsJsonPath, { force: true });
+
+  // 3. SessionStart hook with full agy v1.5.13 stdin payload (strict protojson, zero leaked keys)
+  const hooksConfig = JSON.parse(fs.readFileSync(hooksJsonPath, "utf8"));
+  const sessionStartCmd = hooksConfig["agy-loop-shadow-check"].SessionStart[0].command;
+  const v1513Stdin = JSON.stringify({
+    artifactDirectoryPath: path.join(home, ".gemini", "antigravity-cli", "brain", "conv-1513"),
+    conversationId: "00000000-0000-0000-0000-000000001513",
+    hookEventName: "SessionStart",
+    modelName: "gemini-4-neon-xhigh",
+    lastUserInput: "SENTINEL_USER_INPUT_NEVER_LEAK",
+    cwd: workspace,
+    workspacePaths: [workspace],
+  });
+  const runSessionStart = () =>
+    spawnSync("sh", ["-c", sessionStartCmd], {
+      cwd: REPO_ROOT,
+      env: { ...envWithMockAgy, PLUGIN_ROOT: REPO_ROOT },
+      input: v1513Stdin,
+      encoding: "utf8",
+    });
+  const assertNoLeakedStdin = (rawStdout, parsed) => {
+    for (const key of [
+      "artifactDirectoryPath",
+      "conversationId",
+      "hookEventName",
+      "modelName",
+      "lastUserInput",
+      "cwd",
+      "workspacePaths",
+    ]) {
+      assert.equal(key in parsed, false, `SessionStart leaked stdin key '${key}'`);
+    }
+    assert.equal(rawStdout.includes("SENTINEL_USER_INPUT_NEVER_LEAK"), false);
+  };
+
+  // 3a. Clean -> {}
+  const ssClean = runSessionStart();
+  assert.equal(ssClean.status, 0, ssClean.stderr);
+  const ssCleanJson = JSON.parse(ssClean.stdout);
+  assert.deepEqual(ssCleanJson, {});
+  assertNoLeakedStdin(ssClean.stdout, ssCleanJson);
+
+  // 3b. skills.json block only (no shadows) -> injectSteps warning about skills.json
+  fs.writeFileSync(skillsJsonPath, JSON.stringify({ include_only: ["lint"] }));
+  const ssFilterOnly = runSessionStart();
+  assert.equal(ssFilterOnly.status, 0, ssFilterOnly.stderr);
+  const ssFilterJson = JSON.parse(ssFilterOnly.stdout);
+  assert.deepEqual(Object.keys(ssFilterJson), ["injectSteps"]);
+  assert.equal(ssFilterJson.injectSteps.length, 1);
+  assert.match(ssFilterJson.injectSteps[0].systemMessage.systemMessage, /skills\.json/);
+  assertNoLeakedStdin(ssFilterOnly.stdout, ssFilterJson);
+
+  // 3c. Shadows + skills.json -> emits both warnings with zero leaked stdin keys
+  const shadowSkill = path.join(home, ".gemini", "config", "skills", "loop");
+  fs.mkdirSync(shadowSkill, { recursive: true });
+  fs.writeFileSync(path.join(shadowSkill, "SKILL.md"), "shadow\n");
+  const ssBoth = runSessionStart();
+  assert.equal(ssBoth.status, 0, ssBoth.stderr);
+  const ssBothJson = JSON.parse(ssBoth.stdout);
+  assert.deepEqual(Object.keys(ssBothJson), ["injectSteps"]);
+  const bothText = ssBothJson.injectSteps[0].systemMessage.systemMessage;
+  assert.match(bothText, /Shadow warning/);
+  assert.match(bothText, /skills\.json/);
+  assertNoLeakedStdin(ssBoth.stdout, ssBothJson);
+
+  fs.rmSync(shadowSkill, { recursive: true, force: true });
+  fs.rmSync(skillsJsonPath, { force: true });
+
+  // 3d. #27 #2 edge regexes ([\^], [\^a]oop, l{300}, [[:lower:]]+) keep SessionStart protojson & doctor crash-free
+  for (const [pat, expectedSessionSteps] of [
+    ["[\\^]", false],
+    ["[\\^a]oop", false],
+    ["l{300}", false],
+    ["[[:lower:]]+", true],
+  ]) {
+    fs.writeFileSync(skillsJsonPath, JSON.stringify({ exclude: [pat] }));
+    const ssEdge = runSessionStart();
+    assert.equal(ssEdge.status, 0, `SessionStart crashed for exclude '${pat}': ${ssEdge.stderr}`);
+    const ssEdgeJson = JSON.parse(ssEdge.stdout);
+    assertNoLeakedStdin(ssEdge.stdout, ssEdgeJson);
+    if (expectedSessionSteps) {
+      assert.deepEqual(Object.keys(ssEdgeJson), ["injectSteps"]);
+    } else {
+      assert.deepEqual(ssEdgeJson, {});
+    }
+
+    const helperEdge = spawnSync("sh", [helperShPath, "doctor", workspace], {
+      cwd: workspace,
+      env: envWithMockAgy,
+      encoding: "utf8",
+    });
+    assert.equal(helperEdge.status, 0, `doctor crashed for exclude '${pat}': ${helperEdge.stderr}`);
+    assert.equal(JSON.parse(helperEdge.stdout).skill_filter_warnings.length > 0, expectedSessionSteps);
+
+    const cliEdge = spawnSync(process.execPath, [cliPath, "doctor", "--json"], {
+      cwd: workspace,
+      env: envWithMockAgy,
+      encoding: "utf8",
+    });
+    assert.equal(cliEdge.status, 0, cliEdge.stderr);
+  }
+
+  fs.writeFileSync(skillsJsonPath, JSON.stringify({ include_only: ["[[:lower:]]+"] }));
+  const ssLowerInc = runSessionStart();
+  assert.equal(ssLowerInc.status, 0, ssLowerInc.stderr);
+  assert.deepEqual(JSON.parse(ssLowerInc.stdout), {});
+  const helperLowerInc = spawnSync("sh", [helperShPath, "doctor", workspace], {
+    cwd: workspace,
+    env: envWithMockAgy,
+    encoding: "utf8",
+  });
+  assert.equal(helperLowerInc.status, 0, helperLowerInc.stderr);
+  assert.deepEqual(JSON.parse(helperLowerInc.stdout).skill_filter_warnings, []);
+
+  fs.rmSync(skillsJsonPath, { force: true });
+
+  // 4. Upgraded bin/agy-loop.mjs doctor --json checks
+  // 4a. Capabilities matrix for mock agy 1.5.9 vs 1.5.13 + hookSelfTest + agentToolsCheck + activeLoops
+  const activeRun = spawnSync("sh", [helperShPath, "parse", "1m run checks"], {
+    cwd: workspace,
+    env: envWithMockAgy,
+    encoding: "utf8",
+  }).stdout;
+  const activeLoop = JSON.parse(
+    spawnSync("sh", [helperShPath, "state-init", workspace, "--stdin"], {
+      cwd: workspace,
+      env: envWithMockAgy,
+      input: activeRun,
+      encoding: "utf8",
+    }).stdout
+  );
+
+  const doc159 = JSON.parse(
+    spawnSync(process.execPath, [cliPath, "doctor", "--json"], {
+      cwd: workspace,
+      env: { ...envWithMockAgy, MOCK_AGY_VERSION: "1.5.9" },
+      encoding: "utf8",
+    }).stdout
+  );
+  assert.equal(doc159.ok, true);
+  assert.equal(doc159.agy.capabilities.parsedVersion, "1.5.9");
+  assert.equal(doc159.agy.capabilities.dynamicWorkflows, true);
+  assert.equal(doc159.agy.capabilities.githubUrlValidate, false);
+  assert.equal(doc159.agy.capabilities.strictProtojsonHooks, false);
+  assert.equal(doc159.hookSelfTest.ok, true);
+  assert.equal(doc159.agentToolsCheck.ok, true);
+  assert.equal(doc159.activeLoops.length, 1);
+  assert.equal(doc159.activeLoops[0].loopId, activeLoop.loop_id);
+
+  const doc1513 = JSON.parse(
+    spawnSync(process.execPath, [cliPath, "doctor", "--json"], {
+      cwd: workspace,
+      env: { ...envWithMockAgy, MOCK_AGY_VERSION: "1.5.13" },
+      encoding: "utf8",
+    }).stdout
+  );
+  assert.equal(doc1513.ok, true);
+  assert.equal(doc1513.agy.capabilities.parsedVersion, "1.5.13");
+  assert.equal(doc1513.agy.capabilities.githubUrlValidate, true);
+  assert.equal(doc1513.agy.capabilities.strictProtojsonHooks, true);
+
+  // 4b. admin_settings.json pluginsDisabled: true -> ok: false + warning
+  const adminSettingsPath = path.join(home, ".gemini", "config", "admin_settings.json");
+  fs.mkdirSync(path.dirname(adminSettingsPath), { recursive: true });
+  fs.writeFileSync(
+    adminSettingsPath,
+    JSON.stringify({ pluginControls: { pluginsDisabled: true } })
+  );
+  const docAdmin = JSON.parse(
+    spawnSync(process.execPath, [cliPath, "doctor", "--json"], {
+      cwd: workspace,
+      env: envWithMockAgy,
+      encoding: "utf8",
+    }).stdout
+  );
+  assert.equal(docAdmin.ok, false);
+  assert.equal(docAdmin.environment.adminSettings.pluginsDisabled, true);
+  assert.ok(docAdmin.environmentWarnings.some((w) => /pluginsDisabled/.test(w)));
+  fs.rmSync(adminSettingsPath, { force: true });
+
+  // 4c. settings.json toolPermission: "strict" + secrets never echoed
+  const cliSettingsPath = path.join(home, ".gemini", "antigravity-cli", "settings.json");
+  fs.mkdirSync(path.dirname(cliSettingsPath), { recursive: true });
+  fs.writeFileSync(
+    cliSettingsPath,
+    JSON.stringify({
+      toolPermission: "strict",
+      apiKey: "SECRET_SHOULD_NEVER_LEAK_1",
+      oauthToken: "SECRET_SHOULD_NEVER_LEAK_2",
+    })
+  );
+  const docSettingsRaw = spawnSync(process.execPath, [cliPath, "doctor", "--json"], {
+    cwd: workspace,
+    env: envWithMockAgy,
+    encoding: "utf8",
+  }).stdout;
+  assert.equal(docSettingsRaw.includes("SECRET_SHOULD_NEVER_LEAK"), false);
+  const docSettings = JSON.parse(docSettingsRaw);
+  assert.equal(docSettings.environment.cliSettings.toolPermission, "strict");
+  assert.ok(docSettings.environmentWarnings.some((w) => /toolPermission="strict"/.test(w)));
+  fs.rmSync(cliSettingsPath, { force: true });
+
+  // 4c-ii. Malformed settings.json and admin_settings.json never echo raw secret tokens via JSON.parse() excerpts
+  fs.writeFileSync(cliSettingsPath, '{"apiKey": SECRET_RAW_TOKEN_XYZ');
+  fs.mkdirSync(path.dirname(adminSettingsPath), { recursive: true });
+  fs.writeFileSync(adminSettingsPath, '{"gatewaySecret": ADMIN_SECRET_ABC_999');
+  for (const args of [
+    ["doctor", "--json"],
+    ["doctor"],
+  ]) {
+    const malformedDoc = spawnSync(process.execPath, [cliPath, ...args], {
+      cwd: workspace,
+      env: envWithMockAgy,
+      encoding: "utf8",
+    });
+    assert.equal(malformedDoc.status, 0, malformedDoc.stderr);
+    const combinedOut = `${malformedDoc.stdout}\n${malformedDoc.stderr}`;
+    assert.equal(combinedOut.includes("SECRET_RAW_TOKEN_XYZ"), false);
+    assert.equal(combinedOut.includes("ADMIN_SECRET_ABC_999"), false);
+    assert.match(combinedOut, /syntax details redacted/);
+    if (args.includes("--json")) {
+      const parsedMal = JSON.parse(malformedDoc.stdout);
+      assert.ok(parsedMal.environmentWarnings.some((w) => /CLI settings/.test(w)));
+      assert.ok(parsedMal.environmentWarnings.some((w) => /Admin settings/.test(w)));
+    }
+  }
+  fs.rmSync(cliSettingsPath, { force: true });
+  fs.rmSync(adminSettingsPath, { force: true });
+
+  // 4d. User hooks.json flat PreToolUse triggers advisory warning
+  const userHooksPath = path.join(home, ".gemini", "config", "hooks.json");
+  fs.writeFileSync(
+    userHooksPath,
+    JSON.stringify({ PreToolUse: [{ type: "command", command: "echo flat" }] })
+  );
+  const docFlatHooks = JSON.parse(
+    spawnSync(process.execPath, [cliPath, "doctor", "--json"], {
+      cwd: workspace,
+      env: envWithMockAgy,
+      encoding: "utf8",
+    }).stdout
+  );
+  assert.equal(docFlatHooks.environment.hooksFiles.user.valid, false);
+  assert.ok(docFlatHooks.environmentWarnings.some((w) => /PreToolUse/.test(w)));
+  fs.rmSync(userHooksPath, { force: true });
+
+  // 4e. runAgy timeout handling via sleeping mock agy + small AGY_LOOP_AGY_TIMEOUT_MS
+  const timeoutRes = spawnSync(process.execPath, [cliPath, "doctor", "--json"], {
+    cwd: workspace,
+    env: {
+      ...envWithMockAgy,
+      MOCK_AGY_SLEEP_MS: "2000",
+      AGY_LOOP_AGY_TIMEOUT_MS: "100",
+    },
+    encoding: "utf8",
+  });
+  assert.equal(timeoutRes.status, 124, timeoutRes.stderr);
+  const timeoutJson = JSON.parse(timeoutRes.stdout);
+  assert.equal(timeoutJson.ok, false);
+  assert.equal(timeoutJson.timedOut, true);
+  assert.equal(timeoutJson.agy.timedOut, true);
+});

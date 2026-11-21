@@ -115,7 +115,7 @@ fi
 
 BACKUP_DIR=""
 if [ "$SHADOW_FOUND" -eq 1 ] && [ "$CLEAN_SHADOW" -eq 1 ]; then
-  TS=$(date +%Y%m%d-%H%M%S)
+  TS=$(date -u +%Y%m%d-%H%M%SZ)
   BACKUP_DIR="$HOME/.gemini/config/.agy-loop-backup-$TS"
   if [ -e "$BACKUP_DIR" ] || [ -L "$BACKUP_DIR" ]; then
     BACKUP_DIR="${BACKUP_DIR}-$$"
@@ -128,7 +128,9 @@ if [ "$SHADOW_FOUND" -eq 1 ] && [ "$CLEAN_SHADOW" -eq 1 ]; then
     if [ -e "$src_path" ] || [ -L "$src_path" ]; then
       dest_path="$BACKUP_DIR/$rel_dest"
       mkdir -p "$(dirname -- "$dest_path")"
-      mv "$src_path" "$dest_path"
+      if ! mv "$src_path" "$dest_path" 2>/dev/null; then
+        cp -RPp "$src_path" "$dest_path" && rm -rf "$src_path"
+      fi
     fi
   }
 
@@ -160,6 +162,6 @@ fi
 printf "==> Done! AGY Loop (agy-loop) is installed.\n"
 printf "    Run '/skills reload' in open 'agy' sessions, then invoke '/agy-loop:loop' (or '/agy-loop:loop help').\n"
 printf "    - If 'agy' is already open, run: /skills reload\n"
-printf "    - Try: /loop 1m check local build and tests\n"
-printf "    - Try: /loop check current PR CI status and fix failures --stateful\n"
-printf "    - Try: /loop status\n"
+printf "    - Try: /agy-loop:loop 1m check local build and tests\n"
+printf "    - Try: /agy-loop:loop check current PR CI status and fix failures --stateful\n"
+printf "    - Try: /agy-loop:loop status\n"

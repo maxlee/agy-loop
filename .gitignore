@@ -3,3 +3,4 @@ node_modules/
 *.tgz
 .audit/
 .trae/
+.agents/.agy-loop/

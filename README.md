@@ -29,20 +29,20 @@
 ```text
 > /agy-loop:loop check current PR CI status and fix failures --stateful
 
-⏺ Dispatched Loop #1/20 to loop-worker (stateful, sandbox). Main prompt is free.
+⏺ Dispatched Loop [lp_20261121T101500Z_a3f9] #1/20 to loop-worker (dynamic, stateful, workspace=inherit). Main prompt is free.
 
   [42s later · reactive subagent wake-up]
-⏺ [Loop #1/20] Fixed snapshot mismatch in src/render.test.ts and pushed 9c41e2b; CI re-running | Next wake-up in 45s (self-paced)
+⏺ [Loop lp_20261121T101500Z_a3f9 #1/20] Fixed snapshot mismatch in src/render.test.ts and pushed 9c41e2b; CI re-running | Next wake-up in 45s (self-paced)
 
 > Meanwhile, explain how token caching works in src/auth.ts
 ⏺ Token caching in src/auth.ts stores verified JWT claims in an LRU map keyed by SHA-256...
   (Background timer sleeps at 0 tokens/sec; your main chat stays clean and responsive.)
 
   [45s later · timer wake-up -> Iteration #2]
-⏺ [Loop #2/20] Unit & lint checks passed; awaiting e2e matrix (4/5 green) | Next wake-up in 90s (self-paced)
+⏺ [Loop lp_20261121T101500Z_a3f9 #2/20] Unit & lint checks passed; awaiting e2e matrix (4/5 green) | Next wake-up in 90s (self-paced)
 
   [90s later · timer wake-up -> Iteration #3]
-⏺ [Loop #3/20] DONE: All 5 CI checks green on PR #42; active schedule cleared.
+⏺ [Loop lp_20261121T101500Z_a3f9 #3/20] DONE: All 5 CI checks green on PR #42; active schedule cleared.
 ```
 
 ---
@@ -54,11 +54,11 @@
 | **Wait Mechanism** | Blocking shell `sleep` | Built-in session cron queue | Native non-blocking `schedule` timers & crons |
 | **Main Chat Availability** | Locked while waiting | Free between ticks | Free between ticks **and** while subagent runs |
 | **Context Isolation** | Pollutes main chat with raw logs | Shares main conversation window | Clean `loop-worker` / `self` subagent window; 1-line main summaries |
-| **Minimum Granularity** | `1s` (blocks turn) | `1m` cron floor (`30s` rounds up to `1m`) | Sub-minute `DurationSeconds` down to exact seconds (`15s`, `30s`, `45s`) |
-| **Dynamic Backoff** | Fixed delay only | Model-selected `1m–1h` delay | Worker-reported `NEXT_DELAY_SEC` (`30–60s` active, `120–300s` CI, `600–1800s` idle) |
+| **Minimum Granularity** | `1s` (blocks turn) | `1m` cron floor (`30s` rounds up to `1m`) | Sub-minute `DurationSeconds` (`15s`, `30s`) & compound durations (`1h30m`, `2m30s`) |
+| **Dynamic Backoff & Safety** | Fixed delay only | Model-selected `1m–1h` delay | Clamped `NEXT_DELAY_SEC` (`[10s, 86400s]`), 3-error circuit breaker & `loop_id` state |
 | **Live-Reloading `loop.md`** | None | `.claude/loop.md` & `~/.claude/loop.md` | Re-read every tick: `.agents/loop.md` -> `loop.md` -> `~/.gemini/config/loop.md` -> built-in fallback |
 | **Stateful Debugging** | Full transcript bloat | Shared main history | Opt-in `--stateful` `Idle` subagent re-awakening via `send_message` |
-| **Risk-Free Edits** | Mutates active working tree | Mutates active working tree | Opt-in `--worktree` (`branch` isolated Git worktree) or `--share` copy |
+| **Risk-Free Edits** | Mutates active working tree | Mutates active working tree | Opt-in `--worktree` (`branch` worktree + pre-teardown diff/merge safety) or `--share` |
 
 ---
 
@@ -66,7 +66,7 @@
 
 ### Requirements
 
-- **Antigravity CLI (`agy`)** `v1.5.0+` (verified against `cli-1.5.9` strict validator) or **Antigravity Desktop**
+- **Antigravity CLI (`agy`)** `v1.5.0+` (verified against `v1.5.13` strict validator and `oneharness` tool registry) or **Antigravity Desktop**
 - **Zero Node.js / npm required** for native `agy plugin install` or the one-line `curl` installer (`Node.js >= 18` or `Bun` is only needed if you use the `npx` / `bunx` CLI bridge)
 
 `agy-loop` is packaged as a **pure, Marketplace-compatible dual-habitat plugin**: the repository root is simultaneously a strict v1 Antigravity native plugin (`plugin.json`, `hooks.json`, `skills/loop/SKILL.md`, `agents/loop-worker.md`) and a zero-dependency npm CLI installer (`bin/agy-loop.mjs`). Once installed:
@@ -83,7 +83,7 @@ npx agy-loop
 bunx agy-loop
 ```
 
-Migrating from a manual `~/.gemini/config/skills/loop` or `~/.gemini/config/agents/loop-worker.md` setup? Because Antigravity loads user-level `~/.gemini/config/` files before plugins, pass `--clean-shadow` to install `agy-loop` and archive those loose files into `~/.gemini/config/.agy-loop-backup-<timestamp>/` automatically:
+Migrating from a manual `~/.gemini/config/skills/loop` or `~/.gemini/config/agents/loop-worker.md` setup? Because Antigravity loads user-level `~/.gemini/config/` files before plugins, pass `--clean-shadow` to install `agy-loop` and archive those loose files into `~/.gemini/config/.agy-loop-backup-<YYYYMMDD-HHMMSSZ>/` automatically:
 
 ```bash
 npx agy-loop install --clean-shadow
@@ -131,28 +131,37 @@ agy plugin install .
 
 | Mode | Example Commands | Behavior |
 |:---|:---|:---|
-| **1. Fixed Interval + Prompt** | `/agy-loop:loop 30s curl -fsS http://localhost:8080/health`<br>`/agy-loop:loop 5m check the deploy`<br>`/agy-loop:loop check PR #42 comments every 2h` | Runs on a fixed cadence (`s`, `m`, `h`, `d`). Chains non-overlapping `DurationSeconds` timers by default (supporting sub-minute `30s` and non-cron `90s` / `7m`), or registers a 5-field `CronExpression` when `--cron` is passed. |
-| **2. Dynamic Self-Paced** | `/agy-loop:loop check CI and fix failures`<br>`/agy-loop:loop run pytest and fix failing tests --stateful` | Omits the interval. After each pass, `loop-worker` inspects live activity and sets `NEXT_DELAY_SEC` (`30–60s` active build/fix, `120–300s` CI queue wait, `600–1800s` quiet green backoff). |
-| **3. Live-Reloading `loop.md` Maintenance** | `/agy-loop:loop`<br>`/agy-loop:loop 15m` | Omits the inline prompt. Re-reads `.agents/loop.md` -> `loop.md` -> `~/.gemini/config/loop.md` -> built-in branch maintenance fallback on **every tick** (self-paced for `/agy-loop:loop`, fixed cadence for `/agy-loop:loop 15m`). |
+| **1. Fixed Interval + Prompt** | `/agy-loop:loop 30s curl -fsS http://localhost:8080/health`<br>`/agy-loop:loop every 5m check the deploy`<br>`/agy-loop:loop 1h30m check backup`<br>`/agy-loop:loop check PR #42 comments every 2h` | Runs on a fixed cadence (`s`, `m`, `h`, `d`), supporting leading `every <dur>`, trailing `every`, and compound durations (`1h30m`, `2m30s`; fractional `1.5m` rejected with Exit `2`). Chains non-overlapping `DurationSeconds` timers by default, or uses 5-field `CronExpression` with `--cron`. |
+| **2. Dynamic Self-Paced** | `/agy-loop:loop check CI and fix failures`<br>`/agy-loop:loop run pytest and fix failing tests --stateful` | Omits the interval. After each pass, `loop-worker` sets `NEXT_DELAY_SEC` (`120s` default fallback, clamped to `[10s, 86400s]`). |
+| **3. Live-Reloading `loop.md` Maintenance** | `/agy-loop:loop`<br>`/agy-loop:loop 15m` | Omits the inline prompt. Re-reads `.agents/loop.md` -> `loop.md` -> `~/.gemini/config/loop.md` -> built-in branch maintenance fallback via `resolve-task` on **every tick** (`25,000`-byte cap with truncation warning). |
 | **4. One-Shot Delayed Check-In** | `/agy-loop:loop in 20m verify staging smoke tests`<br>`/agy-loop:loop --once 10m check if docker build finished` | Schedules a single non-blocking `DurationSeconds` timer (`max_iterations = 1`), runs one isolated subagent pass when the timer fires, reports the result, and stops. |
-| **5. Lifecycle & Diagnostics** | `/agy-loop:loop status` (or `list`)<br>`/agy-loop:loop stop [id\|all]` (or `cancel`)<br>`/agy-loop:loop doctor [--clean-shadow]`<br>`/agy-loop:loop help` | Lists active schedules & loop subagents, cancels a specific or all running loops (`manage_task` + `manage_subagents`), diagnoses (or non-destructively archives with `--clean-shadow`) shadow files, `skills.json` filters, and active `loop.md` resolution, or prints concise usage. |
+| **5. Lifecycle & Diagnostics** | `/agy-loop:loop status [--all]` (or `list`)<br>`/agy-loop:loop stop [<id1> <id2>\|all] [--after-current]`<br>`/agy-loop:loop doctor [--clean-shadow]`<br>`/agy-loop:loop help` | Correlates `.agents/.agy-loop/` `loop_id` state with `manage_task` & `manage_subagents`, stops specific or all loops (immediately or gracefully `--after-current`), diagnoses shadows / `skills.json` / `active_loops`, or prints concise usage. |
 
 ### Flags Reference
 
-Flags can appear anywhere in `/agy-loop:loop` arguments:
+Flags can appear anywhere before `--` in `/agy-loop:loop` arguments (leading typos or close aliases like `--statefull` / `--max-iter` fail fast with Exit `2`; mid/trailing command flags like `gh pr checks --required` pass with a warning unless escaped after `--`):
 
 | Flag | Default | Description |
 |:---|:---|:---|
 | `--max <N>` | `20` (`1` with `--once`) | Upper bound on iterations before the loop automatically stops to protect quota. |
 | `--stateful` | `fresh` | Reuse a single `loop-worker` conversation ID across ticks, waking it from `Idle` via `send_message` so multi-turn debugging context persists off the main thread. |
-| `--worktree` | `inherit` | Run the worker inside an isolated Git branch/worktree (`Workspace: "branch"`) so risky edits never touch your active checkout while you chat. |
+| `--worktree` | `inherit` | Run the worker inside an isolated Git branch/worktree (`Workspace: "branch"`). In `agy v1.5.5+`, dirty parent edits carry over; `agy-loop` tracks `worktree_branch` and surfaces `git diff --stat` + merge commands before teardown. |
 | `--share` | `inherit` | Run the worker inside a shared working copy (`Workspace: "share"`). |
 | `--model <tier>` | `flash` (`loop-worker`) | Override subagent model tier: `inherit`, `flash_lite`, `flash`, or `pro`. |
 | `--self` | `loop-worker` | Delegate iterations to the built-in full-capability `self` subagent (also auto-enabled when the prompt starts with `/` to invoke a nested skill like `/agy-loop:loop 20m /code-review`, or requires MCP tools). |
-| `--cron` | `false` | Use native 5-field `CronExpression` (`schedule` tool) when the fixed interval `>= 60s` maps cleanly to cron (`1m`, divisors of `60m` or `24h`, `1d`). |
+| `--cron` | `false` | Use native 5-field `CronExpression` (`schedule` tool) when the fixed interval `>= 60s` maps cleanly to cron (`1m`, divisors of `60m` or `24h`, `1d`). Authoritative `state-read` eliminates static prompt drift across ticks. |
 | `--exact` | `false` | Set `ExactTiming: true` on `--cron` schedules to fire on exact wall-clock minutes without anti-herd jitter. |
 | `--daemon` | `false` | Set `IsDaemon: true` on `--cron` schedules for standing jobs that continue firing after the current task finishes. |
 | `--once` | `false` | Execute a single delayed run (`max_iterations = 1`) and exit cleanly after reporting. |
+| `--` | — | End-of-options separator: everything after `--` is passed verbatim as prompt text without flag parsing or warnings. |
+
+---
+
+## 🛡️ Reliability, Sandbox State & Cross-Engine Worker
+
+- **6-Tool Cross-Engine `loop-worker` (Desktop Cortex + CLI `oneharness`)**: `agents/loop-worker.md` pins the exact 6 tools verified across both Desktop Cortex and `agy v1.5.13` CLI `oneharness` (`view_file`, `write_to_file`, `replace_file_content`, `run_command`, `manage_task`, `search_web`). The 4 legacy Cortex-only tools (`multi_replace_file_content`, `list_dir`, `find_by_name`, `grep_search`) were removed because `oneharness` aborts agent loading when unmapped tools are absent from its registry; sandboxed `run_command` (`rg`/`grep`/`find`/`ls`) covers search and directory inspection cleanly.
+- **Sandbox-Safe Externalized State (`.agents/.agy-loop/`)**: Because `agy v1.5.7+` `auto` mode blocks sandboxed `run_command` writes to `~/.gemini/antigravity-cli/plugin_data/`, per-loop `state.json` and `events.jsonl` live under `<workspace>/.agents/.agy-loop/loops/<loop_id>/` (override via `AGY_LOOP_STATE_DIR`) with an auto-created `.gitignore` (`*`). `state-read` loads authoritative `iteration`, `next_hint`, `worker_id`, and `stop_requested` on every wake-up, eliminating `--cron` static-prompt drift and surviving `/compact`.
+- **3-Error Circuit Breaker & Delay Clamping**: Missing/unparseable 4-line worker footers increment `consecutive_errors`; 3 consecutive failures automatically mark the loop `circuit_broken`, clear remaining schedules, and halt with diagnostics. Dynamic `NEXT_DELAY_SEC` values default to `120s` if invalid and clamp to `[10s, 86400s]`.
 
 ---
 
@@ -187,7 +196,7 @@ Because resolution runs dynamically on every tick via `skills/loop/scripts/loop-
 You can stop an active loop at any time through four clean paths, in addition to built-in automatic exit conditions:
 
 1. **Slash Command (`/agy-loop:loop stop`)**
-   Run `/agy-loop:loop stop` (or `/agy-loop:loop stop <taskId>` / `/agy-loop:loop cancel`) to cancel active `schedule` timers/crons via `manage_task(Action="kill")` and terminate any running or idle `loop-worker` via `manage_subagents(Action="kill")`.
+   Run `/agy-loop:loop stop` (or `/agy-loop:loop stop <id1> <id2>`, `/agy-loop:loop stop <id> --after-current`, `/agy-loop:loop cancel`) to update `.agents/.agy-loop/` state (`state-stop`), cancel linked `schedule` timers/crons via `manage_task(Action="kill")`, and terminate loop subagents via `manage_subagents(Action="kill")` (preserving `branch` worktrees with unmerged commits until reviewed).
 2. **Conversational Stop**
    Tell the session in plain language: `"stop the current loop"` (or `"stop the loop after this iteration finishes"`).
 3. **Interactive CLI TUI Panels (`/tasks` & `/agents`)**
@@ -196,7 +205,7 @@ You can stop an active loop at any time through four clean paths, in addition to
 4. **Foreground Turn Interrupt (`Esc`)**
    Press **`Esc`** to interrupt an active foreground dispatch turn immediately without closing `agy` CLI (pressing `Ctrl+C` twice exits the CLI).
 
-**Automatic Stop Conditions**: Every loop stops and clears any remaining schedule automatically when the worker returns `LOOP_STATUS: DONE` (objective satisfied), `LOOP_STATUS: BLOCKED` (human input or credentials required), or reaches `--max <N>` (default `20` iterations).
+**Automatic Stop Conditions**: Every loop stops and clears any remaining schedule automatically when the worker returns `LOOP_STATUS: DONE` (objective satisfied), `LOOP_STATUS: BLOCKED` (human input, sandbox permission, or credentials required), reaches `--max <N>` (default `20` iterations), or hits 3 consecutive contract/runtime errors (`circuit_broken`).
 
 ---
 
@@ -208,8 +217,8 @@ Antigravity loads user-level customizations in `~/.gemini/config/` ahead of inst
 
 To prevent silent precedence collisions:
 
-- **Zero-Overhead `SessionStart` Auto-Detector (`hooks.json`)**: Runs `skills/loop/scripts/loop-helper.sh session-start` on session start. When clean, it returns `{}` in `<5ms` at **`0` token cost** with zero UI output. When loose shadow files exist, it displays an automatic startup alert naming the colliding paths.
-- **One-Command Non-Destructive Cleanup**: Archive colliding loose files into `~/.gemini/config/.agy-loop-backup-<timestamp>/` (then run `/skills reload` in any open `agy` session):
+- **Zero-Overhead `SessionStart` Auto-Detector (`hooks.json`)**: Runs `skills/loop/scripts/loop-helper.sh session-start` on session start. Strictly `protojson`-compliant for `agy v1.5.13+` (zero leaked stdin keys): returns `{}` in `<5ms` at **`0` token cost** when clean, and surfaces startup alerts when loose shadow files **or** `skills.json` `include_only`/`exclude` filters block `/agy-loop:loop` (matched with POSIX ERE parity).
+- **One-Command Non-Destructive Cleanup**: Archive colliding loose files into `~/.gemini/config/.agy-loop-backup-<YYYYMMDD-HHMMSSZ>/` (unified UTC timestamp across `agy-loop.mjs`, `loop-helper.sh`, and `install.sh`; then run `/skills reload` in any open `agy` session):
   - **POSIX shell (zero Node/npm required)**: `sh ~/.gemini/config/plugins/agy-loop/install.sh --clean-shadow`
   - **Inside `agy` (works right away via plugin prefix)**: `/agy-loop:loop doctor --clean-shadow`
   - **Via npm CLI bridge**: `npx agy-loop doctor --clean-shadow`
@@ -219,9 +228,9 @@ To prevent silent precedence collisions:
 | Command | Description |
 |:---|:---|
 | `npx agy-loop [install \| update]` | Install or update `agy-loop` via `agy plugin install` (warns if user-level shadow files exist) |
-| `npx agy-loop install --clean-shadow` | Install `agy-loop` and archive loose shadow files into `~/.gemini/config/.agy-loop-backup-<timestamp>/` |
-| `npx agy-loop doctor [--json]` | Inspect `agy` version, plugin registration (`agy plugin list --json`), shadow files, `skills.json` `include_only`/`exclude` filters, and active `loop.md` (`status` alias supported) |
-| `npx agy-loop doctor --clean-shadow [--json]` | Non-destructively archive loose shadow files into `~/.gemini/config/.agy-loop-backup-<timestamp>/` and re-run diagnostics (`status --clean-shadow` alias supported; run `/skills reload` in open sessions) |
+| `npx agy-loop install --clean-shadow` | Install `agy-loop` and archive loose shadow files into `~/.gemini/config/.agy-loop-backup-<YYYYMMDD-HHMMSSZ>/` |
+| `npx agy-loop doctor [--json]` | Run full diagnostics (`agy v1.5.13` `agy.capabilities` matrix, enterprise `admin_settings.json` / `settings.json` / `hooks.json` audit, `SessionStart` `protojson` `hookSelfTest`, `loop-worker` 6-tool `agentToolsCheck`, shadows, ERE `skills.json` filters, `loop.md`, `activeLoops`, with `15s`/`30s` `spawnSync` timeout protection) |
+| `npx agy-loop doctor --clean-shadow [--json]` | Non-destructively archive loose shadow files into `~/.gemini/config/.agy-loop-backup-<YYYYMMDD-HHMMSSZ>/` and re-run diagnostics (`status --clean-shadow` alias supported; run `/skills reload` in open sessions) |
 | `npx agy-loop validate [--json]` | Run `agy plugin validate --strict` against the packaged plugin root |
 | `npx agy-loop uninstall` | Cleanly remove the plugin via `agy plugin uninstall agy-loop` (`remove` alias supported) |
 

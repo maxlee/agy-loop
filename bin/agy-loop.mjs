@@ -13,9 +13,9 @@ const PLUGIN_ROOT = path.resolve(__dirname, "..");
 function readPluginVersion() {
   try {
     const raw = fs.readFileSync(path.join(PLUGIN_ROOT, "package.json"), "utf8");
-    return JSON.parse(raw).version || "1.0.0";
+    return JSON.parse(raw).version || "1.1.0";
   } catch {
-    return "1.0.0";
+    return "1.1.0";
   }
 }
 
@@ -321,8 +321,8 @@ function inspectLoopMd(workspaceDir, homeDir) {
 function formatBackupTimestamp(date = new Date()) {
   const pad = (n) => String(n).padStart(2, "0");
   return (
-    `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}-` +
-    `${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`
+    `${date.getUTCFullYear()}${pad(date.getUTCMonth() + 1)}${pad(date.getUTCDate())}-` +
+    `${pad(date.getUTCHours())}${pad(date.getUTCMinutes())}${pad(date.getUTCSeconds())}Z`
   );
 }
 
@@ -363,19 +363,61 @@ function backupShadowPaths(homeDir, shadows = detectShadowPaths(homeDir)) {
   return { backupDir, moved };
 }
 
-function runAgy(args) {
+const VALID_WORKER_MODELS = new Set(["inherit", "flash_lite", "flash", "pro"]);
+const BROKEN_ONEHARNESS_TOOLS = new Set([
+  "multi_replace_file_content",
+  "list_dir",
+  "find_by_name",
+  "grep_search",
+]);
+const VERIFIED_DUAL_ENGINE_TOOLS = new Set([
+  "view_file",
+  "write_to_file",
+  "replace_file_content",
+  "run_command",
+  "manage_task",
+  "search_web",
+]);
+
+function resolveAgyTimeoutMs(defaultTimeoutMs) {
+  const raw = process.env.AGY_LOOP_AGY_TIMEOUT_MS;
+  if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    if (/^[1-9]\d*$/.test(trimmed)) {
+      const parsed = Number.parseInt(trimmed, 10);
+      if (Number.isSafeInteger(parsed) && parsed > 0) {
+        return parsed;
+      }
+    }
+  }
+  return defaultTimeoutMs;
+}
+
+function runAgy(args, { timeoutMs = 15000 } = {}) {
+  const effectiveTimeout = resolveAgyTimeoutMs(timeoutMs);
   const res = spawnSync("agy", args, {
     encoding: "utf8",
     env: process.env,
+    timeout: effectiveTimeout,
   });
 
   if (res.error) {
     if (res.error.code === "ENOENT" || res.error.code === "EACCES") {
       return {
         found: false,
+        timedOut: false,
         status: 127,
         stdout: "",
         stderr: res.error.message,
+      };
+    }
+    if (res.error.code === "ETIMEDOUT") {
+      return {
+        found: true,
+        timedOut: true,
+        status: 124,
+        stdout: res.stdout || "",
+        stderr: `agy ${args.join(" ")} timed out after ${effectiveTimeout}ms`,
       };
     }
     throw res.error;
@@ -383,6 +425,7 @@ function runAgy(args) {
 
   return {
     found: true,
+    timedOut: false,
     status: res.status ?? 1,
     stdout: res.stdout || "",
     stderr: res.stderr || "",
@@ -409,6 +452,608 @@ function emitMissingAgyError(jsonMode) {
   process.exit(1);
 }
 
+function emitAgyTimeoutError(res, { action = null, jsonMode = false, version = null } = {}) {
+  const message = res.stderr || "Antigravity CLI ('agy') timed out.";
+  if (jsonMode) {
+    const payload = {
+      ok: false,
+      ...(action ? { action } : {}),
+      ...(version ? { version } : {}),
+      error: message,
+      timedOut: true,
+      agy: { found: true, version: null, timedOut: true },
+      ...(action === "install" ? { backupDir: null } : {}),
+    };
+    process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
+  }
+  process.stderr.write(`Error: ${message}\n`);
+  process.exit(res.status || 124);
+}
+
+function parseAgySemver(rawVersion) {
+  if (typeof rawVersion !== "string") {
+    return null;
+  }
+  const match = rawVersion.match(/(\d+)\.(\d+)\.(\d+)/);
+  if (!match) {
+    return null;
+  }
+  const major = Number.parseInt(match[1], 10);
+  const minor = Number.parseInt(match[2], 10);
+  const patch = Number.parseInt(match[3], 10);
+  if (!Number.isInteger(major) || !Number.isInteger(minor) || !Number.isInteger(patch)) {
+    return null;
+  }
+  return {
+    major,
+    minor,
+    patch,
+    version: `${major}.${minor}.${patch}`,
+  };
+}
+
+function semverGte(parsed, targetMajor, targetMinor, targetPatch) {
+  if (!parsed) {
+    return false;
+  }
+  if (parsed.major !== targetMajor) {
+    return parsed.major > targetMajor;
+  }
+  if (parsed.minor !== targetMinor) {
+    return parsed.minor > targetMinor;
+  }
+  return parsed.patch >= targetPatch;
+}
+
+function detectAgyCapabilities(agyVersion) {
+  const parsed = parseAgySemver(agyVersion);
+  return {
+    parsedVersion: parsed ? parsed.version : null,
+    printTimeout: semverGte(parsed, 1, 5, 0),
+    sidecarHomeExpansion: semverGte(parsed, 1, 5, 0),
+    worktreeDirtyCarry: semverGte(parsed, 1, 5, 5),
+    autoModeDefault: semverGte(parsed, 1, 5, 7),
+    dynamicWorkflows: semverGte(parsed, 1, 5, 9),
+    githubUrlValidate: semverGte(parsed, 1, 5, 11),
+    strictProtojsonHooks: semverGte(parsed, 1, 5, 13),
+  };
+}
+
+function readJsoncFile(filePath, { redactError = false } = {}) {
+  if (!lstatExists(filePath)) {
+    return { exists: false, parsed: null, error: null };
+  }
+  try {
+    const raw = fs.readFileSync(filePath, "utf8");
+    const parsed = JSON.parse(stripJsonc(raw));
+    return { exists: true, parsed, error: null };
+  } catch (err) {
+    return {
+      exists: true,
+      parsed: null,
+      error: redactError ? "Invalid JSON/JSONC syntax" : err.message,
+    };
+  }
+}
+
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function isGroupedToolHookEntry(entry) {
+  return isPlainObject(entry) && typeof entry.matcher === "string" && Array.isArray(entry.hooks);
+}
+
+function inspectHooksConfigFile(filePath, scopeLabel, warnings) {
+  const res = readJsoncFile(filePath);
+  if (!res.exists) {
+    return { exists: false, path: filePath, valid: true };
+  }
+  if (res.error) {
+    warnings.push(`${scopeLabel} (${filePath}) could not be parsed as JSON/JSONC: ${res.error}`);
+    return { exists: true, path: filePath, valid: false };
+  }
+  if (!isPlainObject(res.parsed)) {
+    warnings.push(`${scopeLabel} (${filePath}) must be a JSON object mapping hook names to specs.`);
+    return { exists: true, path: filePath, valid: false };
+  }
+
+  let valid = true;
+  const checkEventEntries = (ownerLabel, eventName, entries) => {
+    if (!Array.isArray(entries)) {
+      warnings.push(
+        `${scopeLabel} (${filePath}) "${ownerLabel}.${eventName}" must be an array of { matcher, hooks: [...] } groups.`
+      );
+      valid = false;
+      return;
+    }
+    if (entries.some((entry) => !isGroupedToolHookEntry(entry))) {
+      warnings.push(
+        `${scopeLabel} (${filePath}) "${ownerLabel}.${eventName}" contains flat or malformed entries without { matcher, hooks: [...] }.`
+      );
+      valid = false;
+    }
+  };
+
+  for (const [hookName, spec] of Object.entries(res.parsed)) {
+    if (hookName === "$schema") {
+      continue;
+    }
+    if ((hookName === "PreToolUse" || hookName === "PostToolUse") && Array.isArray(spec)) {
+      checkEventEntries("<root>", hookName, spec);
+      continue;
+    }
+    if (!isPlainObject(spec)) {
+      continue;
+    }
+    for (const eventName of ["PreToolUse", "PostToolUse"]) {
+      if (spec[eventName] !== undefined) {
+        checkEventEntries(hookName, eventName, spec[eventName]);
+      }
+    }
+  }
+
+  return { exists: true, path: filePath, valid };
+}
+
+function inspectEnvironment(workspaceDir, homeDir) {
+  const warnings = [];
+
+  const adminPath = path.join(homeDir, ".gemini", "config", "admin_settings.json");
+  const adminRes = readJsoncFile(adminPath, { redactError: true });
+  if (adminRes.error) {
+    warnings.push(
+      `Admin settings (${adminPath}) could not be parsed as JSON/JSONC (syntax details redacted).`
+    );
+  }
+  const adminObj = isPlainObject(adminRes.parsed) ? adminRes.parsed : null;
+  const pluginsDisabled = Boolean(adminObj?.pluginControls?.pluginsDisabled);
+  const marketplaceDisabled = Boolean(adminObj?.pluginControls?.marketplaceDisabled);
+  const remoteControlRaw = adminObj?.featureControls?.remoteControlEnabled;
+  const remoteControlEnabled =
+    typeof remoteControlRaw === "boolean" ? remoteControlRaw : null;
+
+  if (pluginsDisabled) {
+    warnings.push(
+      `Admin policy (${adminPath}) sets pluginControls.pluginsDisabled=true; plugins are blocked.`
+    );
+  }
+  if (marketplaceDisabled) {
+    warnings.push(
+      `Admin policy (${adminPath}) sets pluginControls.marketplaceDisabled=true; marketplace installs are disabled.`
+    );
+  }
+
+  const cliSettingsPath = path.join(homeDir, ".gemini", "antigravity-cli", "settings.json");
+  const cliRes = readJsoncFile(cliSettingsPath, { redactError: true });
+  if (cliRes.error) {
+    warnings.push(
+      `CLI settings (${cliSettingsPath}) could not be parsed as JSON/JSONC (syntax details redacted).`
+    );
+  }
+  const cliObj = isPlainObject(cliRes.parsed) ? cliRes.parsed : null;
+  const agentMode = typeof cliObj?.agentMode === "string" ? cliObj.agentMode : null;
+  const toolPermission = typeof cliObj?.toolPermission === "string" ? cliObj.toolPermission : null;
+  const enableTerminalSandbox =
+    typeof cliObj?.enableTerminalSandbox === "boolean" ? cliObj.enableTerminalSandbox : null;
+  const modelProvider = typeof cliObj?.modelProvider === "string" ? cliObj.modelProvider : null;
+  const hasGeminiApiKey = Boolean(process.env.GEMINI_API_KEY);
+
+  if (toolPermission === "strict") {
+    warnings.push(
+      `CLI settings (${cliSettingsPath}) sets toolPermission="strict", which overrides auto/accept-edits and soft-denies unattended headless tools.`
+    );
+  }
+  if (modelProvider === "gemini" || hasGeminiApiKey) {
+    warnings.push(
+      `GEMINI_API_KEY / modelProvider="gemini" mode active: /usage, /quota, /credits, and --remote-agent are unavailable in this mode.`
+    );
+  }
+
+  const userHooks = inspectHooksConfigFile(
+    path.join(homeDir, ".gemini", "config", "hooks.json"),
+    "User hooks.json",
+    warnings
+  );
+  const workspaceHooks = inspectHooksConfigFile(
+    path.join(workspaceDir, ".agents", "hooks.json"),
+    "Workspace hooks.json",
+    warnings
+  );
+
+  return {
+    environment: {
+      adminSettings: {
+        exists: adminRes.exists,
+        path: adminPath,
+        pluginsDisabled,
+        marketplaceDisabled,
+        remoteControlEnabled,
+      },
+      cliSettings: {
+        exists: cliRes.exists,
+        path: cliSettingsPath,
+        agentMode,
+        toolPermission,
+        enableTerminalSandbox,
+        modelProvider,
+      },
+      hooksFiles: {
+        user: userHooks,
+        workspace: workspaceHooks,
+      },
+    },
+    environmentWarnings: warnings,
+  };
+}
+
+function runHookSelfTest(homeDir, workspaceDir) {
+  const hooksFile = path.join(PLUGIN_ROOT, "hooks.json");
+  const hooksRes = readJsoncFile(hooksFile);
+  if (!hooksRes.exists) {
+    return {
+      ok: false,
+      exitStatus: null,
+      unexpectedKeys: [],
+      error: `Missing plugin hooks.json at ${hooksFile}`,
+    };
+  }
+  if (hooksRes.error) {
+    return {
+      ok: false,
+      exitStatus: null,
+      unexpectedKeys: [],
+      error: `Failed to parse plugin hooks.json: ${hooksRes.error}`,
+    };
+  }
+  if (!isPlainObject(hooksRes.parsed)) {
+    return {
+      ok: false,
+      exitStatus: null,
+      unexpectedKeys: [],
+      error: "Plugin hooks.json must be a JSON object",
+    };
+  }
+
+  let sessionStartCommand = null;
+  for (const [hookName, spec] of Object.entries(hooksRes.parsed)) {
+    if (hookName === "$schema" || !isPlainObject(spec) || spec.enabled === false) {
+      continue;
+    }
+    if (Array.isArray(spec.SessionStart)) {
+      const handler = spec.SessionStart.find(
+        (h) =>
+          isPlainObject(h) &&
+          (h.type === undefined || h.type === "command") &&
+          typeof h.command === "string" &&
+          h.command.trim().length > 0
+      );
+      if (handler) {
+        sessionStartCommand = handler.command;
+        break;
+      }
+    }
+  }
+
+  if (!sessionStartCommand) {
+    return {
+      ok: false,
+      exitStatus: null,
+      unexpectedKeys: [],
+      error: "No enabled SessionStart command handler found in hooks.json",
+    };
+  }
+
+  const syntheticPayload = {
+    artifactDirectoryPath: path.join(
+      homeDir,
+      ".gemini",
+      "antigravity-cli",
+      "brain",
+      "doctor-selftest"
+    ),
+    conversationId: "00000000-0000-0000-0000-000000000000",
+    workspacePaths: [workspaceDir],
+    hookEventName: "SessionStart",
+    cwd: workspaceDir,
+    modelName: "gemini-4-neon-xhigh",
+    lastUserInput: "/agy-loop:loop doctor",
+  };
+
+  // Isolate env from user tokens/API keys while keeping HOME, PLUGIN_ROOT, and POSIX PATH.
+  const hookEnv = {
+    HOME: homeDir,
+    PLUGIN_ROOT,
+    PATH: process.env.PATH || "/usr/bin:/bin",
+  };
+  for (const key of ["LC_ALL", "LANG", "TMPDIR", "AGY_LOOP_STATE_DIR"]) {
+    if (process.env[key]) {
+      hookEnv[key] = process.env[key];
+    }
+  }
+
+  const shellBin = process.platform === "win32" ? "cmd.exe" : "sh";
+  const shellArgs =
+    process.platform === "win32" ? ["/c", sessionStartCommand] : ["-c", sessionStartCommand];
+  const res = spawnSync(shellBin, shellArgs, {
+    cwd: PLUGIN_ROOT,
+    env: hookEnv,
+    input: JSON.stringify(syntheticPayload),
+    encoding: "utf8",
+    timeout: 5000,
+  });
+
+  if (res.error) {
+    return {
+      ok: false,
+      exitStatus: res.status ?? (res.error.code === "ETIMEDOUT" ? 124 : null),
+      unexpectedKeys: [],
+      error:
+        res.error.code === "ETIMEDOUT"
+          ? "SessionStart hook timed out after 5000ms"
+          : res.error.message,
+    };
+  }
+
+  if (res.status !== 0) {
+    return {
+      ok: false,
+      exitStatus: res.status ?? 1,
+      unexpectedKeys: [],
+      error: (res.stderr || res.stdout || `SessionStart exited with status ${res.status}`).trim(),
+    };
+  }
+
+  const rawOut = (res.stdout || "").trim();
+  if (!rawOut) {
+    return {
+      ok: false,
+      exitStatus: 0,
+      unexpectedKeys: [],
+      error: "SessionStart hook produced empty stdout (expected JSON object)",
+    };
+  }
+
+  let parsedOut;
+  try {
+    parsedOut = JSON.parse(rawOut);
+  } catch (err) {
+    return {
+      ok: false,
+      exitStatus: 0,
+      unexpectedKeys: [],
+      error: `SessionStart hook stdout is not valid JSON: ${err.message}`,
+    };
+  }
+
+  if (!isPlainObject(parsedOut)) {
+    return {
+      ok: false,
+      exitStatus: 0,
+      unexpectedKeys: [],
+      error: "SessionStart hook stdout must be a JSON object",
+    };
+  }
+
+  const unexpectedKeys = Object.keys(parsedOut).filter((k) => k !== "injectSteps");
+  if (unexpectedKeys.length > 0) {
+    return {
+      ok: false,
+      exitStatus: 0,
+      unexpectedKeys,
+      error: `SessionStart output leaked unexpected non-protojson key(s): ${unexpectedKeys.join(", ")}`,
+    };
+  }
+
+  if ("injectSteps" in parsedOut && !Array.isArray(parsedOut.injectSteps)) {
+    return {
+      ok: false,
+      exitStatus: 0,
+      unexpectedKeys: [],
+      error: 'SessionStart "injectSteps" field must be an array',
+    };
+  }
+
+  return {
+    ok: true,
+    exitStatus: 0,
+    unexpectedKeys: [],
+    error: null,
+  };
+}
+
+function inspectAgentTools(pluginEntry) {
+  let agentPath = path.join(PLUGIN_ROOT, "agents", "loop-worker.md");
+  if (pluginEntry?.path) {
+    const installedAgentPath = path.join(pluginEntry.path, "agents", "loop-worker.md");
+    try {
+      fs.accessSync(installedAgentPath, fs.constants.R_OK);
+      agentPath = installedAgentPath;
+    } catch {
+      // Fall back to bundled PLUGIN_ROOT when installed plugin path is not readable.
+    }
+  }
+
+  let raw;
+  try {
+    raw = fs.readFileSync(agentPath, "utf8");
+  } catch (err) {
+    return {
+      ok: false,
+      path: agentPath,
+      model: null,
+      tools: [],
+      invalidTools: [],
+      error: `Failed to read ${agentPath}: ${err.message}`,
+    };
+  }
+
+  const fmMatch = raw.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
+  if (!fmMatch) {
+    return {
+      ok: false,
+      path: agentPath,
+      model: null,
+      tools: [],
+      invalidTools: [],
+      error: `Missing YAML frontmatter in ${agentPath}`,
+    };
+  }
+
+  const frontmatter = fmMatch[1];
+  let model = null;
+  const modelMatch = frontmatter.match(/^model:\s*(.+?)\s*$/m);
+  if (modelMatch) {
+    let rawModel = modelMatch[1].replace(/\s+#.*$/, "").trim();
+    if (
+      (rawModel.startsWith('"') && rawModel.endsWith('"')) ||
+      (rawModel.startsWith("'") && rawModel.endsWith("'"))
+    ) {
+      rawModel = rawModel.slice(1, -1).trim();
+    }
+    model = rawModel || null;
+  }
+
+  const tools = [];
+  let inTools = false;
+  for (const line of frontmatter.split(/\r?\n/)) {
+    if (!inTools) {
+      const startMatch = line.match(/^tools:\s*(.*)$/);
+      if (startMatch) {
+        const rest = startMatch[1].replace(/\s+#.*$/, "").trim();
+        if (rest.startsWith("[") && rest.endsWith("]")) {
+          const inner = rest.slice(1, -1).trim();
+          if (inner) {
+            for (const part of inner.split(",")) {
+              const cleaned = part.trim().replace(/^["']|["']$/g, "");
+              if (cleaned) {
+                tools.push(cleaned);
+              }
+            }
+          }
+        } else {
+          inTools = true;
+        }
+      }
+      continue;
+    }
+
+    if (!line.trim() || /^\s*#/.test(line)) {
+      continue;
+    }
+    const itemMatch = line.match(/^\s*-\s*(.+?)\s*$/);
+    if (itemMatch) {
+      const cleaned = itemMatch[1]
+        .replace(/\s+#.*$/, "")
+        .trim()
+        .replace(/^["']|["']$/g, "");
+      if (cleaned) {
+        tools.push(cleaned);
+      }
+    } else if (/^\S/.test(line)) {
+      inTools = false;
+    }
+  }
+
+  const invalidTools = tools.filter(
+    (t) => BROKEN_ONEHARNESS_TOOLS.has(t) || !VERIFIED_DUAL_ENGINE_TOOLS.has(t)
+  );
+  const errors = [];
+  if (!model || !VALID_WORKER_MODELS.has(model)) {
+    errors.push(
+      `Invalid or missing model '${model ?? ""}' (expected inherit, flash_lite, flash, or pro)`
+    );
+  }
+  if (tools.length === 0) {
+    errors.push("No tools declared in frontmatter");
+  } else if (invalidTools.length > 0) {
+    errors.push(`Incompatible or unverified tool(s): ${invalidTools.join(", ")}`);
+  }
+
+  return {
+    ok: errors.length === 0,
+    path: agentPath,
+    model,
+    tools,
+    invalidTools,
+    error: errors.length > 0 ? errors.join("; ") : null,
+  };
+}
+
+function inspectActiveLoops(workspaceDir) {
+  const envStateDir = process.env.AGY_LOOP_STATE_DIR;
+  const stateRoot =
+    typeof envStateDir === "string" && envStateDir.trim()
+      ? envStateDir.trim()
+      : path.join(workspaceDir, ".agents", ".agy-loop");
+  const loopsDir = path.join(stateRoot, "loops");
+
+  if (!lstatExists(loopsDir)) {
+    return [];
+  }
+
+  let entries;
+  try {
+    entries = fs.readdirSync(loopsDir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+
+  const active = [];
+  for (const entry of entries) {
+    const stateFile = path.join(loopsDir, entry.name, "state.json");
+    let parsed;
+    try {
+      const stat = fs.statSync(stateFile);
+      if (!stat.isFile()) {
+        continue;
+      }
+      parsed = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+    } catch {
+      continue;
+    }
+
+    if (!isPlainObject(parsed) || parsed.status !== "running") {
+      continue;
+    }
+
+    const maxIterations =
+      typeof parsed.max_iterations === "number"
+        ? parsed.max_iterations
+        : typeof parsed.maxIterations === "number"
+          ? parsed.maxIterations
+          : null;
+
+    active.push({
+      loopId: parsed.loop_id ?? parsed.loopId ?? entry.name,
+      status: parsed.status,
+      iteration: typeof parsed.iteration === "number" ? parsed.iteration : null,
+      maxIterations,
+      pacing: parsed.pacing ?? null,
+      taskId: parsed.task_id ?? parsed.taskId ?? null,
+      workerId: parsed.worker_id ?? parsed.workerId ?? null,
+      updatedAt: parsed.updated_at ?? parsed.updatedAt ?? null,
+    });
+  }
+
+  active.sort((a, b) => {
+    const ta = a.updatedAt ? Date.parse(a.updatedAt) : Number.NaN;
+    const tb = b.updatedAt ? Date.parse(b.updatedAt) : Number.NaN;
+    if (!Number.isNaN(ta) && !Number.isNaN(tb) && tb !== ta) {
+      return tb - ta;
+    }
+    const sa = String(a.updatedAt || "");
+    const sb = String(b.updatedAt || "");
+    const cmp = sb.localeCompare(sa);
+    if (cmp !== 0) {
+      return cmp;
+    }
+    return String(b.loopId || "").localeCompare(String(a.loopId || ""));
+  });
+
+  return active;
+}
+
 function printHelp(version) {
   process.stdout.write(`AGY Loop (agy-loop) v${version}
 Non-blocking /agy-loop:loop scheduler plugin for Antigravity Desktop & CLI.
@@ -420,7 +1065,7 @@ Commands:
   install, update     Install or update the agy-loop plugin (default)
   uninstall, remove   Uninstall the agy-loop plugin from Antigravity
   validate            Run 'agy plugin validate --strict' on the bundled plugin
-  doctor, status      Inspect agy CLI, plugin registration, shadow files, and loop.md
+  doctor, status      Inspect agy capabilities, plugin, hooks, worker tools, env, loops, and loop.md
   version             Print package version
   help                Show this help message
 
@@ -484,6 +1129,9 @@ function handleInstall({ cleanShadow, json, version }) {
   if (!probe.found) {
     emitMissingAgyError(json);
   }
+  if (probe.timedOut) {
+    emitAgyTimeoutError(probe, { action: "install", jsonMode: json, version });
+  }
 
   const alreadyInPlace = isSameDirectory(PLUGIN_ROOT, installedPluginDir);
   let installStdout = "";
@@ -510,7 +1158,7 @@ function handleInstall({ cleanShadow, json, version }) {
       process.exit(1);
     }
 
-    const valRes = runAgy(["plugin", "validate", PLUGIN_ROOT]);
+    const valRes = runAgy(["plugin", "validate", PLUGIN_ROOT], { timeoutMs: 30000 });
     if (valRes.status !== 0) {
       const errMsg = (valRes.stderr || valRes.stdout || "agy plugin validate failed").trim();
       if (json) {
@@ -519,6 +1167,7 @@ function handleInstall({ cleanShadow, json, version }) {
             {
               ok: false,
               action: "install",
+              ...(valRes.timedOut ? { timedOut: true } : {}),
               error: errMsg,
               backupDir: null,
             },
@@ -533,7 +1182,7 @@ function handleInstall({ cleanShadow, json, version }) {
       process.exit(valRes.status || 1);
     }
   } else {
-    const installRes = runAgy(["plugin", "install", PLUGIN_ROOT]);
+    const installRes = runAgy(["plugin", "install", PLUGIN_ROOT], { timeoutMs: 30000 });
     if (installRes.status !== 0) {
       if (json) {
         process.stdout.write(
@@ -541,6 +1190,7 @@ function handleInstall({ cleanShadow, json, version }) {
             {
               ok: false,
               action: "install",
+              ...(installRes.timedOut ? { timedOut: true } : {}),
               error: (installRes.stderr || installRes.stdout || "agy plugin install failed").trim(),
               backupDir: null,
             },
@@ -639,8 +1289,11 @@ function handleUninstall({ json }) {
   if (!probe.found) {
     emitMissingAgyError(json);
   }
+  if (probe.timedOut) {
+    emitAgyTimeoutError(probe, { action: "uninstall", jsonMode: json });
+  }
 
-  const res = runAgy(["plugin", "uninstall", "agy-loop"]);
+  const res = runAgy(["plugin", "uninstall", "agy-loop"], { timeoutMs: 30000 });
   if (res.status !== 0) {
     if (json) {
       process.stdout.write(
@@ -648,6 +1301,7 @@ function handleUninstall({ json }) {
           {
             ok: false,
             action: "uninstall",
+            ...(res.timedOut ? { timedOut: true } : {}),
             error: (res.stderr || res.stdout || "agy plugin uninstall failed").trim(),
           },
           null,
@@ -681,6 +1335,9 @@ function handleValidate({ json }) {
   if (!probe.found) {
     emitMissingAgyError(json);
   }
+  if (probe.timedOut) {
+    emitAgyTimeoutError(probe, { action: "validate", jsonMode: json });
+  }
 
   const args = ["plugin", "validate", "--strict"];
   if (json) {
@@ -688,7 +1345,10 @@ function handleValidate({ json }) {
   }
   args.push(PLUGIN_ROOT);
 
-  const res = runAgy(args);
+  const res = runAgy(args, { timeoutMs: 30000 });
+  if (res.timedOut && json && !res.stdout.trim()) {
+    emitAgyTimeoutError(res, { action: "validate", jsonMode: json });
+  }
   if (res.stdout) {
     process.stdout.write(res.stdout);
   }
@@ -720,7 +1380,11 @@ function handleDoctor({ cleanShadow = false, json, version }) {
   if (!verRes.found) {
     emitMissingAgyError(json);
   }
+  if (verRes.timedOut) {
+    emitAgyTimeoutError(verRes, { action: "doctor", jsonMode: json, version });
+  }
   const agyVersion = (verRes.stdout || verRes.stderr).trim() || "unknown";
+  const capabilities = detectAgyCapabilities(agyVersion);
 
   const listRes = runAgy(["plugin", "list", "--json"]);
   let pluginEntry = null;
@@ -745,6 +1409,10 @@ function handleDoctor({ cleanShadow = false, json, version }) {
   const shadows = detectShadowPaths(homeDir);
   const skillFilterWarnings = detectSkillFilterWarnings(workspaceDir, homeDir);
   const loopMd = inspectLoopMd(workspaceDir, homeDir);
+  const { environment, environmentWarnings } = inspectEnvironment(workspaceDir, homeDir);
+  const hookSelfTest = runHookSelfTest(homeDir, workspaceDir);
+  const agentToolsCheck = inspectAgentTools(pluginEntry);
+  const activeLoops = inspectActiveLoops(workspaceDir);
 
   const pluginInstalled = Boolean(pluginEntry);
   const pluginEnabled = pluginEntry ? pluginEntry.enabled !== false : false;
@@ -753,7 +1421,10 @@ function handleDoctor({ cleanShadow = false, json, version }) {
     pluginEnabled &&
     !pluginListError &&
     shadows.length === 0 &&
-    skillFilterWarnings.length === 0;
+    skillFilterWarnings.length === 0 &&
+    !environment.adminSettings.pluginsDisabled &&
+    hookSelfTest.ok &&
+    agentToolsCheck.ok;
 
   const report = {
     ok,
@@ -761,6 +1432,7 @@ function handleDoctor({ cleanShadow = false, json, version }) {
     agy: {
       found: true,
       version: agyVersion,
+      capabilities,
     },
     plugin: {
       installed: pluginInstalled,
@@ -774,6 +1446,11 @@ function handleDoctor({ cleanShadow = false, json, version }) {
     movedShadows: backupInfo ? backupInfo.moved : [],
     shadows: shadows.map((s) => s.path),
     skillFilterWarnings,
+    environment,
+    environmentWarnings,
+    hookSelfTest,
+    agentToolsCheck,
+    activeLoops,
     loopMd: {
       active: loopMd.active,
       activeSource: loopMd.activeSource,
@@ -783,11 +1460,25 @@ function handleDoctor({ cleanShadow = false, json, version }) {
 
   if (json) {
     process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+    if (listRes.timedOut) {
+      process.exit(listRes.status || 124);
+    }
     return;
   }
 
+  const capLabels = [];
+  if (capabilities.worktreeDirtyCarry) capLabels.push("worktree-carry");
+  if (capabilities.autoModeDefault) capLabels.push("auto-mode");
+  if (capabilities.dynamicWorkflows) capLabels.push("run_workflow");
+  if (capabilities.githubUrlValidate) capLabels.push("github-url");
+  if (capabilities.strictProtojsonHooks) capLabels.push("strict-protojson");
+  const capSummary = capabilities.parsedVersion
+    ? `${capabilities.parsedVersion} (${capLabels.length > 0 ? capLabels.join(", ") : "legacy"})`
+    : "unknown (unparsed version)";
+
   process.stdout.write(`AGY Loop Doctor (v${version})\n`);
   process.stdout.write(`  agy CLI:        found (v${agyVersion})\n`);
+  process.stdout.write(`  agy features:   ${capSummary}\n`);
   if (pluginListError) {
     process.stdout.write(`  plugin status:  error (${pluginListError})\n`);
   } else if (pluginInstalled) {
@@ -836,10 +1527,55 @@ function handleDoctor({ cleanShadow = false, json, version }) {
     }
   }
 
+  if (hookSelfTest.ok) {
+    process.stdout.write(`  hook protojson: ok (SessionStart strict schema)\n`);
+  } else {
+    const detail =
+      hookSelfTest.error ||
+      (hookSelfTest.unexpectedKeys.length > 0
+        ? `unexpected keys: ${hookSelfTest.unexpectedKeys.join(", ")}`
+        : "failed");
+    process.stdout.write(`  hook protojson: FAILED (${detail})\n`);
+  }
+
+  if (agentToolsCheck.ok) {
+    process.stdout.write(
+      `  loop-worker:    ok (model=${agentToolsCheck.model}, ${agentToolsCheck.tools.length} dual-engine tools)\n`
+    );
+  } else {
+    process.stdout.write(`  loop-worker:    FAILED (${agentToolsCheck.error})\n`);
+  }
+
+  if (environmentWarnings.length === 0) {
+    process.stdout.write(`  environment:    ok\n`);
+  } else {
+    process.stdout.write(`  environment:    ${environmentWarnings.length} warning(s)\n`);
+    for (const w of environmentWarnings) {
+      process.stdout.write(`    - ${w}\n`);
+    }
+  }
+
+  if (activeLoops.length === 0) {
+    process.stdout.write(`  active loops:   0\n`);
+  } else {
+    process.stdout.write(`  active loops:   ${activeLoops.length} running\n`);
+    for (const loop of activeLoops) {
+      process.stdout.write(
+        `    - ${loop.loopId} (iter ${loop.iteration ?? "?"}/${loop.maxIterations ?? "?"}, pacing=${
+          loop.pacing || "?"
+        }, updated=${loop.updatedAt || "?"})\n`
+      );
+    }
+  }
+
   if (loopMd.active) {
     process.stdout.write(`  active loop.md: ${loopMd.activeSource} (${loopMd.active})\n`);
   } else {
     process.stdout.write(`  active loop.md: none (using built-in maintenance fallback)\n`);
+  }
+
+  if (listRes.timedOut) {
+    process.exit(listRes.status || 124);
   }
 }
 
