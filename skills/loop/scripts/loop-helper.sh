@@ -133,15 +133,17 @@ run_parse() {
       return (unit_short(upart) != "") ? 1 : 0
     }
 
-    function check_fractional_compact(w) {
+    function check_fractional_compact(w, err_prefix,    ep) {
+      ep = (err_prefix != "") ? err_prefix : "Invalid interval: "
       if (is_fractional_compact(w)) {
-        json_error("Invalid interval: " strip_comma(w) " (fractional durations are not supported; use integer units like 90s or 1m30s)")
+        json_error(ep strip_comma(w) " (fractional durations are not supported; use integer units like 90s or 1m30s)")
       }
     }
 
-    function check_fractional_split(nw, uw) {
+    function check_fractional_split(nw, uw, err_prefix,    ep) {
+      ep = (err_prefix != "") ? err_prefix : "Invalid interval: "
       if (nw ~ /^[0-9]*\.[0-9]+$/ && unit_short(strip_comma(uw)) != "") {
-        json_error("Invalid interval: " nw " " strip_comma(uw) " (fractional durations are not supported; use integer units like 90s or 1m30s)")
+        json_error(ep nw " " strip_comma(uw) " (fractional durations are not supported; use integer units like 90s or 1m30s)")
       }
     }
 
@@ -176,8 +178,9 @@ run_parse() {
       return (segs > 0) ? 1 : 0
     }
 
-    function parse_compact_dur(w,    cw, pos, n, ch, dstart, ustart, dpart, upart, su, seg_num, total_sec, label, seen_s, seen_m, seen_h, seen_d, segs, last_su) {
+    function parse_compact_dur(w, err_prefix,    ep, cw, pos, n, ch, dstart, ustart, dpart, upart, su, seg_num, total_sec, label, seen_s, seen_m, seen_h, seen_d, segs, last_su) {
       if (!looks_like_compact_dur(w)) return 0
+      ep = (err_prefix != "") ? err_prefix : "Invalid interval: "
       cw = strip_comma(w)
       n = length(cw)
       pos = 1
@@ -205,7 +208,7 @@ run_parse() {
         su = unit_short(upart)
 
         if ((su == "s" && seen_s) || (su == "m" && seen_m) || (su == "h" && seen_h) || (su == "d" && seen_d)) {
-          json_error("Invalid interval: " cw " (duplicate unit \047" su "\047)")
+          json_error(ep cw " (duplicate unit \047" su "\047)")
         }
         if (su == "s") seen_s = 1
         else if (su == "m") seen_m = 1
@@ -213,7 +216,7 @@ run_parse() {
         else if (su == "d") seen_d = 1
 
         if (dpart ~ /^0+$/) {
-          json_error("Invalid interval: " cw " (duration must be >= 1)")
+          json_error(ep cw " (duration must be >= 1)")
         }
 
         seg_num = dpart + 0
@@ -230,18 +233,56 @@ run_parse() {
       return 1
     }
 
-    function parse_split_dur(nw, uw,    su) {
+    function parse_split_dur(nw, uw, err_prefix,    ep, su) {
       if (nw !~ /^[0-9]+$/) return 0
       su = unit_short(strip_comma(uw))
       if (su == "") return 0
+      ep = (err_prefix != "") ? err_prefix : "Invalid interval: "
       if (nw ~ /^0+$/) {
-        json_error("Invalid interval: " nw " " strip_comma(uw) " (duration must be >= 1)")
+        json_error(ep nw " " strip_comma(uw) " (duration must be >= 1)")
       }
       PARSED_NUM = nw + 0
       PARSED_UNIT = su
       PARSED_SEC = PARSED_NUM * unit_mult(su)
       PARSED_LABEL = PARSED_NUM su
       return 1
+    }
+
+    function parse_dur_value(raw_val, flag_name,    v, ep, nparts, dparts) {
+      v = trim(strip_opt_quotes(raw_val))
+      ep = "Invalid " flag_name ": "
+      if (v == "" || substr(v, length(v), 1) == ",") {
+        json_error(ep v " (expected integer duration like 30s, 5m, or 1h30m)")
+      }
+      nparts = split(v, dparts, /[ \t\r\n]+/)
+      if (nparts == 1) {
+        check_fractional_compact(dparts[1], ep)
+        if (parse_compact_dur(dparts[1], ep)) {
+          return PARSED_SEC
+        }
+      } else if (nparts == 2 && substr(dparts[2], length(dparts[2]), 1) != ",") {
+        check_fractional_split(dparts[1], dparts[2], ep)
+        if (parse_split_dur(dparts[1], dparts[2], ep)) {
+          return PARSED_SEC
+        }
+      }
+      json_error(ep v " (expected integer duration like 30s, 5m, or 1h30m)")
+    }
+
+    function parse_targets_csv(raw_val, out_arr,    v, n, idx, parts, item) {
+      v = strip_opt_quotes(raw_val)
+      if (trim(v) == "") {
+        json_error("Invalid --targets value: empty target list")
+      }
+      n = split(v, parts, ",")
+      for (idx = 1; idx <= n; idx++) {
+        item = trim(parts[idx])
+        if (item == "") {
+          json_error("Invalid --targets value: empty target item in \047" v "\047")
+        }
+        out_arr[idx] = item
+      }
+      return n
     }
 
     function edit_distance(a, b,    la, lb, i, j, ca, cb, pa, pb, cost, v1, v2, v3, d) {
@@ -305,6 +346,19 @@ run_parse() {
       kflags[9] = "daemon"
       kflags[10] = "max"
       kflags[11] = "model"
+      kflags[12] = "engine"
+      kflags[13] = "verify"
+      kflags[14] = "verifier-model"
+      kflags[15] = "verify-cmd"
+      kflags[16] = "verify-timeout"
+      kflags[17] = "probe"
+      kflags[18] = "probe-timeout"
+      kflags[19] = "probe-until-pass"
+      kflags[20] = "targets"
+      kflags[21] = "reset-every"
+      kflags[22] = "max-tokens"
+      kflags[23] = "max-duration"
+      nkflags = 23
 
       flag_aliases["--statefull"] = "--stateful"
       flag_aliases["--stateless"] = "--fresh"
@@ -326,6 +380,27 @@ run_parse() {
       flag_aliases["--shares"] = "--share"
       flag_aliases["--freshes"] = "--fresh"
       flag_aliases["--freshs"] = "--fresh"
+      flag_aliases["--engines"] = "--engine"
+      flag_aliases["--verify-command"] = "--verify-cmd"
+      flag_aliases["--verify_cmd"] = "--verify-cmd"
+      flag_aliases["--verifycmd"] = "--verify-cmd"
+      flag_aliases["--verify-timeouts"] = "--verify-timeout"
+      flag_aliases["--verifiers"] = "--verify"
+      flag_aliases["--verifier"] = "--verify"
+      flag_aliases["--verifier-models"] = "--verifier-model"
+      flag_aliases["--verifier_model"] = "--verifier-model"
+      flag_aliases["--probes"] = "--probe"
+      flag_aliases["--probe-cmd"] = "--probe"
+      flag_aliases["--probe-command"] = "--probe"
+      flag_aliases["--probe-timeouts"] = "--probe-timeout"
+      flag_aliases["--probe-until-passed"] = "--probe-until-pass"
+      flag_aliases["--target"] = "--targets"
+      flag_aliases["--reset_every"] = "--reset-every"
+      flag_aliases["--max-token"] = "--max-tokens"
+      flag_aliases["--max_tokens"] = "--max-tokens"
+      flag_aliases["--max-dur"] = "--max-duration"
+      flag_aliases["--max-durations"] = "--max-duration"
+      flag_aliases["--max_duration"] = "--max-duration"
     }
 
     function handle_unknown_option(t, rc,    eqp, fname, lfname, stem, k, max_d, d, best_d, best_k) {
@@ -339,7 +414,7 @@ run_parse() {
       best_k = ""
       best_d = 999
       if (length(stem) >= 2) {
-        for (k = 1; k <= 11; k++) {
+        for (k = 1; k <= nkflags; k++) {
           max_d = (length(kflags[k]) <= 4) ? 1 : 2
           d = edit_distance(stem, kflags[k])
           if (d <= max_d && (best_k == "" || d < best_d)) {
@@ -357,7 +432,7 @@ run_parse() {
       warnings[++wcount] = "Kept unrecognized flag \047" t "\047 as literal prompt text (use \047--\047 before prompt if intentional)."
     }
 
-    function tokenize_single(s,    len, pos, ch, j, nx, unq, matched) {
+    function tokenize_single(s,    len, pos, ch, j, nx, unq, matched, eq_j, qch, k) {
       len = length(s)
       pos = 1
       ntok = 0
@@ -380,31 +455,71 @@ run_parse() {
                 continue
               }
             }
-            if (substr(s, j, 1) == ch) {
-              if (j == len || is_space(substr(s, j + 1, 1))) {
-                ntok++
-                tok[ntok] = unq
-                raw_tok[ntok] = substr(s, pos, j - pos + 1)
-                qflag[ntok] = 1
-                pos = j + 1
-                matched = 1
+                if (substr(s, j, 1) == ch) {
+                  if (j == len || is_space(substr(s, j + 1, 1))) {
+                    ntok++
+                    tok[ntok] = unq
+                    raw_tok[ntok] = substr(s, pos, j - pos + 1)
+                    qflag[ntok] = 1
+                    eq_qflag[ntok] = 0
+                    pos = j + 1
+                    matched = 1
+                  }
+                  break
+                }
+                unq = unq substr(s, j, 1)
+                j++
               }
-              break
+              if (matched) continue
             }
-            unq = unq substr(s, j, 1)
-            j++
-          }
-          if (matched) continue
-        }
-        j = pos
-        while (j <= len && !is_space(substr(s, j, 1))) {
-          j++
-        }
-        ntok++
-        tok[ntok] = substr(s, pos, j - pos)
-        raw_tok[ntok] = tok[ntok]
-        qflag[ntok] = 0
-        pos = j
+            if (substr(s, pos, 2) == "--") {
+              eq_j = pos + 2
+              while (eq_j <= len && !is_space(substr(s, eq_j, 1)) && substr(s, eq_j, 1) != "=") {
+                eq_j++
+              }
+              if (eq_j < len && substr(s, eq_j, 1) == "=") {
+                qch = substr(s, eq_j + 1, 1)
+                if (qch == "\"" || qch == "\047") {
+                  unq = ""
+                  k = eq_j + 2
+                  while (k <= len) {
+                    if (qch == "\"" && substr(s, k, 1) == "\\" && k < len) {
+                      nx = substr(s, k + 1, 1)
+                      if (nx == "\"" || nx == "\\" || nx == "$" || nx == "`") {
+                        unq = unq nx
+                        k += 2
+                        continue
+                      }
+                    }
+                    if (substr(s, k, 1) == qch) {
+                      if (k == len || is_space(substr(s, k + 1, 1))) {
+                        ntok++
+                        tok[ntok] = substr(s, pos, eq_j - pos + 1) unq
+                        raw_tok[ntok] = substr(s, pos, k - pos + 1)
+                        qflag[ntok] = 0
+                        eq_qflag[ntok] = 1
+                        pos = k + 1
+                        matched = 1
+                      }
+                      break
+                    }
+                    unq = unq substr(s, k, 1)
+                    k++
+                  }
+                  if (matched) continue
+                }
+              }
+            }
+            j = pos
+            while (j <= len && !is_space(substr(s, j, 1))) {
+              j++
+            }
+            ntok++
+            tok[ntok] = substr(s, pos, j - pos)
+            raw_tok[ntok] = tok[ntok]
+            qflag[ntok] = 0
+            eq_qflag[ntok] = 0
+            pos = j
       }
     }
 
@@ -420,16 +535,7 @@ run_parse() {
       return v
     }
 
-    function execute_parse(is_single_mode,    i, w1, st_all, st_json, after_current, has_all, st_ntgt, ti, lti, tgt, max_set, max_val, once, state_mode, stateful_flag, fresh_flag, workspace, worktree_flag, share_flag, model_set, model_val, self_flag, cron_flag, exact_timing, is_daemon, end_of_opts, rcount, t, val, has_interval, p_start, p_end, su, pcount, prompt, pacing, max_iterations, task_source, delegate, has_cron, cron_expr, use_cron) {
-      if (ntok >= 1 && qflag[1] == 0 && (tok[1] == "/loop" || tok[1] == "/agy-loop:loop")) {
-        for (i = 1; i < ntok; i++) {
-          tok[i] = tok[i + 1]
-          raw_tok[i] = raw_tok[i + 1]
-          qflag[i] = qflag[i + 1]
-        }
-        ntok--
-      }
-
+    function parse_lifecycle_subcmd(    i, w1, st_all, st_json, after_current, has_all, st_ntgt, ti, lti, tgt, n_wake, n_tgt, n_end_opts, n_mcount, n_mtok, n_mraw, n_mq, n_msg) {
       if (ntok >= 1 && qflag[1] == 0) {
         w1 = tolower(tok[1])
         if (w1 == "status" || w1 == "list") {
@@ -474,6 +580,81 @@ run_parse() {
             finish_ok()
           }
           json_error("Unexpected arguments for help (expected /agy-loop:loop help)")
+        }
+        if (w1 == "wake") {
+          if (ntok < 2) {
+            json_error("Missing target for wake (expected /agy-loop:loop wake <loop_id|latest>)")
+          }
+          if (ntok > 2) {
+            json_error("Unexpected extra argument for wake: " tok[3] " (expected /agy-loop:loop wake <loop_id|latest>)")
+          }
+          if (qflag[2] == 0 && substr(tok[2], 1, 1) == "-") {
+            json_error("Unknown option for wake: " tok[2])
+          }
+          tgt = trim(tok[2])
+          if (tgt == "") {
+            json_error("Invalid empty target for wake")
+          }
+          printf "{\"action\":\"wake\",\"target\":\"%s\"}\n", json_escape(tgt)
+          finish_ok()
+        }
+        if (w1 == "nudge") {
+          n_wake = 0
+          n_tgt = ""
+          n_end_opts = 0
+          n_mcount = 0
+          split("", n_mtok); split("", n_mraw); split("", n_mq)
+          for (i = 2; i <= ntok; i++) {
+            ti = tok[i]
+            if (!n_end_opts && qflag[i] == 0) {
+              if (ti == "--") {
+                n_end_opts = 1
+                continue
+              }
+              if (ti == "--wake") {
+                n_wake = 1
+                continue
+              }
+              if (index(ti, "--wake=") == 1) {
+                json_error("Option --wake does not take a value")
+              }
+              if (n_tgt == "" && substr(ti, 1, 1) == "-") {
+                json_error("Unknown option for nudge: " ti)
+              }
+            }
+            if (n_tgt == "") {
+              n_tgt = trim(ti)
+              if (n_tgt == "") {
+                json_error("Invalid empty target for nudge")
+              }
+            } else {
+              n_mcount++
+              n_mtok[n_mcount] = tok[i]
+              n_mraw[n_mcount] = raw_tok[i]
+              n_mq[n_mcount] = qflag[i]
+            }
+          }
+          if (n_tgt == "") {
+            json_error("Missing target for nudge (expected /agy-loop:loop nudge <loop_id|latest> <message...> [--wake])")
+          }
+          if (n_mcount == 0) {
+            json_error("Missing message for nudge (expected /agy-loop:loop nudge <loop_id|latest> <message...> [--wake])")
+          }
+          if (n_mcount == 1 && n_mq[1] == 1) {
+            n_msg = n_mtok[1]
+          } else {
+            n_msg = ""
+            for (i = 1; i <= n_mcount; i++) {
+              if (i > 1) n_msg = n_msg " "
+              n_msg = n_msg n_mraw[i]
+            }
+          }
+          n_msg = trim(n_msg)
+          if (n_msg == "") {
+            json_error("Invalid empty message for nudge")
+          }
+          printf "{\"action\":\"nudge\",\"target\":\"%s\",\"message\":\"%s\",\"wake\":%s}\n", json_escape(n_tgt), json_escape(n_msg), json_bool(n_wake)
+          finish_ok()
         }
         if (w1 == "stop" || w1 == "cancel") {
           after_current = 0
@@ -524,25 +705,29 @@ run_parse() {
         print "{\"action\":\"doctor\",\"clean_shadow\":true}"
         finish_ok()
       }
+    }
 
-      max_set = 0
-      max_val = 20
-      once = 0
-      state_mode = "fresh"
-      stateful_flag = 0
-      fresh_flag = 0
-      workspace = "inherit"
-      worktree_flag = 0
-      share_flag = 0
-      model_set = 0
-      model_val = ""
-      self_flag = 0
-      cron_flag = 0
-      exact_timing = 0
-      is_daemon = 0
-      end_of_opts = 0
-      rcount = 0
+    function parse_run_flags(    i, t, val, end_of_opts) {
+      OP_MAX_SET = 0; OP_MAX_VAL = 20
+      OP_ONCE = 0
+      OP_STATE_MODE = "fresh"; OP_STATEFUL = 0; OP_FRESH = 0
+      OP_WORKSPACE = "inherit"; OP_WORKTREE = 0; OP_SHARE = 0
+      OP_MODEL_SET = 0; OP_MODEL_VAL = ""
+      OP_SELF = 0; OP_CRON = 0; OP_EXACT = 0; OP_DAEMON = 0
+      OP_ENGINE_ARG = "auto"
+      OP_VERIFY = 0
+      OP_VERIFIER_MODEL_SET = 0; OP_VERIFIER_MODEL_VAL = ""
+      OP_VERIFY_CMD_SET = 0; OP_VERIFY_CMD_VAL = ""
+      OP_VERIFY_TIMEOUT_SET = 0; OP_VERIFY_TIMEOUT_SEC = 60
+      OP_PROBE_SET = 0; OP_PROBE_VAL = ""
+      OP_PROBE_TIMEOUT_SET = 0; OP_PROBE_TIMEOUT_SEC = 60; OP_PROBE_UNTIL_PASS = 0
+      OP_TARGETS_SET = 0; OP_TARGETS_COUNT = 0; split("", OP_TARGETS)
+      OP_RESET_EVERY_SET = 0; OP_RESET_EVERY_VAL = 0
+      OP_MAX_TOKENS_SET = 0; OP_MAX_TOKENS_VAL = 0
+      OP_MAX_DUR_SET = 0; OP_MAX_DUR_SEC = 0
+      OP_RCOUNT = 0
       wcount = 0
+      end_of_opts = 0
 
       for (i = 1; i <= ntok; i++) {
         if (!end_of_opts && qflag[i] == 0) {
@@ -551,235 +736,328 @@ run_parse() {
             end_of_opts = 1
             continue
           }
-          if (t == "--once") {
-            once = 1
-            continue
-          }
+          if (t == "--once") { OP_ONCE = 1; continue }
           if (t == "--stateful") {
-            if (fresh_flag) {
-              json_error("Conflicting flags: --stateful and --fresh cannot be combined")
-            }
-            stateful_flag = 1
-            state_mode = "stateful"
-            continue
+            if (OP_FRESH) json_error("Conflicting flags: --stateful and --fresh cannot be combined")
+            OP_STATEFUL = 1; OP_STATE_MODE = "stateful"; continue
           }
           if (t == "--fresh") {
-            if (stateful_flag) {
-              json_error("Conflicting flags: --stateful and --fresh cannot be combined")
-            }
-            fresh_flag = 1
-            state_mode = "fresh"
-            continue
+            if (OP_STATEFUL) json_error("Conflicting flags: --stateful and --fresh cannot be combined")
+            OP_FRESH = 1; OP_STATE_MODE = "fresh"; continue
           }
           if (t == "--worktree") {
-            if (share_flag) {
-              json_error("Conflicting flags: --worktree and --share cannot be combined")
-            }
-            worktree_flag = 1
-            workspace = "branch"
-            continue
+            if (OP_SHARE) json_error("Conflicting flags: --worktree and --share cannot be combined")
+            OP_WORKTREE = 1; OP_WORKSPACE = "branch"; continue
           }
           if (t == "--share") {
-            if (worktree_flag) {
-              json_error("Conflicting flags: --worktree and --share cannot be combined")
+            if (OP_WORKTREE) json_error("Conflicting flags: --worktree and --share cannot be combined")
+            OP_SHARE = 1; OP_WORKSPACE = "share"; continue
+          }
+          if (t == "--self") { OP_SELF = 1; continue }
+          if (t == "--cron") { OP_CRON = 1; continue }
+          if (t == "--exact") { OP_EXACT = 1; continue }
+          if (t == "--daemon") { OP_DAEMON = 1; continue }
+          if (t == "--verify") { OP_VERIFY = 1; continue }
+          if (index(t, "--verify=") == 1) json_error("Option --verify does not take a value")
+          if (t == "--probe-until-pass") { OP_PROBE_UNTIL_PASS = 1; continue }
+          if (index(t, "--probe-until-pass=") == 1) json_error("Option --probe-until-pass does not take a value")
+          if (t == "--engine" || index(t, "--engine=") == 1) {
+            if (t == "--engine") {
+              if (i + 1 > ntok) json_error("Missing value for --engine")
+              i++
+              val = qflag[i] ? tok[i] : strip_opt_quotes(tok[i])
+            } else {
+              val = substr(t, 10)
+              if (!eq_qflag[i]) val = strip_opt_quotes(val)
             }
-            share_flag = 1
-            workspace = "share"
-            continue
-          }
-          if (t == "--self") {
-            self_flag = 1
-            continue
-          }
-          if (t == "--cron") {
-            cron_flag = 1
-            continue
-          }
-          if (t == "--exact") {
-            exact_timing = 1
-            continue
-          }
-          if (t == "--daemon") {
-            is_daemon = 1
-            continue
-          }
-          if (t == "--max") {
-            if (i + 1 > ntok) {
-              json_error("Missing value for --max")
+            if (val == "") json_error("Missing value for --engine")
+            if (val != "auto" && val != "schedule" && val != "workflow") {
+              json_error("Invalid --engine value: " val " (expected auto, schedule, or workflow)")
             }
-            i++
-            val = strip_opt_quotes(tok[i])
-            if (val !~ /^[1-9][0-9]*$/) {
-              json_error("Invalid --max value: " val " (expected positive integer)")
-            }
-            max_set = 1
-            max_val = val + 0
+            OP_ENGINE_ARG = val
             continue
           }
-          if (index(t, "--max=") == 1) {
-            val = strip_opt_quotes(substr(t, 7))
-            if (val !~ /^[1-9][0-9]*$/) {
-              json_error("Invalid --max value: " val " (expected positive integer)")
+          if (t == "--max" || index(t, "--max=") == 1) {
+            if (t == "--max") {
+              if (i + 1 > ntok) json_error("Missing value for --max")
+              i++
+              val = qflag[i] ? tok[i] : strip_opt_quotes(tok[i])
+            } else {
+              val = substr(t, 7)
+              if (!eq_qflag[i]) val = strip_opt_quotes(val)
             }
-            max_set = 1
-            max_val = val + 0
+            if (val !~ /^[1-9][0-9]*$/) json_error("Invalid --max value: " val " (expected positive integer)")
+            OP_MAX_SET = 1; OP_MAX_VAL = val + 0; continue
+          }
+          if (t == "--reset-every" || index(t, "--reset-every=") == 1) {
+            if (t == "--reset-every") {
+              if (i + 1 > ntok) json_error("Missing value for --reset-every")
+              i++
+              val = qflag[i] ? tok[i] : strip_opt_quotes(tok[i])
+            } else {
+              val = substr(t, 15)
+              if (!eq_qflag[i]) val = strip_opt_quotes(val)
+            }
+            if (val !~ /^[1-9][0-9]*$/) json_error("Invalid --reset-every value: " val " (expected positive integer)")
+            OP_RESET_EVERY_SET = 1; OP_RESET_EVERY_VAL = val + 0; continue
+          }
+          if (t == "--max-tokens" || index(t, "--max-tokens=") == 1) {
+            if (t == "--max-tokens") {
+              if (i + 1 > ntok) json_error("Missing value for --max-tokens")
+              i++
+              val = qflag[i] ? tok[i] : strip_opt_quotes(tok[i])
+            } else {
+              val = substr(t, 14)
+              if (!eq_qflag[i]) val = strip_opt_quotes(val)
+            }
+            if (val !~ /^[1-9][0-9]*$/) json_error("Invalid --max-tokens value: " val " (expected positive integer)")
+            OP_MAX_TOKENS_SET = 1; OP_MAX_TOKENS_VAL = val + 0; continue
+          }
+          if (t == "--max-duration" || index(t, "--max-duration=") == 1) {
+            if (t == "--max-duration") {
+              if (i + 1 > ntok) json_error("Missing value for --max-duration")
+              i++
+              val = tok[i]
+            } else {
+              val = substr(t, 16)
+              if (!eq_qflag[i]) val = strip_opt_quotes(val)
+            }
+            OP_MAX_DUR_SEC = parse_dur_value(val, "--max-duration")
+            OP_MAX_DUR_SET = 1
             continue
           }
-          if (t == "--model") {
-            if (i + 1 > ntok) {
-              json_error("Missing value for --model")
+          if (t == "--model" || index(t, "--model=") == 1) {
+            if (t == "--model") {
+              if (i + 1 > ntok) json_error("Missing value for --model")
+              i++
+              val = qflag[i] ? tok[i] : strip_opt_quotes(tok[i])
+            } else {
+              val = substr(t, 9)
+              if (!eq_qflag[i]) val = strip_opt_quotes(val)
             }
-            i++
-            val = strip_opt_quotes(tok[i])
             if (val != "inherit" && val != "flash_lite" && val != "flash" && val != "pro") {
               json_error("Invalid --model tier: " val " (expected inherit, flash_lite, flash, or pro)")
             }
-            model_set = 1
-            model_val = val
+            OP_MODEL_SET = 1; OP_MODEL_VAL = val; continue
+          }
+          if (t == "--verifier-model" || index(t, "--verifier-model=") == 1) {
+            if (t == "--verifier-model") {
+              if (i + 1 > ntok) json_error("Missing value for --verifier-model")
+              i++
+              val = qflag[i] ? tok[i] : strip_opt_quotes(tok[i])
+            } else {
+              val = substr(t, 18)
+              if (!eq_qflag[i]) val = strip_opt_quotes(val)
+            }
+            if (val == "") json_error("Missing value for --verifier-model")
+            if (val != "inherit" && val != "flash_lite" && val != "flash" && val != "pro") {
+              json_error("Invalid --verifier-model tier: " val " (expected inherit, flash_lite, flash, or pro)")
+            }
+            OP_VERIFIER_MODEL_SET = 1; OP_VERIFIER_MODEL_VAL = val; OP_VERIFY = 1; continue
+          }
+          if (t == "--verify-cmd" || index(t, "--verify-cmd=") == 1) {
+            if (t == "--verify-cmd") {
+              if (i + 1 > ntok) json_error("Missing value for --verify-cmd")
+              i++
+              val = tok[i]
+            } else {
+              val = substr(t, 14)
+              if (!eq_qflag[i]) val = strip_opt_quotes(val)
+            }
+            if (trim(val) == "") json_error("Missing or empty value for --verify-cmd")
+            OP_VERIFY_CMD_SET = 1; OP_VERIFY_CMD_VAL = val; continue
+          }
+          if (t == "--verify-timeout" || index(t, "--verify-timeout=") == 1) {
+            if (t == "--verify-timeout") {
+              if (i + 1 > ntok) json_error("Missing value for --verify-timeout")
+              i++
+              val = tok[i]
+            } else {
+              val = substr(t, 18)
+              if (!eq_qflag[i]) val = strip_opt_quotes(val)
+            }
+            OP_VERIFY_TIMEOUT_SEC = parse_dur_value(val, "--verify-timeout")
+            OP_VERIFY_TIMEOUT_SET = 1
             continue
           }
-          if (index(t, "--model=") == 1) {
-            val = strip_opt_quotes(substr(t, 9))
-            if (val != "inherit" && val != "flash_lite" && val != "flash" && val != "pro") {
-              json_error("Invalid --model tier: " val " (expected inherit, flash_lite, flash, or pro)")
+          if (t == "--probe" || index(t, "--probe=") == 1) {
+            if (t == "--probe") {
+              if (i + 1 > ntok) json_error("Missing value for --probe")
+              i++
+              val = tok[i]
+            } else {
+              val = substr(t, 9)
+              if (!eq_qflag[i]) val = strip_opt_quotes(val)
             }
-            model_set = 1
-            model_val = val
+            if (trim(val) == "") json_error("Missing or empty value for --probe")
+            OP_PROBE_SET = 1; OP_PROBE_VAL = val; continue
+          }
+          if (t == "--probe-timeout" || index(t, "--probe-timeout=") == 1) {
+            if (t == "--probe-timeout") {
+              if (i + 1 > ntok) json_error("Missing value for --probe-timeout")
+              i++
+              val = tok[i]
+            } else {
+              val = substr(t, 17)
+              if (!eq_qflag[i]) val = strip_opt_quotes(val)
+            }
+            OP_PROBE_TIMEOUT_SEC = parse_dur_value(val, "--probe-timeout")
+            OP_PROBE_TIMEOUT_SET = 1
+            continue
+          }
+          if (t == "--targets" || index(t, "--targets=") == 1) {
+            if (t == "--targets") {
+              if (i + 1 > ntok) json_error("Missing value for --targets")
+              i++
+              val = tok[i]
+            } else {
+              val = substr(t, 11)
+              if (!eq_qflag[i]) val = strip_opt_quotes(val)
+              if (val == "") json_error("Missing value for --targets")
+            }
+            OP_TARGETS_COUNT = parse_targets_csv(val, OP_TARGETS)
+            OP_TARGETS_SET = 1
             continue
           }
           if (substr(t, 1, 2) == "--") {
-            handle_unknown_option(t, rcount)
+            handle_unknown_option(t, OP_RCOUNT)
           }
         }
-        rcount++
-        rtok[rcount] = tok[i]
-        rraw[rcount] = raw_tok[i]
-        rq[rcount] = qflag[i]
+        OP_RCOUNT++
+        rtok[OP_RCOUNT] = tok[i]
+        rraw[OP_RCOUNT] = raw_tok[i]
+        rq[OP_RCOUNT] = qflag[i]
       }
+    }
 
-      has_interval = 0
-      p_start = 1
-      p_end = rcount
+    function parse_run_intervals(rc,    su) {
+      OP_HAS_INTERVAL = 0
+      OP_P_START = 1
+      OP_P_END = rc
 
-      if (rcount >= 2 && rq[1] == 0 && tolower(rtok[1]) == "in") {
-        if (rq[2] == 0) {
-          check_fractional_compact(rtok[2])
-        }
-        if (rcount >= 3 && rq[2] == 0 && rq[3] == 0) {
-          check_fractional_split(rtok[2], rtok[3])
-        }
+      if (rc >= 2 && rq[1] == 0 && tolower(rtok[1]) == "in") {
+        if (rq[2] == 0) check_fractional_compact(rtok[2])
+        if (rc >= 3 && rq[2] == 0 && rq[3] == 0) check_fractional_split(rtok[2], rtok[3])
         if (rq[2] == 0 && parse_compact_dur(rtok[2])) {
-          once = 1
-          has_interval = 1
-          p_start = 3
-        } else if (rcount >= 3 && rq[2] == 0 && rq[3] == 0 && parse_split_dur(rtok[2], rtok[3])) {
-          once = 1
-          has_interval = 1
-          p_start = 4
-        } else if (rcount >= 3 && rq[2] == 0 && (tolower(rtok[2]) == "a" || tolower(rtok[2]) == "an") && rq[3] == 0 && unit_short(strip_comma(rtok[3])) != "") {
+          OP_ONCE = 1; OP_HAS_INTERVAL = 1; OP_P_START = 3
+        } else if (rc >= 3 && rq[2] == 0 && rq[3] == 0 && parse_split_dur(rtok[2], rtok[3])) {
+          OP_ONCE = 1; OP_HAS_INTERVAL = 1; OP_P_START = 4
+        } else if (rc >= 3 && rq[2] == 0 && (tolower(rtok[2]) == "a" || tolower(rtok[2]) == "an") && rq[3] == 0 && unit_short(strip_comma(rtok[3])) != "") {
           su = unit_short(strip_comma(rtok[3]))
-          PARSED_NUM = 1
-          PARSED_UNIT = su
-          PARSED_SEC = unit_mult(su)
-          PARSED_LABEL = "1" su
-          once = 1
-          has_interval = 1
-          p_start = 4
+          PARSED_NUM = 1; PARSED_UNIT = su; PARSED_SEC = unit_mult(su); PARSED_LABEL = "1" su
+          OP_ONCE = 1; OP_HAS_INTERVAL = 1; OP_P_START = 4
         }
-      } else if (rcount >= 2 && rq[1] == 0 && tolower(rtok[1]) == "every") {
-        if (rq[2] == 0) {
-          check_fractional_compact(rtok[2])
-        }
-        if (rcount >= 3 && rq[2] == 0 && rq[3] == 0) {
-          check_fractional_split(rtok[2], rtok[3])
-        }
+      } else if (rc >= 2 && rq[1] == 0 && tolower(rtok[1]) == "every") {
+        if (rq[2] == 0) check_fractional_compact(rtok[2])
+        if (rc >= 3 && rq[2] == 0 && rq[3] == 0) check_fractional_split(rtok[2], rtok[3])
         if (rq[2] == 0 && parse_compact_dur(rtok[2])) {
-          has_interval = 1
-          p_start = 3
-        } else if (rcount >= 3 && rq[2] == 0 && rq[3] == 0 && parse_split_dur(rtok[2], rtok[3])) {
-          has_interval = 1
-          p_start = 4
+          OP_HAS_INTERVAL = 1; OP_P_START = 3
+        } else if (rc >= 3 && rq[2] == 0 && rq[3] == 0 && parse_split_dur(rtok[2], rtok[3])) {
+          OP_HAS_INTERVAL = 1; OP_P_START = 4
         } else if (rq[2] == 0 && unit_short(strip_comma(rtok[2])) != "") {
           su = unit_short(strip_comma(rtok[2]))
-          PARSED_NUM = 1
-          PARSED_UNIT = su
-          PARSED_SEC = unit_mult(su)
-          PARSED_LABEL = "1" su
-          has_interval = 1
-          p_start = 3
+          PARSED_NUM = 1; PARSED_UNIT = su; PARSED_SEC = unit_mult(su); PARSED_LABEL = "1" su
+          OP_HAS_INTERVAL = 1; OP_P_START = 3
         }
-      } else if (rcount >= 1 && rq[1] == 0) {
+      } else if (rc >= 1 && rq[1] == 0) {
         check_fractional_compact(rtok[1])
-        if (rcount >= 2 && rq[2] == 0) {
-          check_fractional_split(rtok[1], rtok[2])
-        }
+        if (rc >= 2 && rq[2] == 0) check_fractional_split(rtok[1], rtok[2])
         if (parse_compact_dur(rtok[1])) {
-          has_interval = 1
-          p_start = 2
-        } else if (rcount >= 2 && rq[2] == 0 && parse_split_dur(rtok[1], rtok[2])) {
-          has_interval = 1
-          p_start = 3
+          OP_HAS_INTERVAL = 1; OP_P_START = 2
+        } else if (rc >= 2 && rq[2] == 0 && parse_split_dur(rtok[1], rtok[2])) {
+          OP_HAS_INTERVAL = 1; OP_P_START = 3
         }
       }
 
-      if (!has_interval) {
-        if (rcount >= 3 && rq[rcount - 2] == 0 && tolower(rtok[rcount - 2]) == "every" && rq[rcount - 1] == 0 && rq[rcount] == 0) {
-          check_fractional_split(rtok[rcount - 1], rtok[rcount])
-          if (parse_split_dur(rtok[rcount - 1], rtok[rcount])) {
-            has_interval = 1
-            p_end = rcount - 3
+      if (!OP_HAS_INTERVAL) {
+        if (rc >= 3 && rq[rc - 2] == 0 && tolower(rtok[rc - 2]) == "every" && rq[rc - 1] == 0 && rq[rc] == 0) {
+          check_fractional_split(rtok[rc - 1], rtok[rc])
+          if (parse_split_dur(rtok[rc - 1], rtok[rc])) {
+            OP_HAS_INTERVAL = 1; OP_P_END = rc - 3
           }
         }
-        if (!has_interval && rcount >= 2 && rq[rcount - 1] == 0 && tolower(rtok[rcount - 1]) == "every" && rq[rcount] == 0) {
-          check_fractional_compact(rtok[rcount])
-          if (parse_compact_dur(rtok[rcount])) {
-            has_interval = 1
-            p_end = rcount - 2
-          } else if (unit_short(strip_comma(rtok[rcount])) != "") {
-            su = unit_short(strip_comma(rtok[rcount]))
-            PARSED_NUM = 1
-            PARSED_UNIT = su
-            PARSED_SEC = unit_mult(su)
-            PARSED_LABEL = "1" su
-            has_interval = 1
-            p_end = rcount - 2
+        if (!OP_HAS_INTERVAL && rc >= 2 && rq[rc - 1] == 0 && tolower(rtok[rc - 1]) == "every" && rq[rc] == 0) {
+          check_fractional_compact(rtok[rc])
+          if (parse_compact_dur(rtok[rc])) {
+            OP_HAS_INTERVAL = 1; OP_P_END = rc - 2
+          } else if (unit_short(strip_comma(rtok[rc])) != "") {
+            su = unit_short(strip_comma(rtok[rc]))
+            PARSED_NUM = 1; PARSED_UNIT = su; PARSED_SEC = unit_mult(su); PARSED_LABEL = "1" su
+            OP_HAS_INTERVAL = 1; OP_P_END = rc - 2
           }
         }
-        if (has_interval && p_end >= p_start && rq[p_end] == 0) {
-          rraw[p_end] = strip_comma(rraw[p_end])
-          rtok[p_end] = strip_comma(rtok[p_end])
+        if (OP_HAS_INTERVAL && OP_P_END >= OP_P_START && rq[OP_P_END] == 0) {
+          rraw[OP_P_END] = strip_comma(rraw[OP_P_END])
+          rtok[OP_P_END] = strip_comma(rtok[OP_P_END])
         }
       }
+    }
 
-      if (once && cron_flag) {
+    function execute_parse(is_single_mode,    i, has_wf_only, effective_engine, pcount, prompt, pacing, max_iterations, task_source, delegate, has_cron, cron_expr, use_cron) {
+      if (ntok >= 1 && qflag[1] == 0 && (tok[1] == "/loop" || tok[1] == "/agy-loop:loop")) {
+        for (i = 1; i < ntok; i++) {
+          tok[i] = tok[i + 1]
+          raw_tok[i] = raw_tok[i + 1]
+          qflag[i] = qflag[i + 1]
+          eq_qflag[i] = eq_qflag[i + 1]
+        }
+        ntok--
+      }
+
+      parse_lifecycle_subcmd()
+      parse_run_flags()
+      parse_run_intervals(OP_RCOUNT)
+
+      if (OP_ONCE && OP_CRON) {
         json_error("Conflicting flags: one-shot mode (--once or in <delay>) cannot be combined with --cron")
       }
-      if (once && max_set && max_val > 1) {
+      if (OP_ONCE && OP_MAX_SET && OP_MAX_VAL > 1) {
         json_error("Conflicting flags: one-shot mode (--once or in <delay>) cannot use --max > 1")
       }
 
-      pcount = (p_end >= p_start) ? (p_end - p_start + 1) : 0
+      has_wf_only = (OP_VERIFY || OP_VERIFIER_MODEL_SET || OP_VERIFY_CMD_SET || OP_VERIFY_TIMEOUT_SET || OP_PROBE_SET || OP_PROBE_TIMEOUT_SET || OP_TARGETS_SET || OP_MAX_TOKENS_SET || OP_MAX_DUR_SET || OP_RESET_EVERY_SET) ? 1 : 0
+      if ((OP_CRON || OP_EXACT || OP_DAEMON) && (OP_ENGINE_ARG == "workflow" || has_wf_only)) {
+        json_error("Conflicting flags: --cron, --exact, and --daemon require --engine schedule (cannot combine with --engine workflow or workflow-only options)")
+      }
+      if (OP_ENGINE_ARG == "schedule" && has_wf_only) {
+        json_error("Conflicting flags: workflow-only options (--verify, --verifier-model, --verify-cmd, --verify-timeout, --probe, --probe-timeout, --targets, --max-tokens, --max-duration, --reset-every) require --engine workflow")
+      }
+      if (OP_RESET_EVERY_SET && !OP_STATEFUL) {
+        json_error("Conflicting flags: --reset-every requires --stateful")
+      }
+      if (OP_PROBE_UNTIL_PASS && !OP_PROBE_SET) {
+        json_error("Conflicting flags: --probe-until-pass requires --probe <cmd>")
+      }
+      if (OP_VERIFY_TIMEOUT_SET && !OP_VERIFY_CMD_SET) {
+        json_error("Conflicting flags: --verify-timeout requires --verify-cmd <cmd>")
+      }
+      if (OP_PROBE_TIMEOUT_SET && !OP_PROBE_SET) {
+        json_error("Conflicting flags: --probe-timeout requires --probe <cmd>")
+      }
+      effective_engine = (OP_ENGINE_ARG == "workflow" || (OP_ENGINE_ARG == "auto" && has_wf_only)) ? "workflow" : "schedule"
+
+      pcount = (OP_P_END >= OP_P_START) ? (OP_P_END - OP_P_START + 1) : 0
       if (pcount == 0) {
         prompt = ""
-      } else if (pcount == 1 && rq[p_start] == 1) {
-        prompt = rtok[p_start]
+      } else if (pcount == 1 && rq[OP_P_START] == 1) {
+        prompt = rtok[OP_P_START]
       } else {
         prompt = ""
-        for (i = p_start; i <= p_end; i++) {
-          if (i > p_start) prompt = prompt " "
+        for (i = OP_P_START; i <= OP_P_END; i++) {
+          if (i > OP_P_START) prompt = prompt " "
           prompt = prompt rraw[i]
         }
       }
       prompt = trim(prompt)
 
-      pacing = has_interval ? "fixed" : "dynamic"
-      max_iterations = max_set ? max_val : (once ? 1 : 20)
+      pacing = OP_HAS_INTERVAL ? "fixed" : "dynamic"
+      max_iterations = OP_MAX_SET ? OP_MAX_VAL : (OP_ONCE ? 1 : 20)
       task_source = (prompt != "") ? "inline" : "loop_md_or_default"
-      delegate = (self_flag || substr(prompt, 1, 1) == "/") ? "self" : "loop-worker"
+      delegate = (OP_SELF || substr(prompt, 1, 1) == "/") ? "self" : "loop-worker"
 
       has_cron = 0
       cron_expr = ""
-      if (has_interval && PARSED_SEC >= 60) {
+      if (OP_HAS_INTERVAL && PARSED_SEC >= 60) {
         if (PARSED_SEC == 60) {
           has_cron = 1
           cron_expr = "* * * * *"
@@ -798,13 +1076,14 @@ run_parse() {
         }
       }
 
-      use_cron = (cron_flag && has_cron && !once) ? 1 : 0
+      use_cron = (OP_CRON && has_cron && !OP_ONCE) ? 1 : 0
 
       printf "{"
       printf "\"action\":\"run\","
+      printf "\"engine\":\"%s\",", effective_engine
       printf "\"pacing\":\"%s\",", pacing
-      printf "\"once\":%s,", json_bool(once)
-      if (has_interval) {
+      printf "\"once\":%s,", json_bool(OP_ONCE)
+      if (OP_HAS_INTERVAL) {
         printf "\"interval_sec\":%d,", PARSED_SEC
         printf "\"interval_label\":\"%s\",", json_escape(PARSED_LABEL)
       } else {
@@ -813,13 +1092,41 @@ run_parse() {
       }
       printf "\"cron_expr\":%s,", json_str_or_null(has_cron, cron_expr)
       printf "\"use_cron\":%s,", json_bool(use_cron)
-      printf "\"exact_timing\":%s,", json_bool(exact_timing)
-      printf "\"is_daemon\":%s,", json_bool(is_daemon)
+      printf "\"exact_timing\":%s,", json_bool(OP_EXACT)
+      printf "\"is_daemon\":%s,", json_bool(OP_DAEMON)
       printf "\"max_iterations\":%d,", max_iterations
-      printf "\"state_mode\":\"%s\",", state_mode
-      printf "\"workspace\":\"%s\",", workspace
-      printf "\"model\":%s,", json_str_or_null(model_set, model_val)
+      printf "\"state_mode\":\"%s\",", OP_STATE_MODE
+      if (OP_RESET_EVERY_SET) {
+        printf "\"reset_every\":%d,", OP_RESET_EVERY_VAL
+      } else {
+        printf "\"reset_every\":null,"
+      }
+      printf "\"workspace\":\"%s\",", OP_WORKSPACE
+      printf "\"model\":%s,", json_str_or_null(OP_MODEL_SET, OP_MODEL_VAL)
       printf "\"delegate\":\"%s\",", delegate
+      printf "\"verify\":%s,", json_bool(OP_VERIFY)
+      printf "\"verifier_model\":%s,", json_str_or_null(OP_VERIFIER_MODEL_SET, OP_VERIFIER_MODEL_VAL)
+      printf "\"verify_cmd\":%s,", json_str_or_null(OP_VERIFY_CMD_SET, OP_VERIFY_CMD_VAL)
+      printf "\"verify_timeout_sec\":%d,", OP_VERIFY_TIMEOUT_SEC
+      printf "\"probe_cmd\":%s,", json_str_or_null(OP_PROBE_SET, OP_PROBE_VAL)
+      printf "\"probe_timeout_sec\":%d,", OP_PROBE_TIMEOUT_SEC
+      printf "\"probe_until_pass\":%s,", json_bool(OP_PROBE_UNTIL_PASS)
+      printf "\"targets\":["
+      for (i = 1; i <= OP_TARGETS_COUNT; i++) {
+        if (i > 1) printf ","
+        printf "\"%s\"", json_escape(OP_TARGETS[i])
+      }
+      printf "],"
+      if (OP_MAX_TOKENS_SET) {
+        printf "\"max_tokens\":%d,", OP_MAX_TOKENS_VAL
+      } else {
+        printf "\"max_tokens\":null,"
+      }
+      if (OP_MAX_DUR_SET) {
+        printf "\"max_duration_sec\":%d,", OP_MAX_DUR_SEC
+      } else {
+        printf "\"max_duration_sec\":null,"
+      }
       printf "\"task_source\":\"%s\",", task_source
       printf "\"prompt\":\"%s\"", json_escape(prompt)
       if (wcount > 0) {
@@ -851,6 +1158,7 @@ run_parse() {
             tok[ntok] = ARGV[i + 1]
             raw_tok[ntok] = ARGV[i + 1]
             qflag[ntok] = 0
+            eq_qflag[ntok] = 0
           }
           execute_parse(0)
         }
@@ -1678,6 +1986,40 @@ write_state_atomic() {
   mv -f "$_wsa_tmp" "$_wsa_dir/state.json"
 }
 
+write_control_stop_atomic() {
+  _wcs_dir="$1"
+  _wcs_mode="$2"
+  _wcs_now="$3"
+  _wcs_tmp="$_wcs_dir/.control.json.tmp.$$"
+  printf '{"stop_requested":true,"mode":"%s","requested_at":"%s"}\n' "$_wcs_mode" "$_wcs_now" > "$_wcs_tmp"
+  mv -f "$_wcs_tmp" "$_wcs_dir/control.json"
+}
+
+write_inbox_message() {
+  _wim_dir="$1"
+  _wim_json="$2"
+  _wim_inbox="$_wim_dir/inbox"
+  mkdir -p "$_wim_inbox"
+  _wim_epoch="$(date +%s 2>/dev/null || true)"
+  case "$_wim_epoch" in
+    [0-9]*) ;;
+    *) _wim_epoch="0" ;;
+  esac
+  _wim_seq=1
+  while :; do
+    _wim_seq_pad="$(printf '%03d' "$_wim_seq")"
+    _wim_dest="$_wim_inbox/${_wim_epoch}000_$$_${_wim_seq_pad}.json"
+    if [ ! -e "$_wim_dest" ]; then
+      break
+    fi
+    _wim_seq=$((_wim_seq + 1))
+  done
+  _wim_tmp="$_wim_inbox/.tmp.$$.${_wim_seq_pad}"
+  printf '%s\n' "$_wim_json" > "$_wim_tmp"
+  mv -f "$_wim_tmp" "$_wim_dest"
+  printf '%s' "$_wim_dest"
+}
+
 run_state_engine() {
   POSIXLY_CORRECT=1 LC_ALL=C awk '
     function init_json_tables(    i, c) {
@@ -1753,9 +2095,35 @@ run_state_engine() {
       return sprintf("%c%c%c%c", b1, b2, b3, b4)
     }
 
-    function json_parse_obj_top(raw, out_type, out_val,    n, i, ch, ntk, tkt, tkv, sval, closed, sc, nx, cp, cp2, j, c2, pos, key, d, lit, ok_root) {
+    function parse_str_array(tkt, tkv, start_pos, end_pos,    p, out, expect_str) {
+      if (tkt[start_pos] != "SYM" || tkv[start_pos] != "[") return ""
+      if (tkt[end_pos] != "SYM" || tkv[end_pos] != "]") return ""
+      if (start_pos + 1 == end_pos) return "[]"
+      out = "["
+      expect_str = 1
+      for (p = start_pos + 1; p < end_pos; p++) {
+        if (expect_str) {
+          if (tkt[p] != "STR") return ""
+          out = out "\"" json_escape(tkv[p]) "\""
+          expect_str = 0
+        } else {
+          if (tkt[p] != "SYM" || tkv[p] != ",") return ""
+          out = out ","
+          expect_str = 1
+        }
+      }
+      if (expect_str) return ""
+      return out "]"
+    }
+
+    function json_parse_obj_top(raw, out_type, out_val, out_raw, out_keys,    n, i, ch, ntk, tkt, tkv, sval, closed, sc, nx, cp, cp2, j, c2, pos, key, d, lit, ok_root, vstart, vend, p, raw_c, sarr, kc, seen_k) {
       split("", out_type)
       split("", out_val)
+      split("", out_raw)
+      split("", out_keys)
+      split("", seen_k)
+      kc = 0
+      out_keys[0] = 0
       n = length(raw)
       i = 1
       ntk = 0
@@ -1860,29 +2228,39 @@ run_state_engine() {
         if (pos > ntk || tkt[pos] != "SYM" || tkv[pos] != ":") return 0
         pos++
         if (pos > ntk) return 0
+        if (!(key in seen_k)) {
+          seen_k[key] = 1
+          out_keys[++kc] = key
+        }
         if (tkt[pos] == "STR") {
           out_type[key] = "str"
           out_val[key] = tkv[pos]
+          out_raw[key] = "\"" json_escape(tkv[pos]) "\""
           pos++
         } else if (tkt[pos] == "LIT") {
           lit = tkv[pos]
           if (lit == "true") {
             out_type[key] = "bool"
             out_val[key] = 1
+            out_raw[key] = "true"
           } else if (lit == "false") {
             out_type[key] = "bool"
             out_val[key] = 0
+            out_raw[key] = "false"
           } else if (lit == "null") {
             out_type[key] = "null"
             out_val[key] = ""
+            out_raw[key] = "null"
           } else if (lit ~ /^-?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$/) {
             out_type[key] = "num"
             out_val[key] = lit + 0
+            out_raw[key] = lit
           } else {
             return 0
           }
           pos++
         } else if (tkt[pos] == "SYM" && (tkv[pos] == "{" || tkv[pos] == "[")) {
+          vstart = pos
           d = 0
           while (pos <= ntk) {
             if (tkt[pos] == "SYM" && (tkv[pos] == "{" || tkv[pos] == "[")) d++
@@ -1896,13 +2274,30 @@ run_state_engine() {
             pos++
           }
           if (d != 0) return 0
-          out_type[key] = "complex"
-          out_val[key] = ""
+          vend = pos - 1
+          raw_c = ""
+          for (p = vstart; p <= vend; p++) {
+            if (tkt[p] == "STR") raw_c = raw_c "\"" json_escape(tkv[p]) "\""
+            else raw_c = raw_c tkv[p]
+          }
+          out_raw[key] = raw_c
+          sarr = ""
+          if (tkv[vstart] == "[") {
+            sarr = parse_str_array(tkt, tkv, vstart, vend)
+          }
+          if (sarr != "") {
+            out_type[key] = "str_array"
+            out_val[key] = sarr
+          } else {
+            out_type[key] = "complex"
+            out_val[key] = ""
+          }
         } else {
           return 0
         }
       }
       if (!ok_root || pos <= ntk) return 0
+      out_keys[0] = kc
       return 1
     }
 
@@ -1918,7 +2313,7 @@ run_state_engine() {
     }
 
     function valid_status(s) {
-      return (s == "running" || s == "done" || s == "blocked" || s == "stopped" || s == "max_reached" || s == "circuit_broken")
+      return (s == "running" || s == "done" || s == "blocked" || s == "stopped" || s == "max_reached" || s == "circuit_broken" || s == "error")
     }
 
     function json_str_val(s) {
@@ -1935,11 +2330,12 @@ run_state_engine() {
       return sprintf("%d", v + 0)
     }
 
-    function format_state_json(st_t, st_v,    out) {
+    function format_state_json(st_t, st_v, ex_keys, ex_raw,    out, i, n_ex, ek) {
       out = "{"
       out = out "\"schema_version\":" sprintf("%d", st_v["schema_version"] + 0)
       out = out ",\"loop_id\":" json_str_val(st_v["loop_id"])
       out = out ",\"status\":" json_str_val(st_v["status"])
+      out = out ",\"engine\":" json_str_val(st_v["engine"])
       out = out ",\"workspace_dir\":" json_str_val(st_v["workspace_dir"])
       out = out ",\"task_source\":" json_str_val(st_v["task_source"])
       out = out ",\"inline_prompt\":" json_str_val(st_v["inline_prompt"])
@@ -1952,11 +2348,24 @@ run_state_engine() {
       out = out ",\"exact_timing\":" (st_v["exact_timing"] ? "true" : "false")
       out = out ",\"is_daemon\":" (st_v["is_daemon"] ? "true" : "false")
       out = out ",\"state_mode\":" json_str_val(st_v["state_mode"])
+      out = out ",\"reset_every\":" json_nullable_int(st_t["reset_every"], st_v["reset_every"])
       out = out ",\"workspace\":" json_str_val(st_v["workspace"])
       out = out ",\"model\":" json_nullable_str(st_t["model"], st_v["model"])
       out = out ",\"delegate\":" json_str_val(st_v["delegate"])
+      out = out ",\"verify\":" (st_v["verify"] ? "true" : "false")
+      out = out ",\"verifier_model\":" json_nullable_str(st_t["verifier_model"], st_v["verifier_model"])
+      out = out ",\"verify_cmd\":" json_nullable_str(st_t["verify_cmd"], st_v["verify_cmd"])
+      out = out ",\"verify_timeout_sec\":" json_nullable_int(st_t["verify_timeout_sec"], st_v["verify_timeout_sec"])
+      out = out ",\"probe_cmd\":" json_nullable_str(st_t["probe_cmd"], st_v["probe_cmd"])
+      out = out ",\"probe_timeout_sec\":" json_nullable_int(st_t["probe_timeout_sec"], st_v["probe_timeout_sec"])
+      out = out ",\"probe_until_pass\":" (st_v["probe_until_pass"] ? "true" : "false")
+      out = out ",\"targets\":" (st_v["targets"] != "" ? st_v["targets"] : "[]")
+      out = out ",\"max_tokens\":" json_nullable_int(st_t["max_tokens"], st_v["max_tokens"])
+      out = out ",\"max_duration_sec\":" json_nullable_int(st_t["max_duration_sec"], st_v["max_duration_sec"])
       out = out ",\"iteration\":" sprintf("%d", st_v["iteration"] + 0)
       out = out ",\"max_iterations\":" sprintf("%d", st_v["max_iterations"] + 0)
+      out = out ",\"in_flight_iteration\":" json_nullable_int(st_t["in_flight_iteration"], st_v["in_flight_iteration"])
+      out = out ",\"in_flight_snapshot_hash\":" json_nullable_str(st_t["in_flight_snapshot_hash"], st_v["in_flight_snapshot_hash"])
       out = out ",\"consecutive_errors\":" sprintf("%d", st_v["consecutive_errors"] + 0)
       out = out ",\"task_id\":" json_nullable_str(st_t["task_id"], st_v["task_id"])
       out = out ",\"worker_id\":" json_nullable_str(st_t["worker_id"], st_v["worker_id"])
@@ -1969,6 +2378,13 @@ run_state_engine() {
       out = out ",\"stop_mode\":" json_nullable_str(st_t["stop_mode"], st_v["stop_mode"])
       out = out ",\"created_at\":" json_str_val(st_v["created_at"])
       out = out ",\"updated_at\":" json_str_val(st_v["updated_at"])
+      n_ex = (0 in ex_keys) ? (ex_keys[0] + 0) : 0
+      for (i = 1; i <= n_ex; i++) {
+        ek = ex_keys[i]
+        if (ek != "" && (ek in ex_raw)) {
+          out = out "," json_str_val(ek) ":" ex_raw[ek]
+        }
+      }
       out = out "}"
       return out
     }
@@ -1976,6 +2392,7 @@ run_state_engine() {
     function format_doctor_summary(st_t, st_v,    out) {
       out = "{"
       out = out "\"loop_id\":" json_str_val(st_v["loop_id"])
+      out = out ",\"engine\":" json_str_val(st_v["engine"])
       out = out ",\"iteration\":" sprintf("%d", st_v["iteration"] + 0)
       out = out ",\"max_iterations\":" sprintf("%d", st_v["max_iterations"] + 0)
       out = out ",\"pacing\":" json_str_val(st_v["pacing"])
@@ -2004,6 +2421,7 @@ run_state_engine() {
       st_t["schema_version"] = "num"; st_v["schema_version"] = 1
       st_t["loop_id"] = "str"; st_v["loop_id"] = ""
       st_t["status"] = "str"; st_v["status"] = "running"
+      st_t["engine"] = "str"; st_v["engine"] = "schedule"
       st_t["workspace_dir"] = "str"; st_v["workspace_dir"] = ""
       st_t["task_source"] = "str"; st_v["task_source"] = "loop_md_or_default"
       st_t["inline_prompt"] = "str"; st_v["inline_prompt"] = ""
@@ -2016,11 +2434,24 @@ run_state_engine() {
       st_t["exact_timing"] = "bool"; st_v["exact_timing"] = 0
       st_t["is_daemon"] = "bool"; st_v["is_daemon"] = 0
       st_t["state_mode"] = "str"; st_v["state_mode"] = "fresh"
+      st_t["reset_every"] = "null"; st_v["reset_every"] = ""
       st_t["workspace"] = "str"; st_v["workspace"] = "inherit"
       st_t["model"] = "null"; st_v["model"] = ""
       st_t["delegate"] = "str"; st_v["delegate"] = "loop-worker"
+      st_t["verify"] = "bool"; st_v["verify"] = 0
+      st_t["verifier_model"] = "null"; st_v["verifier_model"] = ""
+      st_t["verify_cmd"] = "null"; st_v["verify_cmd"] = ""
+      st_t["verify_timeout_sec"] = "null"; st_v["verify_timeout_sec"] = ""
+      st_t["probe_cmd"] = "null"; st_v["probe_cmd"] = ""
+      st_t["probe_timeout_sec"] = "null"; st_v["probe_timeout_sec"] = ""
+      st_t["probe_until_pass"] = "bool"; st_v["probe_until_pass"] = 0
+      st_t["targets"] = "str_array"; st_v["targets"] = "[]"
+      st_t["max_tokens"] = "null"; st_v["max_tokens"] = ""
+      st_t["max_duration_sec"] = "null"; st_v["max_duration_sec"] = ""
       st_t["iteration"] = "num"; st_v["iteration"] = 1
       st_t["max_iterations"] = "num"; st_v["max_iterations"] = 20
+      st_t["in_flight_iteration"] = "null"; st_v["in_flight_iteration"] = ""
+      st_t["in_flight_snapshot_hash"] = "null"; st_v["in_flight_snapshot_hash"] = ""
       st_t["consecutive_errors"] = "num"; st_v["consecutive_errors"] = 0
       st_t["task_id"] = "null"; st_v["task_id"] = ""
       st_t["worker_id"] = "null"; st_v["worker_id"] = ""
@@ -2035,14 +2466,31 @@ run_state_engine() {
       st_t["updated_at"] = "str"; st_v["updated_at"] = ""
     }
 
-    function apply_existing_state(in_t, in_v, st_t, st_v,    k) {
+    function apply_existing_state(in_t, in_v, in_raw, in_keys, st_t, st_v, ex_keys, ex_raw,    idx, nk, k, ec) {
       load_state_defaults(st_t, st_v)
-      for (k in st_t) {
-        if (k in in_t && in_t[k] != "complex") {
-          st_t[k] = in_t[k]
-          st_v[k] = in_v[k]
+      split("", ex_keys)
+      split("", ex_raw)
+      ex_keys[0] = 0
+      ec = 0
+      nk = in_keys[0] + 0
+      for (idx = 1; idx <= nk; idx++) {
+        k = in_keys[idx]
+        if (k in st_t) {
+          if (k == "targets") {
+            if (in_t[k] == "str_array") {
+              st_t[k] = "str_array"
+              st_v[k] = in_v[k]
+            }
+          } else if (in_t[k] != "complex" && in_t[k] != "str_array") {
+            st_t[k] = in_t[k]
+            st_v[k] = in_v[k]
+          }
+        } else {
+          ex_keys[++ec] = k
+          ex_raw[k] = in_raw[k]
         }
       }
+      ex_keys[0] = ec
       if (st_t["loop_id"] != "str" || st_v["loop_id"] == "" || !valid_status(st_v["status"])) {
         return 0
       }
@@ -2056,6 +2504,12 @@ run_state_engine() {
         }
         st_t["status"] = "str"; st_v["status"] = pt_v["status"]
       }
+      if ("engine" in pt_t) {
+        if (pt_t["engine"] != "str" || pt_v["engine"] == "") {
+          json_error("Invalid engine value in JSON patch")
+        }
+        st_t["engine"] = "str"; st_v["engine"] = pt_v["engine"]
+      }
       if ("iteration" in pt_t) {
         if (pt_t["iteration"] != "num" || pt_v["iteration"] < 1 || int(pt_v["iteration"]) != pt_v["iteration"]) {
           json_error("Invalid iteration value in JSON patch")
@@ -2067,6 +2521,39 @@ run_state_engine() {
           json_error("Invalid max_iterations value in JSON patch")
         }
         st_t["max_iterations"] = "num"; st_v["max_iterations"] = int(pt_v["max_iterations"])
+      }
+      if ("in_flight_iteration" in pt_t) {
+        if (pt_t["in_flight_iteration"] == "null") {
+          st_t["in_flight_iteration"] = "null"; st_v["in_flight_iteration"] = ""
+        } else if (pt_t["in_flight_iteration"] == "num" && pt_v["in_flight_iteration"] >= 1 && int(pt_v["in_flight_iteration"]) == pt_v["in_flight_iteration"]) {
+          st_t["in_flight_iteration"] = "num"; st_v["in_flight_iteration"] = int(pt_v["in_flight_iteration"])
+        } else {
+          json_error("Invalid in_flight_iteration in JSON patch")
+        }
+      }
+      if ("in_flight_snapshot_hash" in pt_t) {
+        if (pt_t["in_flight_snapshot_hash"] == "null") {
+          st_t["in_flight_snapshot_hash"] = "null"; st_v["in_flight_snapshot_hash"] = ""
+        } else if (pt_t["in_flight_snapshot_hash"] == "str") {
+          st_t["in_flight_snapshot_hash"] = "str"; st_v["in_flight_snapshot_hash"] = pt_v["in_flight_snapshot_hash"]
+        } else {
+          json_error("Invalid in_flight_snapshot_hash in JSON patch")
+        }
+      }
+      if ("verify_cmd" in pt_t) {
+        if (pt_t["verify_cmd"] == "null") {
+          st_t["verify_cmd"] = "null"; st_v["verify_cmd"] = ""
+        } else if (pt_t["verify_cmd"] == "str") {
+          st_t["verify_cmd"] = "str"; st_v["verify_cmd"] = pt_v["verify_cmd"]
+        } else {
+          json_error("Invalid verify_cmd in JSON patch")
+        }
+      }
+      if ("targets" in pt_t) {
+        if (pt_t["targets"] != "str_array") {
+          json_error("Invalid targets in JSON patch")
+        }
+        st_t["targets"] = "str_array"; st_v["targets"] = pt_v["targets"]
       }
       if ("consecutive_errors" in pt_t) {
         if (pt_t["consecutive_errors"] != "num" || pt_v["consecutive_errors"] < 0 || int(pt_v["consecutive_errors"]) != pt_v["consecutive_errors"]) {
@@ -2191,11 +2678,11 @@ run_state_engine() {
       if (op == "init") {
         req_stdin = (ENVIRON["LP_REQ_STDIN"] == "1") ? 1 : 0
         raw = read_stdin_all()
-        split("", in_t); split("", in_v)
+        split("", in_t); split("", in_v); split("", in_raw); split("", in_keys)
         if (raw ~ /^[ \t\r\n]*$/) {
           if (req_stdin) json_error("Empty stdin JSON for state-init")
         } else {
-          if (!json_parse_obj_top(raw, in_t, in_v)) {
+          if (!json_parse_obj_top(raw, in_t, in_v, in_raw, in_keys)) {
             json_error("Invalid JSON input for state-init")
           }
           if ("error" in in_t) {
@@ -2207,11 +2694,13 @@ run_state_engine() {
         }
 
         load_state_defaults(st_t, st_v)
+        split("", ex_keys); split("", ex_raw); ex_keys[0] = 0
         st_v["loop_id"] = ENVIRON["LP_LOOP_ID"]
         st_v["workspace_dir"] = ENVIRON["LP_WS_DIR"]
         st_v["created_at"] = ENVIRON["LP_NOW"]
         st_v["updated_at"] = ENVIRON["LP_NOW"]
 
+        if ("engine" in in_t && in_t["engine"] == "str" && in_v["engine"] != "") st_v["engine"] = in_v["engine"]
         if ("task_source" in in_t && in_t["task_source"] == "str") st_v["task_source"] = in_v["task_source"]
         if ("inline_prompt" in in_t && in_t["inline_prompt"] == "str") {
           st_v["inline_prompt"] = in_v["inline_prompt"]
@@ -2245,6 +2734,13 @@ run_state_engine() {
         if ("exact_timing" in in_t && in_t["exact_timing"] == "bool") st_v["exact_timing"] = in_v["exact_timing"]
         if ("is_daemon" in in_t && in_t["is_daemon"] == "bool") st_v["is_daemon"] = in_v["is_daemon"]
         if ("state_mode" in in_t && in_t["state_mode"] == "str") st_v["state_mode"] = in_v["state_mode"]
+        if ("reset_every" in in_t) {
+          if (in_t["reset_every"] == "num" && in_v["reset_every"] >= 1) {
+            st_t["reset_every"] = "num"; st_v["reset_every"] = int(in_v["reset_every"])
+          } else if (in_t["reset_every"] == "null") {
+            st_t["reset_every"] = "null"; st_v["reset_every"] = ""
+          }
+        }
         if ("workspace" in in_t && in_t["workspace"] == "str") st_v["workspace"] = in_v["workspace"]
         if ("model" in in_t) {
           if (in_t["model"] == "str") {
@@ -2254,6 +2750,77 @@ run_state_engine() {
           }
         }
         if ("delegate" in in_t && in_t["delegate"] == "str") st_v["delegate"] = in_v["delegate"]
+        if ("verify" in in_t && in_t["verify"] == "bool") st_v["verify"] = in_v["verify"]
+        if ("verifier_model" in in_t) {
+          if (in_t["verifier_model"] == "str") {
+            st_t["verifier_model"] = "str"; st_v["verifier_model"] = in_v["verifier_model"]
+          } else if (in_t["verifier_model"] == "null") {
+            st_t["verifier_model"] = "null"; st_v["verifier_model"] = ""
+          }
+        }
+        if ("verify_cmd" in in_t) {
+          if (in_t["verify_cmd"] == "str") {
+            st_t["verify_cmd"] = "str"; st_v["verify_cmd"] = in_v["verify_cmd"]
+          } else if (in_t["verify_cmd"] == "null") {
+            st_t["verify_cmd"] = "null"; st_v["verify_cmd"] = ""
+          }
+        }
+        if ("verify_timeout_sec" in in_t) {
+          if (in_t["verify_timeout_sec"] == "num" && in_v["verify_timeout_sec"] >= 1) {
+            st_t["verify_timeout_sec"] = "num"; st_v["verify_timeout_sec"] = int(in_v["verify_timeout_sec"])
+          } else if (in_t["verify_timeout_sec"] == "null") {
+            st_t["verify_timeout_sec"] = "null"; st_v["verify_timeout_sec"] = ""
+          }
+        }
+        if ("probe_cmd" in in_t) {
+          if (in_t["probe_cmd"] == "str") {
+            st_t["probe_cmd"] = "str"; st_v["probe_cmd"] = in_v["probe_cmd"]
+          } else if (in_t["probe_cmd"] == "null") {
+            st_t["probe_cmd"] = "null"; st_v["probe_cmd"] = ""
+          }
+        }
+        if ("probe_timeout_sec" in in_t) {
+          if (in_t["probe_timeout_sec"] == "num" && in_v["probe_timeout_sec"] >= 1) {
+            st_t["probe_timeout_sec"] = "num"; st_v["probe_timeout_sec"] = int(in_v["probe_timeout_sec"])
+          } else if (in_t["probe_timeout_sec"] == "null") {
+            st_t["probe_timeout_sec"] = "null"; st_v["probe_timeout_sec"] = ""
+          }
+        }
+        if ("probe_until_pass" in in_t && in_t["probe_until_pass"] == "bool") st_v["probe_until_pass"] = in_v["probe_until_pass"]
+        if ("targets" in in_t) {
+          if (in_t["targets"] != "str_array") {
+            json_error("Invalid targets field in state-init")
+          }
+          st_t["targets"] = "str_array"; st_v["targets"] = in_v["targets"]
+        }
+        if ("max_tokens" in in_t) {
+          if (in_t["max_tokens"] == "num" && in_v["max_tokens"] >= 1) {
+            st_t["max_tokens"] = "num"; st_v["max_tokens"] = int(in_v["max_tokens"])
+          } else if (in_t["max_tokens"] == "null") {
+            st_t["max_tokens"] = "null"; st_v["max_tokens"] = ""
+          }
+        }
+        if ("max_duration_sec" in in_t) {
+          if (in_t["max_duration_sec"] == "num" && in_v["max_duration_sec"] >= 1) {
+            st_t["max_duration_sec"] = "num"; st_v["max_duration_sec"] = int(in_v["max_duration_sec"])
+          } else if (in_t["max_duration_sec"] == "null") {
+            st_t["max_duration_sec"] = "null"; st_v["max_duration_sec"] = ""
+          }
+        }
+        if ("in_flight_iteration" in in_t) {
+          if (in_t["in_flight_iteration"] == "num" && in_v["in_flight_iteration"] >= 1) {
+            st_t["in_flight_iteration"] = "num"; st_v["in_flight_iteration"] = int(in_v["in_flight_iteration"])
+          } else if (in_t["in_flight_iteration"] == "null") {
+            st_t["in_flight_iteration"] = "null"; st_v["in_flight_iteration"] = ""
+          }
+        }
+        if ("in_flight_snapshot_hash" in in_t) {
+          if (in_t["in_flight_snapshot_hash"] == "str") {
+            st_t["in_flight_snapshot_hash"] = "str"; st_v["in_flight_snapshot_hash"] = in_v["in_flight_snapshot_hash"]
+          } else if (in_t["in_flight_snapshot_hash"] == "null") {
+            st_t["in_flight_snapshot_hash"] = "null"; st_v["in_flight_snapshot_hash"] = ""
+          }
+        }
         if ("max_iterations" in in_t && in_t["max_iterations"] == "num" && in_v["max_iterations"] >= 1) {
           st_v["max_iterations"] = int(in_v["max_iterations"])
         } else if (st_v["once"]) {
@@ -2269,7 +2836,7 @@ run_state_engine() {
           st_t["worktree_branch"] = "str"; st_v["worktree_branch"] = in_v["worktree_branch"]
         }
 
-        printf "%s\n", format_state_json(st_t, st_v)
+        printf "%s\n", format_state_json(st_t, st_v, ex_keys, ex_raw)
         printf "%s\n", format_event_json("init", st_t, st_v)
         exit 0
       }
@@ -2277,7 +2844,7 @@ run_state_engine() {
       if (op == "update") {
         sfile = ENVIRON["LP_STATE_FILE"]
         sraw = read_file_raw(sfile)
-        if (sraw == "" || !json_parse_obj_top(sraw, cur_t, cur_v) || !apply_existing_state(cur_t, cur_v, st_t, st_v)) {
+        if (sraw == "" || !json_parse_obj_top(sraw, cur_t, cur_v, cur_raw, cur_keys) || !apply_existing_state(cur_t, cur_v, cur_raw, cur_keys, st_t, st_v, ex_keys, ex_raw)) {
           json_error("Invalid or corrupt state.json for " ENVIRON["LP_LOOP_ID"])
         }
         old_status = st_v["status"]
@@ -2286,7 +2853,7 @@ run_state_engine() {
 
         if (ENVIRON["LP_USE_STDIN"] == "1") {
           praw = read_stdin_all()
-          if (praw ~ /^[ \t\r\n]*$/ || !json_parse_obj_top(praw, pt_t, pt_v)) {
+          if (praw ~ /^[ \t\r\n]*$/ || !json_parse_obj_top(praw, pt_t, pt_v, pt_raw, pt_keys)) {
             json_error("Invalid JSON patch on stdin for state-update")
           }
           apply_patch_fields(pt_t, pt_v, st_t, st_v)
@@ -2378,32 +2945,38 @@ run_state_engine() {
         if (ev_name == "" && (st_v["status"] != old_status || st_v["iteration"] != old_iter)) {
           ev_name = "update"
         }
-        printf "%s\n", format_state_json(st_t, st_v)
+        printf "%s\n", format_state_json(st_t, st_v, ex_keys, ex_raw)
         if (ev_name != "") {
           printf "%s\n", format_event_json(ev_name, st_t, st_v)
         }
         exit 0
       }
 
-      if (op == "list" || op == "doctor_summary") {
-        lmode = ENVIRON["LP_MODE"]
+      if (op == "list" || op == "doctor_summary" || op == "resolve_running_latest") {
+        lmode = (op == "resolve_running_latest") ? "active" : ENVIRON["LP_MODE"]
         rc = 0
         while ((getline fpath) > 0) {
           if (fpath == "") continue
           sraw = read_file_raw(fpath)
-          if (sraw == "" || !json_parse_obj_top(sraw, cur_t, cur_v) || !apply_existing_state(cur_t, cur_v, st_t, st_v)) {
+          if (sraw == "" || !json_parse_obj_top(sraw, cur_t, cur_v, cur_raw, cur_keys) || !apply_existing_state(cur_t, cur_v, cur_raw, cur_keys, st_t, st_v, ex_keys, ex_raw)) {
             continue
           }
           if (lmode != "all" && st_v["status"] != "running") {
             continue
           }
+          if (op == "resolve_running_latest" && st_v["engine"] != "workflow" && st_v["engine"] != "headless") {
+            continue
+          }
           rc++
           rec_upd[rc] = st_v["updated_at"]
           rec_lid[rc] = st_v["loop_id"]
-          if (op == "doctor_summary") {
+          if (op == "resolve_running_latest") {
+            rec_eng[rc] = st_v["engine"]
+            rec_pid[rc] = (("pid" in cur_t) && cur_t["pid"] == "num" && cur_v["pid"] > 0 && int(cur_v["pid"]) == cur_v["pid"]) ? int(cur_v["pid"]) : 0
+          } else if (op == "doctor_summary") {
             rec_json[rc] = format_doctor_summary(st_t, st_v)
-          } else {
-            rec_json[rc] = format_state_json(st_t, st_v)
+          } else if (op == "list") {
+            rec_json[rc] = format_state_json(st_t, st_v, ex_keys, ex_raw)
           }
           order[rc] = rc
         }
@@ -2426,6 +2999,15 @@ run_state_engine() {
           order[j + 1] = cur_idx
         }
 
+        if (op == "resolve_running_latest") {
+          if (rc == 0) {
+            json_error("No active workflow or headless running loops found")
+          }
+          for (i = 1; i <= rc; i++) {
+            printf "%s %s %d\n", rec_lid[order[i]], rec_eng[order[i]], rec_pid[order[i]]
+          }
+          exit 0
+        }
         if (op == "doctor_summary") {
           printf "["
           for (i = 1; i <= rc; i++) {
@@ -2444,10 +3026,26 @@ run_state_engine() {
         exit 0
       }
 
+      if (op == "check_running") {
+        sfile = ENVIRON["LP_STATE_FILE"]
+        sraw = read_file_raw(sfile)
+        if (sraw == "" || !json_parse_obj_top(sraw, cur_t, cur_v, cur_raw, cur_keys) || !apply_existing_state(cur_t, cur_v, cur_raw, cur_keys, st_t, st_v, ex_keys, ex_raw)) {
+          json_error("Invalid or corrupt state.json for " ENVIRON["LP_LOOP_ID"])
+        }
+        if (st_v["status"] != "running") {
+          json_error("Loop " ENVIRON["LP_LOOP_ID"] " is not running (status: " st_v["status"] ")")
+        }
+        if (st_v["engine"] != "workflow" && st_v["engine"] != "headless") {
+          json_error("Loop " ENVIRON["LP_LOOP_ID"] " uses engine \047" st_v["engine"] "\047; schedule loops do not consume inbox/")
+        }
+        printf "%d\n", (("pid" in cur_t) && cur_t["pid"] == "num" && cur_v["pid"] > 0 && int(cur_v["pid"]) == cur_v["pid"]) ? int(cur_v["pid"]) : 0
+        exit 0
+      }
+
       if (op == "stop_one") {
         sfile = ENVIRON["LP_STATE_FILE"]
         sraw = read_file_raw(sfile)
-        if (sraw == "" || !json_parse_obj_top(sraw, cur_t, cur_v) || !apply_existing_state(cur_t, cur_v, st_t, st_v)) {
+        if (sraw == "" || !json_parse_obj_top(sraw, cur_t, cur_v, cur_raw, cur_keys) || !apply_existing_state(cur_t, cur_v, cur_raw, cur_keys, st_t, st_v, ex_keys, ex_raw)) {
           json_error("Invalid or corrupt state.json for " ENVIRON["LP_LOOP_ID"])
         }
         if (st_v["status"] != "running") {
@@ -2464,7 +3062,7 @@ run_state_engine() {
           st_v["stop_mode"] = "immediate"
         }
         st_v["updated_at"] = ENVIRON["LP_NOW"]
-        printf "%s\n", format_state_json(st_t, st_v)
+        printf "%s\n", format_state_json(st_t, st_v, ex_keys, ex_raw)
         printf "%s\n", format_event_json("stop", st_t, st_v)
         exit 0
       }
@@ -2781,6 +3379,14 @@ run_state_stop() {
         if [ -n "$_ss_event_line" ]; then
           printf '%s\n' "$_ss_event_line" >> "$_ss_dir/events.jsonl"
         fi
+        if [ "$_ss_after" -eq 1 ]; then
+          _ss_mode="after_current"
+        else
+          _ss_mode="immediate"
+        fi
+        write_control_stop_atomic "$_ss_dir" "$_ss_mode" "$_ss_now"
+        _ss_inbox_json="$(printf '{"type":"stop","mode":"%s","created_at":"%s"}' "$_ss_mode" "$_ss_now")"
+        write_inbox_message "$_ss_dir" "$_ss_inbox_json" >/dev/null
         _ss_stopped_lines="${_ss_stopped_lines}${_ss_stopped_lines:+
 }${_ss_state_line}"
       fi
@@ -3235,6 +3841,212 @@ run_session_start() {
   '
 }
 
+format_inbox_payload_awk() {
+  POSIXLY_CORRECT=1 LC_ALL=C awk '
+    function init_tables(    i, c) {
+      esc["\""] = "\\\""
+      esc["\\"] = "\\\\"
+      esc["\b"] = "\\b"
+      esc["\f"] = "\\f"
+      esc["\n"] = "\\n"
+      esc["\r"] = "\\r"
+      esc["\t"] = "\\t"
+      for (i = 1; i < 32; i++) {
+        c = sprintf("%c", i)
+        if (!(c in esc)) esc[c] = sprintf("\\u%04x", i)
+      }
+    }
+    function json_escape(s,    i, n, ch, out) {
+      out = ""
+      n = length(s)
+      for (i = 1; i <= n; i++) {
+        ch = substr(s, i, 1)
+        out = out ((ch in esc) ? esc[ch] : ch)
+      }
+      return out
+    }
+    BEGIN {
+      init_tables()
+      use_stdin = (ENVIRON["LP_USE_STDIN"] == "1") ? 1 : 0
+      msg = use_stdin ? "" : ENVIRON["LP_MSG"]
+      first = 1
+    }
+    {
+      if (use_stdin) {
+        msg = first ? $0 : (msg "\n" $0)
+        first = 0
+      }
+    }
+    END {
+      tp = ENVIRON["LP_TYPE"]
+      wk = (ENVIRON["LP_WAKE"] == "1") ? "true" : "false"
+      now = ENVIRON["LP_NOW"]
+      if (tp == "nudge") {
+        if (msg ~ /^[ \t\r\n]*$/) {
+          printf "{\"error\":\"Missing non-empty message for nudge\"}\n"
+          exit 2
+        }
+        printf "{\"type\":\"nudge\",\"message\":\"%s\",\"wake\":%s,\"created_at\":\"%s\"}\n",
+          json_escape(msg), wk, json_escape(now)
+      } else {
+        if (msg !~ /^[ \t\r\n]*$/) {
+          printf "{\"type\":\"wake\",\"reason\":\"%s\",\"created_at\":\"%s\"}\n",
+            json_escape(msg), json_escape(now)
+        } else {
+          printf "{\"type\":\"wake\",\"created_at\":\"%s\"}\n", json_escape(now)
+        }
+      }
+      exit 0
+    }
+  '
+}
+
+run_inbox_push() {
+  if [ "$#" -lt 3 ]; then
+    emit_json_error "Usage: loop-helper.sh inbox-push <workspace_dir> <loop_id|latest> <nudge|wake> [--wake] [--message <msg>|--stdin]"
+  fi
+  _ip_ws="$(normalize_dir "$1")"
+  _ip_target="$2"
+  _ip_type="$3"
+  shift 3
+
+  case "$_ip_type" in
+    nudge|wake) ;;
+    *)
+      emit_json_error "Invalid inbox-push type: $_ip_type (expected nudge or wake)"
+      ;;
+  esac
+
+  _ip_wake=0
+  _ip_stdin=0
+  _ip_msg_set=0
+  _ip_msg=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --wake)
+        _ip_wake=1
+        ;;
+      --stdin)
+        _ip_stdin=1
+        ;;
+      --message)
+        if [ "$#" -lt 2 ]; then
+          emit_json_error "Missing value for --message"
+        fi
+        _ip_msg="$2"
+        _ip_msg_set=1
+        shift
+        ;;
+      --message=*)
+        _ip_msg="${1#--message=}"
+        _ip_msg_set=1
+        ;;
+      *)
+        emit_json_error "Unknown argument for inbox-push: $1"
+        ;;
+    esac
+    shift
+  done
+
+  if [ "$_ip_stdin" -eq 1 ] && [ "$_ip_msg_set" -eq 1 ]; then
+    emit_json_error "Cannot combine --message with --stdin in inbox-push"
+  fi
+
+  _ip_now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  _ip_payload_rc=0
+  if [ "$_ip_stdin" -eq 1 ]; then
+    _ip_payload="$(LP_TYPE="$_ip_type" LP_WAKE="$_ip_wake" LP_NOW="$_ip_now" LP_USE_STDIN="1" format_inbox_payload_awk)" || _ip_payload_rc=$?
+  else
+    _ip_payload="$(LP_TYPE="$_ip_type" LP_WAKE="$_ip_wake" LP_NOW="$_ip_now" LP_USE_STDIN="0" LP_MSG="$_ip_msg" format_inbox_payload_awk </dev/null)" || _ip_payload_rc=$?
+  fi
+  if [ "$_ip_payload_rc" -ne 0 ]; then
+    if [ -n "$_ip_payload" ]; then
+      printf '%s\n' "$_ip_payload"
+    fi
+    exit "$_ip_payload_rc"
+  fi
+
+  _ip_root="$(resolve_state_root "$_ip_ws")"
+  _ip_lid=""
+  if [ "$_ip_target" = "latest" ]; then
+    _ip_res_rc=0
+    _ip_cands="$(collect_loop_state_files "$_ip_root" | LP_OP="resolve_running_latest" run_state_engine)" || _ip_res_rc=$?
+    if [ "$_ip_res_rc" -ne 0 ]; then
+      if [ -n "$_ip_cands" ]; then
+        printf '%s\n' "$_ip_cands"
+      fi
+      exit "$_ip_res_rc"
+    fi
+    while read -r _cand_lid _cand_eng _cand_pid; do
+      [ -n "$_cand_lid" ] || continue
+      case "$_cand_pid" in
+        [1-9]*)
+          if ! kill -0 "$_cand_pid" 2>/dev/null; then
+            continue
+          fi
+          ;;
+        *)
+          if [ "$_cand_eng" != "workflow" ]; then
+            continue
+          fi
+          ;;
+      esac
+      _ip_lid="$_cand_lid"
+      break
+    done <<EOF
+$_ip_cands
+EOF
+    if [ -z "$_ip_lid" ]; then
+      emit_json_error "No active workflow or headless running loops found"
+    fi
+  else
+    if ! validate_loop_id "$_ip_target"; then
+      emit_json_error "Invalid loop_id: $_ip_target"
+    fi
+    _ip_sf="$_ip_root/loops/$_ip_target/state.json"
+    if [ ! -f "$_ip_sf" ]; then
+      emit_json_error "Loop state not found: $_ip_target"
+    fi
+    _ip_chk_rc=0
+    _ip_chk_out="$(LP_OP="check_running" LP_STATE_FILE="$_ip_sf" LP_LOOP_ID="$_ip_target" run_state_engine </dev/null)" || _ip_chk_rc=$?
+    if [ "$_ip_chk_rc" -ne 0 ]; then
+      if [ -n "$_ip_chk_out" ]; then
+        printf '%s\n' "$_ip_chk_out"
+      fi
+      exit "$_ip_chk_rc"
+    fi
+    case "$_ip_chk_out" in
+      [1-9]*)
+        if ! kill -0 "$_ip_chk_out" 2>/dev/null; then
+          emit_json_error "Loop $_ip_target is stale (pid=$_ip_chk_out is not alive); cannot $_ip_type a dead process"
+        fi
+        ;;
+    esac
+    _ip_lid="$_ip_target"
+  fi
+
+  _ip_file="$(write_inbox_message "$_ip_root/loops/$_ip_lid" "$_ip_payload")"
+  LP_IP_LID="$_ip_lid" LP_IP_TYPE="$_ip_type" LP_IP_FILE="$_ip_file" POSIXLY_CORRECT=1 LC_ALL=C awk '
+    function init_tables(    i, c) {
+      esc["\""] = "\\\""; esc["\\"] = "\\\\"; esc["\b"] = "\\b"; esc["\f"] = "\\f"; esc["\n"] = "\\n"; esc["\r"] = "\\r"; esc["\t"] = "\\t"
+      for (i = 1; i < 32; i++) { c = sprintf("%c", i); if (!(c in esc)) esc[c] = sprintf("\\u%04x", i) }
+    }
+    function json_escape(s,    i, n, ch, out) {
+      out = ""; n = length(s)
+      for (i = 1; i <= n; i++) { ch = substr(s, i, 1); out = out ((ch in esc) ? esc[ch] : ch) }
+      return out
+    }
+    BEGIN {
+      init_tables()
+      printf "{\"ok\":true,\"loop_id\":\"%s\",\"type\":\"%s\",\"file\":\"%s\"}\n",
+        json_escape(ENVIRON["LP_IP_LID"]),
+        json_escape(ENVIRON["LP_IP_TYPE"]),
+        json_escape(ENVIRON["LP_IP_FILE"])
+      exit 0
+    }
+  '
+}
+
 case "$SUBCMD" in
   parse)
     run_parse "$@"
@@ -3266,8 +4078,11 @@ case "$SUBCMD" in
   state-stop)
     run_state_stop "$@"
     ;;
+  inbox-push)
+    run_inbox_push "$@"
+    ;;
   help|--help|-h|"")
-    printf '%s\n' '{"usage":"loop-helper.sh <parse|resolve-task|doctor|clean-shadow|session-start|state-init|state-read|state-update|state-list|state-stop> [args...]"}'
+    printf '%s\n' '{"usage":"loop-helper.sh <parse|resolve-task|doctor|clean-shadow|session-start|state-init|state-read|state-update|state-list|state-stop|inbox-push> [args...]"}'
     exit 0
     ;;
   *)

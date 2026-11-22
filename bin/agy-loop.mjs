@@ -8,10 +8,13 @@ import { fileURLToPath } from "node:url";
 
 import {
   handleLogs,
+  handleNudge,
   handlePs,
+  handleResume,
   handleRun,
   handleStatusline,
   handleStop,
+  handleWake,
 } from "../lib/cli-commands.mjs";
 import { listLoops, resolveStateRoot } from "../lib/state-store.mjs";
 
@@ -22,9 +25,9 @@ const PLUGIN_ROOT = path.resolve(__dirname, "..");
 function readPluginVersion() {
   try {
     const raw = fs.readFileSync(path.join(PLUGIN_ROOT, "package.json"), "utf8");
-    return JSON.parse(raw).version || "1.2.0";
+    return JSON.parse(raw).version || "1.3.0";
   } catch {
-    return "1.2.0";
+    return "1.3.0";
   }
 }
 
@@ -871,17 +874,16 @@ function runHookSelfTest(homeDir, workspaceDir) {
   };
 }
 
-function inspectAgentTools(pluginEntry) {
-  let agentPath = path.join(PLUGIN_ROOT, "agents", "loop-worker.md");
-  if (pluginEntry?.path) {
-    const installedAgentPath = path.join(pluginEntry.path, "agents", "loop-worker.md");
-    try {
-      fs.accessSync(installedAgentPath, fs.constants.R_OK);
-      agentPath = installedAgentPath;
-    } catch {
-      // Fall back to bundled PLUGIN_ROOT when installed plugin path is not readable.
-    }
-  }
+const READ_ONLY_DISALLOWED_TOOLS = new Set([
+  "write_to_file",
+  "replace_file_content",
+]);
+
+function inspectAgentTools(pluginEntry, agentFilename = "loop-worker.md", { readOnly = false } = {}) {
+  const useInstalledDir = Boolean(pluginEntry?.path && lstatExists(pluginEntry.path));
+  const agentPath = useInstalledDir
+    ? path.join(pluginEntry.path, "agents", agentFilename)
+    : path.join(PLUGIN_ROOT, "agents", agentFilename);
 
   let raw;
   try {
@@ -893,6 +895,7 @@ function inspectAgentTools(pluginEntry) {
       model: null,
       tools: [],
       invalidTools: [],
+      ...(readOnly ? { writeTools: [] } : {}),
       error: `Failed to read ${agentPath}: ${err.message}`,
     };
   }
@@ -905,6 +908,7 @@ function inspectAgentTools(pluginEntry) {
       model: null,
       tools: [],
       invalidTools: [],
+      ...(readOnly ? { writeTools: [] } : {}),
       error: `Missing YAML frontmatter in ${agentPath}`,
     };
   }
@@ -967,6 +971,9 @@ function inspectAgentTools(pluginEntry) {
   const invalidTools = tools.filter(
     (t) => BROKEN_ONEHARNESS_TOOLS.has(t) || !VERIFIED_DUAL_ENGINE_TOOLS.has(t)
   );
+  const writeTools = readOnly
+    ? tools.filter((t) => READ_ONLY_DISALLOWED_TOOLS.has(t))
+    : [];
   const errors = [];
   if (!model || !VALID_WORKER_MODELS.has(model)) {
     errors.push(
@@ -978,6 +985,9 @@ function inspectAgentTools(pluginEntry) {
   } else if (invalidTools.length > 0) {
     errors.push(`Incompatible or unverified tool(s): ${invalidTools.join(", ")}`);
   }
+  if (readOnly && writeTools.length > 0) {
+    errors.push(`Read-only verifier must not declare write tool(s): ${writeTools.join(", ")}`);
+  }
 
   return {
     ok: errors.length === 0,
@@ -985,6 +995,88 @@ function inspectAgentTools(pluginEntry) {
     model,
     tools,
     invalidTools,
+    ...(readOnly ? { writeTools } : {}),
+    error: errors.length > 0 ? errors.join("; ") : null,
+  };
+}
+
+function collectMarkdownFiles(dirPath, rootDir = dirPath, acc = []) {
+  let entries;
+  try {
+    entries = fs.readdirSync(dirPath, { withFileTypes: true });
+  } catch {
+    return acc;
+  }
+  for (const entry of entries) {
+    const full = path.join(dirPath, entry.name);
+    if (entry.isDirectory()) {
+      collectMarkdownFiles(full, rootDir, acc);
+    } else if (entry.name.toLowerCase().endsWith(".md")) {
+      acc.push(path.relative(rootDir, full));
+    }
+  }
+  return acc;
+}
+
+function inspectWorkflowBundle(pluginEntry) {
+  const useInstalledDir = Boolean(pluginEntry?.path && lstatExists(pluginEntry.path));
+  const baseDir = useInstalledDir ? pluginEntry.path : PLUGIN_ROOT;
+
+  const workflowsDir = path.join(baseDir, "workflows");
+  const bundleDir = path.join(workflowsDir, "loop-runner");
+  const manifestPath = path.join(bundleDir, "workflow.json");
+  const defaultEntryPath = path.join(bundleDir, "workflow.py");
+  const mdFiles = collectMarkdownFiles(workflowsDir);
+  const errors = [];
+
+  if (mdFiles.length > 0) {
+    errors.push(`Forbidden .md file(s) inside workflows/: ${mdFiles.join(", ")}`);
+  }
+
+  let manifest = null;
+  if (!lstatExists(manifestPath)) {
+    errors.push(`Missing workflow manifest at ${manifestPath}`);
+  } else {
+    try {
+      manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+      if (!isPlainObject(manifest)) {
+        errors.push("workflow.json must be a JSON object");
+      } else {
+        if (typeof manifest.entry !== "string" || !manifest.entry.trim()) {
+          errors.push('workflow.json missing non-empty "entry" field');
+        } else {
+          const resolvedEntry = path.resolve(bundleDir, manifest.entry);
+          const relEntry = path.relative(bundleDir, resolvedEntry);
+          if (relEntry.startsWith("..") || path.isAbsolute(relEntry)) {
+            errors.push(`workflow.json entry escapes bundle dir: ${manifest.entry}`);
+          } else if (!lstatExists(resolvedEntry)) {
+            errors.push(`workflow.json entry does not exist: ${resolvedEntry}`);
+          }
+        }
+        if (!isPlainObject(manifest.args) || manifest.args.type !== "object") {
+          errors.push('workflow.json "args" must be a JSON Schema object with type: "object"');
+        }
+      }
+    } catch (err) {
+      errors.push(`Failed to parse workflow.json: ${err.message}`);
+    }
+  }
+
+  if (!lstatExists(defaultEntryPath)) {
+    errors.push(`Missing workflow entrypoint at ${defaultEntryPath}`);
+  }
+
+  const entryPath =
+    manifest && typeof manifest.entry === "string" && manifest.entry.trim()
+      ? path.resolve(bundleDir, manifest.entry)
+      : defaultEntryPath;
+
+  return {
+    ok: errors.length === 0,
+    dir: bundleDir,
+    manifestPath,
+    entryPath,
+    mdFiles,
     error: errors.length > 0 ? errors.join("; ") : null,
   };
 }
@@ -1022,11 +1114,14 @@ Plugin Commands:
   help                Show this help message
 
 Headless Runner Commands:
-  run [interval] [prompt...]   Run a non-interactive headless loop (run 'agy-loop run --help' for options)
-  ps, list                     List active loops (supports --all, --global, --json)
-  logs [<id|prefix|latest>]    View or follow (-f) loop event logs
-  stop <id|prefix|all>         Stop running interactive or headless loops (--after-current, --all)
-  statusline                   Emit compact single-line status for statusLine/HUD (<5ms, zero subprocesses)
+  run [interval] [prompt...]      Run a non-interactive headless loop (run 'agy-loop run --help' for options)
+  resume <id|prefix|latest>       Resume an eligible stopped, max_reached, blocked, error, or stale loop
+  nudge <id|prefix|latest> <msg>  Queue live steering instructions for the next iteration (--wake)
+  wake <id|prefix|latest>         Interrupt inter-iteration sleep early for an active loop
+  ps, list                        List active loops (supports --all, --global, --json)
+  logs [<id|prefix|latest>]       View or follow (-f) loop event logs
+  stop <id|prefix|all>            Stop running interactive, workflow, or headless loops (--after-current, --all)
+  statusline                      Emit compact single-line status for statusLine/HUD (<5ms, zero subprocesses)
 
 Options (Plugin Commands):
   --clean-shadow      Move shadowing user-level loop files into a timestamped backup
@@ -1039,7 +1134,9 @@ Examples:
   npx agy-loop install --clean-shadow
   npx agy-loop doctor --json
   agy-loop run --once --model gemini-4-carbon-low "Check tests and fix failures"
-  agy-loop run 2m --stateful --verifier-model gemini-4-neon-xhigh
+  agy-loop run 2m --stateful --verify-cmd "npm test" --verifier-model gemini-4-neon-xhigh
+  agy-loop nudge latest "Focus on auth tests" --wake
+  agy-loop resume latest --max 25
   agy-loop ps --all
   agy-loop logs latest -f
   agy-loop stop all
@@ -1373,7 +1470,11 @@ function handleDoctor({ cleanShadow = false, json, version }) {
   const loopMd = inspectLoopMd(workspaceDir, homeDir);
   const { environment, environmentWarnings } = inspectEnvironment(workspaceDir, homeDir);
   const hookSelfTest = runHookSelfTest(homeDir, workspaceDir);
-  const agentToolsCheck = inspectAgentTools(pluginEntry);
+  const agentToolsCheck = inspectAgentTools(pluginEntry, "loop-worker.md");
+  const verifierToolsCheck = inspectAgentTools(pluginEntry, "loop-verifier.md", {
+    readOnly: true,
+  });
+  const workflowBundleCheck = inspectWorkflowBundle(pluginEntry);
   const activeLoops = inspectActiveLoops(workspaceDir);
 
   const pluginInstalled = Boolean(pluginEntry);
@@ -1386,7 +1487,9 @@ function handleDoctor({ cleanShadow = false, json, version }) {
     skillFilterWarnings.length === 0 &&
     !environment.adminSettings.pluginsDisabled &&
     hookSelfTest.ok &&
-    agentToolsCheck.ok;
+    agentToolsCheck.ok &&
+    verifierToolsCheck.ok &&
+    workflowBundleCheck.ok;
 
   const report = {
     ok,
@@ -1412,6 +1515,8 @@ function handleDoctor({ cleanShadow = false, json, version }) {
     environmentWarnings,
     hookSelfTest,
     agentToolsCheck,
+    verifierToolsCheck,
+    workflowBundleCheck,
     activeLoops,
     loopMd: {
       active: loopMd.active,
@@ -1508,6 +1613,20 @@ function handleDoctor({ cleanShadow = false, json, version }) {
     process.stdout.write(`  loop-worker:    FAILED (${agentToolsCheck.error})\n`);
   }
 
+  if (verifierToolsCheck.ok) {
+    process.stdout.write(
+      `  loop-verifier:  ok (model=${verifierToolsCheck.model}, ${verifierToolsCheck.tools.length} read-only tools)\n`
+    );
+  } else {
+    process.stdout.write(`  loop-verifier:  FAILED (${verifierToolsCheck.error})\n`);
+  }
+
+  if (workflowBundleCheck.ok) {
+    process.stdout.write(`  workflow:       ok (workflows/loop-runner)\n`);
+  } else {
+    process.stdout.write(`  workflow:       FAILED (${workflowBundleCheck.error})\n`);
+  }
+
   if (environmentWarnings.length === 0) {
     process.stdout.write(`  environment:    ok\n`);
   } else {
@@ -1549,6 +1668,18 @@ async function main() {
 
   if (subcommand === "run") {
     await handleRun(rawArgv.slice(1), { version });
+    return;
+  }
+  if (subcommand === "resume") {
+    await handleResume(rawArgv.slice(1), { version });
+    return;
+  }
+  if (subcommand === "nudge") {
+    await handleNudge(rawArgv.slice(1));
+    return;
+  }
+  if (subcommand === "wake") {
+    await handleWake(rawArgv.slice(1));
     return;
   }
   if (subcommand === "ps" || subcommand === "list") {

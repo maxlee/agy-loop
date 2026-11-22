@@ -1,0 +1,224 @@
+{
+  "name": "loop-runner",
+  "description": "Dynamic non-blocking agy-loop workflow runner with pre-iteration probes, two-stage turn-stopping verification, parallel target execution, stateful session rotation, inbox control, and strict budget enforcement.",
+  "entry": "workflow.py",
+  "args": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "workspace_dir"
+    ],
+    "properties": {
+      "loop_id": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "pattern": "^lp_[A-Za-z0-9_-]{4,64}$",
+        "description": "Optional pre-allocated loop ID (lp_YYYYMMDDTHHMMSSZ_<4hex>). Generated automatically if omitted."
+      },
+      "workspace_dir": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Absolute or resolved path to the target workspace root directory."
+      },
+      "task_source": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "enum": [
+          "inline",
+          "loop_md_or_default",
+          null
+        ],
+        "description": "Task origin: 'inline' prompt or 'loop_md_or_default' live-reloaded loop.md / builtin fallback."
+      },
+      "prompt": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "Inline task prompt when task_source is 'inline'."
+      },
+      "pacing": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "enum": [
+          "dynamic",
+          "fixed",
+          null
+        ],
+        "description": "Pacing mode: 'dynamic' self-paced delay or 'fixed' interval_sec."
+      },
+      "once": {
+        "type": "boolean",
+        "description": "Run a single iteration (or delayed one-shot when interval_sec > 0) and exit."
+      },
+      "interval_sec": {
+        "type": [
+          "integer",
+          "null"
+        ],
+        "minimum": 1,
+        "description": "Fixed inter-iteration sleep interval in seconds (or initial delay when once is true)."
+      },
+      "max_iterations": {
+        "type": [
+          "integer",
+          "null"
+        ],
+        "minimum": 1,
+        "description": "Maximum number of loop iterations before stopping with max_reached (default 20, or 1 when once is true)."
+      },
+      "state_mode": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "enum": [
+          "fresh",
+          "stateful",
+          null
+        ],
+        "description": "Worker context mode: 'fresh' per iteration or 'stateful' persistent conversation."
+      },
+      "reset_every": {
+        "type": [
+          "integer",
+          "null"
+        ],
+        "minimum": 1,
+        "description": "Rotate stateful worker session every N iterations (state_mode='stateful')."
+      },
+      "workspace": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "enum": [
+          "inherit",
+          "branch",
+          "share",
+          null
+        ],
+        "description": "Agent workspace isolation mode passed to workflow agent() calls."
+      },
+      "model": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "Worker model tier or slug (e.g. inherit, flash_lite, flash, pro)."
+      },
+      "delegate": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "Worker agent type_name (default 'loop-worker', or 'self')."
+      },
+      "verify": {
+        "type": "boolean",
+        "description": "Enable Stage 2 independent read-only loop-verifier gate whenever worker reports DONE."
+      },
+      "verifier_model": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "Model tier or slug for Stage 2 loop-verifier (default 'pro')."
+      },
+      "verify_cmd": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "Explicit Stage 1 deterministic shell command run when worker reports DONE (0 LLM tokens)."
+      },
+      "verify_timeout_sec": {
+        "type": [
+          "number",
+          "null"
+        ],
+        "exclusiveMinimum": 0,
+        "description": "Timeout in seconds for Stage 1 verify_cmd (default 60)."
+      },
+      "probe_cmd": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "Explicit shell pre-check command executed before each iteration."
+      },
+      "probe_timeout_sec": {
+        "type": [
+          "number",
+          "null"
+        ],
+        "exclusiveMinimum": 0,
+        "description": "Timeout in seconds for probe_cmd (default 60)."
+      },
+      "probe_until_pass": {
+        "type": "boolean",
+        "description": "Exit DONE with 0 LLM tokens as soon as probe_cmd exits 0."
+      },
+      "targets": {
+        "type": [
+          "array",
+          "null"
+        ],
+        "items": {
+          "type": "string",
+          "minLength": 1
+        },
+        "description": "Optional list of targets executed concurrently per iteration via parallel()."
+      },
+      "max_tokens": {
+        "type": [
+          "integer",
+          "null"
+        ],
+        "minimum": 1,
+        "description": "Hard cumulative token budget across the workflow."
+      },
+      "max_duration_sec": {
+        "type": [
+          "number",
+          "null"
+        ],
+        "exclusiveMinimum": 0,
+        "description": "Hard wall-clock budget in seconds across the workflow."
+      },
+      "max_agents": {
+        "type": [
+          "integer",
+          "null"
+        ],
+        "minimum": 1,
+        "description": "Hard budget on total workflow agent instances spawned."
+      },
+      "max_errors": {
+        "type": [
+          "integer",
+          "null"
+        ],
+        "minimum": 1,
+        "description": "Consecutive error circuit-breaker threshold (default 3)."
+      },
+      "include_trajectory": {
+        "type": "boolean",
+        "description": "Fetch bounded prior run_command trajectory context once at workflow startup."
+      },
+      "state_dir": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "Optional override for loop state root directory (defaults to AGY_LOOP_STATE_DIR or <workspace_dir>/.agents/.agy-loop)."
+      }
+    }
+  }
+}

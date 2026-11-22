@@ -52,7 +52,7 @@ test(
     assert.equal(report.name, "agy-loop");
     assert.deepEqual(report.findings, []);
     assert.ok(report.components.skills >= 1, "Expected components.skills >= 1");
-    assert.ok(report.components.agents >= 1, "Expected components.agents >= 1");
+    assert.equal(report.components.agents, 2, "Expected components.agents === 2 (loop-worker + loop-verifier)");
     assert.equal(report.components.hooks, 1, "Expected components.hooks === 1");
   }
 );
@@ -103,12 +103,17 @@ test(
     );
     assert.ok(entry, "Expected agy-loop in isolated agy plugin list --json");
     assert.equal(entry.enabled, true);
-    assert.equal(entry.version, "1.2.0");
+    assert.equal(entry.version, "1.3.0");
     assert.ok(Array.isArray(entry.skills) && entry.skills.includes("loop"));
-    assert.ok(Array.isArray(entry.agents) && entry.agents.includes("loop-worker"));
+    assert.ok(
+      Array.isArray(entry.agents) &&
+        entry.agents.includes("loop-worker") &&
+        entry.agents.includes("loop-verifier"),
+      `Expected both loop-worker and loop-verifier in entry.agents, got ${JSON.stringify(entry.agents)}`
+    );
     assert.ok(Array.isArray(entry.hooks) && entry.hooks.includes("agy-loop-shadow-check"));
 
-    // 3. Verify node bin/agy-loop.mjs doctor --json passes all v1.2 diagnostics
+    // 3. Verify node bin/agy-loop.mjs doctor --json passes all v1.3 diagnostics
     const docRes = spawnSync(
       process.execPath,
       [path.join(REPO_ROOT, "bin", "agy-loop.mjs"), "doctor", "--json"],
@@ -124,8 +129,10 @@ test(
     assert.equal(doc.ok, true);
     assert.equal(doc.hookSelfTest?.ok, true);
     assert.equal(doc.agentToolsCheck?.ok, true);
+    assert.equal(doc.verifierToolsCheck?.ok, true);
+    assert.equal(doc.workflowBundleCheck?.ok, true);
     assert.equal(doc.plugin?.installed, true);
-    assert.equal(doc.plugin?.version, "1.2.0");
+    assert.equal(doc.plugin?.version, "1.3.0");
 
     // 4. Verify agy --output-format json models exits 0 with valid JSON (uses authenticated user HOME with ANTIGRAVITY_* stripped)
     const modelsRes = spawnSync("agy", ["--output-format", "json", "models"], {
@@ -362,3 +369,150 @@ test(
     assert.equal(statuslineRes.stdout, "");
   }
 );
+
+test(
+  "live: v1.3 'agy-loop run --once --verify-cmd \"true\"' and 'agy-loop resume' end-to-end against live agy",
+  { skip: skipReason },
+  (t) => {
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "agy-loop-live-v13-"));
+    const tmpWs = path.join(tmpRoot, "ws");
+    const tmpStateDir = path.join(tmpRoot, "state");
+    fs.mkdirSync(tmpWs, { recursive: true });
+    t.after(() => {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    });
+
+    const liveEnv = {
+      ...buildCleanAgyEnv(),
+      AGY_LOOP_STATE_DIR: tmpStateDir,
+    };
+    const cliPath = path.join(REPO_ROOT, "bin", "agy-loop.mjs");
+
+    // 1. Real --once --verify-cmd "true"
+    const verifyRunRes = spawnSync(
+      process.execPath,
+      [
+        cliPath,
+        "run",
+        "--once",
+        "--verify-cmd",
+        "true",
+        "--model",
+        "gemini-4-carbon-low",
+        "--turn-timeout",
+        "60s",
+        "--json",
+        "Do not edit files or run tools. Immediately finish with iteration 1, loop_status DONE, next_delay_sec 0, summary 'Live verify-cmd ok', next_hint 'None'.",
+      ],
+      {
+        cwd: tmpWs,
+        env: liveEnv,
+        encoding: "utf8",
+        timeout: 120000,
+      }
+    );
+    assert.equal(
+      verifyRunRes.status,
+      0,
+      `agy-loop run --once --verify-cmd failed (exit=${verifyRunRes.status}):\nstdout: ${verifyRunRes.stdout}\nstderr: ${verifyRunRes.stderr}`
+    );
+    const verifyPayload = JSON.parse(verifyRunRes.stdout);
+    assert.equal(verifyPayload.ok, true);
+    assert.equal(verifyPayload.status, "done");
+    const verifyEvents = fs
+      .readFileSync(path.join(tmpStateDir, "loops", verifyPayload.loop_id, "events.jsonl"), "utf8")
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => JSON.parse(l));
+    assert.ok(
+      verifyEvents.some((e) => e.event === "verify_cmd" && e.cmd === "true" && e.passed === true),
+      "Expected verify_cmd pass event in live events.jsonl"
+    );
+
+    // 2. Real --stateful --max 1 (exits 4 max_reached) -> agy-loop resume --max 2 (exits 0 done)
+    const firstRunRes = spawnSync(
+      process.execPath,
+      [
+        cliPath,
+        "run",
+        "1s",
+        "--stateful",
+        "--max",
+        "1",
+        "--model",
+        "gemini-4-carbon-low",
+        "--turn-timeout",
+        "60s",
+        "--json",
+        "Do not edit files or run tools. On iteration 1 return loop_status CONTINUE with next_delay_sec 1; on iteration 2 return loop_status DONE with next_delay_sec 0.",
+      ],
+      {
+        cwd: tmpWs,
+        env: liveEnv,
+        encoding: "utf8",
+        timeout: 120000,
+      }
+    );
+    assert.equal(
+      firstRunRes.status,
+      4,
+      `Expected exit 4 max_reached on --max 1, got ${firstRunRes.status}:\nstdout: ${firstRunRes.stdout}\nstderr: ${firstRunRes.stderr}`
+    );
+    const firstPayload = JSON.parse(firstRunRes.stdout);
+    assert.equal(firstPayload.status, "max_reached");
+    assert.equal(firstPayload.exit_reason, "max_iterations");
+
+    // Resume without bumping --max must fail Exit 2
+    const rejectResumeRes = spawnSync(
+      process.execPath,
+      [cliPath, "resume", firstPayload.loop_id, "--json"],
+      {
+        cwd: tmpWs,
+        env: liveEnv,
+        encoding: "utf8",
+        timeout: 15000,
+      }
+    );
+    assert.equal(rejectResumeRes.status, 2);
+
+    // Resume with --max 2 completes cleanly as done
+    const resumeRes = spawnSync(
+      process.execPath,
+      [cliPath, "resume", firstPayload.loop_id, "--max", "2", "--json"],
+      {
+        cwd: tmpWs,
+        env: liveEnv,
+        encoding: "utf8",
+        timeout: 120000,
+      }
+    );
+    assert.equal(
+      resumeRes.status,
+      0,
+      `agy-loop resume --max 2 failed (exit=${resumeRes.status}):\nstdout: ${resumeRes.stdout}\nstderr: ${resumeRes.stderr}`
+    );
+    const resumePayload = JSON.parse(resumeRes.stdout);
+    assert.equal(resumePayload.ok, true);
+    assert.equal(resumePayload.status, "done");
+    assert.equal(resumePayload.iterations, 2);
+    assert.ok(resumePayload.usage_totals.total_tokens > firstPayload.usage_totals.total_tokens);
+
+    const resumedState = JSON.parse(
+      fs.readFileSync(path.join(tmpStateDir, "loops", firstPayload.loop_id, "state.json"), "utf8")
+    );
+    assert.equal(resumedState.resume_count, 1);
+    assert.equal(resumedState.resumed_from_iteration, 1);
+
+    const resumedEvents = fs
+      .readFileSync(path.join(tmpStateDir, "loops", firstPayload.loop_id, "events.jsonl"), "utf8")
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => JSON.parse(l));
+    assert.ok(resumedEvents.some((e) => e.event === "resume" && e.resume_count === 1));
+    assert.ok(resumedEvents.some((e) => e.event === "iteration_start" && e.iteration === 2));
+    assert.ok(resumedEvents.some((e) => e.event === "iteration_end" && e.iteration === 2));
+  }
+);
+

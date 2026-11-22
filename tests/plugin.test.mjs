@@ -86,7 +86,7 @@ const args = process.argv.slice(2);
 const logFile = process.env.MOCK_AGY_LOG;
 const stateFile = process.env.MOCK_AGY_STATE;
 const mockVersion = process.env.MOCK_AGY_VERSION || "1.5.9";
-const mockPluginVersion = process.env.MOCK_AGY_PLUGIN_VERSION || "1.2.0";
+const mockPluginVersion = process.env.MOCK_AGY_PLUGIN_VERSION || "1.3.0";
 const sleepMs = Number.parseInt(process.env.MOCK_AGY_SLEEP_MS || "0", 10);
 
 function handleArgs() {
@@ -260,7 +260,7 @@ test("plugin.json, package.json, and assets/logo.svg satisfy strict schema and p
   assert.equal(pluginJson.$schema, "https://antigravity.google/schemas/v1/plugin.json");
   assert.equal(pluginJson.name, "agy-loop");
   assert.equal(pluginJson.displayName, "AGY Loop");
-  assert.equal(pluginJson.version, "1.2.0");
+  assert.equal(pluginJson.version, "1.3.0");
   assert.doesNotMatch(
     pluginJson.displayName,
     /Antigravity|Gemini|Claude|Cursor|Plugin/i,
@@ -296,6 +296,10 @@ test("plugin.json, package.json, and assets/logo.svg satisfy strict schema and p
     Array.isArray(packageJson.files) && packageJson.files.includes("lib/"),
     'package.json "files" must include "lib/"'
   );
+  assert.ok(
+    Array.isArray(packageJson.files) && packageJson.files.includes("workflows/"),
+    'package.json "files" must include "workflows/"'
+  );
 
   const svg = fs.readFileSync(logoPath, "utf8");
   assert.match(svg, /<svg\b[^>]*viewBox="0 0 128 128"/);
@@ -324,7 +328,15 @@ test("plugin repository contains no forbidden Antigravity plugin paths", () => {
 });
 
 const agentMdPath = path.join(REPO_ROOT, "agents", "loop-worker.md");
+const verifierAgentMdPath = path.join(REPO_ROOT, "agents", "loop-verifier.md");
 const skillMdPath = path.join(REPO_ROOT, "skills", "loop", "SKILL.md");
+const workflowEngineRefPath = path.join(
+  REPO_ROOT,
+  "skills",
+  "loop",
+  "references",
+  "workflow-engine.md"
+);
 const helperShPath = path.join(REPO_ROOT, "skills", "loop", "scripts", "loop-helper.sh");
 
 test(
@@ -408,15 +420,26 @@ test(
       "SKILL.md description must be safely quoted or block-scalar formatted"
     );
 
+    const totalBytes = Buffer.byteLength(raw, "utf8");
     const bodyBytes = Buffer.byteLength(body, "utf8");
     assert.ok(
-      bodyBytes < 18000,
-      `SKILL.md body (${bodyBytes} bytes) must be strictly under the 18,000 byte budget`
+      totalBytes < 16000,
+      `SKILL.md total (${totalBytes} bytes) must be strictly under the 16,000 byte budget`
+    );
+    assert.ok(
+      bodyBytes < 16000,
+      `SKILL.md body (${bodyBytes} bytes) must be strictly under the 16,000 byte budget`
     );
     assert.ok(
       bodyBytes < 24000,
       `SKILL.md body (${bodyBytes} bytes) must be strictly under the 24,000 byte cap`
     );
+    assert.equal(
+      fs.existsSync(workflowEngineRefPath),
+      true,
+      "skills/loop/references/workflow-engine.md must exist for progressive disclosure"
+    );
+    assert.match(body, /references\/workflow-engine\.md/);
     assert.ok(bodyBytes > 500, "SKILL.md body should contain full orchestration protocol");
     assert.doesNotMatch(
       body,
@@ -654,7 +677,7 @@ test("bin/agy-loop.mjs handles install, --clean-shadow, doctor --json, validate,
   assert.equal(helpRes.status, 0);
   assert.match(helpRes.stdout, /Usage:\s+agy-loop/);
   assert.match(helpRes.stdout, /\bdoctor,\s*status\b/);
-  for (const subcmd of ["run", "ps", "logs", "stop", "statusline"]) {
+  for (const subcmd of ["run", "resume", "nudge", "wake", "ps", "logs", "stop", "statusline"]) {
     assert.match(
       helpRes.stdout,
       new RegExp(`\\b${subcmd}\\b`),
@@ -666,7 +689,7 @@ test("bin/agy-loop.mjs handles install, --clean-shadow, doctor --json, validate,
   assert.equal(verRes.status, 0);
   const verJson = JSON.parse(verRes.stdout);
   assert.equal(verJson.name, "agy-loop");
-  assert.equal(verJson.version, "1.2.0");
+  assert.equal(verJson.version, "1.3.0");
 
   // Create shadow files in isolated HOME
   const shadowSkillDir = path.join(home, ".gemini", "config", "skills", "loop");
@@ -697,7 +720,7 @@ test("bin/agy-loop.mjs handles install, --clean-shadow, doctor --json, validate,
   assert.equal(docShadow.ok, false);
   assert.equal(docShadow.agy.version, "1.5.9");
   assert.equal(docShadow.plugin.installed, true);
-  assert.equal(docShadow.plugin.version, "1.2.0");
+  assert.equal(docShadow.plugin.version, "1.3.0");
   assert.equal(docShadow.shadows.length, 2);
   assert.equal(docShadow.skillFilterWarnings.length, 1);
   assert.equal(docShadow.loopMd.activeSource, ".agents/loop.md");
@@ -2002,6 +2025,8 @@ test("v1.1 3-way UTC backup parity, skills.json regex matrix, SessionStart proto
   assert.equal(doc159.agy.capabilities.strictProtojsonHooks, false);
   assert.equal(doc159.hookSelfTest.ok, true);
   assert.equal(doc159.agentToolsCheck.ok, true);
+  assert.equal(doc159.verifierToolsCheck.ok, true);
+  assert.equal(doc159.workflowBundleCheck.ok, true);
   assert.equal(doc159.activeLoops.length, 1);
   assert.equal(doc159.activeLoops[0].loopId, activeLoop.loop_id);
 
@@ -2118,3 +2143,368 @@ test("v1.1 3-way UTC backup parity, skills.json regex matrix, SessionStart proto
   assert.equal(timeoutJson.timedOut, true);
   assert.equal(timeoutJson.agy.timedOut, true);
 });
+
+test("agents/loop-verifier.md enforces model: pro, sandbox, strict read-only tools, and fail-closed contract", () => {
+  assert.equal(fs.existsSync(verifierAgentMdPath), true, "agents/loop-verifier.md must exist");
+  const raw = fs.readFileSync(verifierAgentMdPath, "utf8");
+  const { rawFrontmatter, body } = parseFrontmatter(raw);
+
+  assert.match(rawFrontmatter, /^name:\s*["']?loop-verifier["']?\s*$/m);
+  assert.match(rawFrontmatter, /^subagent:\s*true\s*$/m);
+  assert.match(rawFrontmatter, /^mainAgent:\s*false\s*$/m);
+  assert.match(rawFrontmatter, /^model:\s*["']?pro["']?\s*$/m);
+  assert.match(rawFrontmatter, /^commandExecutionPolicy:\s*["']?sandbox["']?\s*$/m);
+
+  const toolLines = [];
+  let inTools = false;
+  for (const line of rawFrontmatter.split(/\r?\n/)) {
+    if (/^tools:\s*$/.test(line)) {
+      inTools = true;
+      continue;
+    }
+    if (inTools) {
+      const item = line.match(/^\s*-\s*([A-Za-z0-9_]+)\s*$/);
+      if (item) {
+        toolLines.push(item[1]);
+      } else if (/^\S/.test(line)) {
+        inTools = false;
+      }
+    }
+  }
+
+  const READ_ONLY_VERIFIER_TOOLS = ["view_file", "run_command", "search_web"];
+  const WRITE_TOOLS = ["write_to_file", "replace_file_content", "multi_replace_file_content"];
+  assert.deepEqual([...toolLines].sort(), [...READ_ONLY_VERIFIER_TOOLS].sort());
+  for (const t of toolLines) {
+    assert.ok(VERIFIED_CORTEX_TOOLS.has(t), `Unverified tool '${t}' in loop-verifier.md`);
+    assert.equal(BROKEN_ONEHARNESS_TOOLS.includes(t), false);
+    assert.equal(WRITE_TOOLS.includes(t), false, `loop-verifier.md must NOT declare write tool '${t}'`);
+  }
+
+  assert.match(body, /"passed":\s*true/);
+  assert.match(body, /"summary":/);
+  assert.match(body, /"issues":/);
+  assert.match(body, /read-only/i);
+});
+
+test("loop-helper.sh v1.3 parser flags, engine auto-routing, conflicts, nudge/wake, inbox-push, and dual-write state-stop", (t) => {
+  const { workspace, envWithMockAgy } = makeSandbox(t);
+  const runHelper = (args, stdinText = undefined) =>
+    spawnSync("sh", [helperShPath, ...args], {
+      cwd: workspace,
+      env: envWithMockAgy,
+      input: stdinText,
+      encoding: "utf8",
+    });
+
+  // 1. Auto-routing: plain loop -> schedule; workflow flag or --engine workflow -> workflow
+  const schedDefault = JSON.parse(runHelper(["parse", "30s check ci"]).stdout);
+  assert.equal(schedDefault.engine, "schedule");
+  assert.equal(schedDefault.verify, false);
+  assert.deepEqual(schedDefault.targets, []);
+
+  const explicitSchedule = JSON.parse(runHelper(["parse", "--engine", "schedule", "30s check ci"]).stdout);
+  assert.equal(explicitSchedule.engine, "schedule");
+
+  const explicitWorkflow = JSON.parse(runHelper(["parse", "--engine=workflow", "30s check ci"]).stdout);
+  assert.equal(explicitWorkflow.engine, "workflow");
+
+  // #72 2.1: --verify-cmd="..." and --probe="..." preserve inner quotes without double-stripping
+  const innerQuotesParsed = JSON.parse(
+    runHelper([
+      "parse",
+      `--verify-cmd="'a' && 'b'" --probe="'echo' 'ok'" run inner quote check`,
+    ]).stdout
+  );
+  assert.equal(innerQuotesParsed.verify_cmd, "'a' && 'b'");
+  assert.equal(innerQuotesParsed.probe_cmd, "'echo' 'ok'");
+
+  const innerQuotesStdin = JSON.parse(
+    runHelper(
+      ["parse", "--stdin"],
+      `--verify-cmd="'a' && 'b'" --probe="'echo' 'ok'" run inner quote check`
+    ).stdout
+  );
+  assert.equal(innerQuotesStdin.verify_cmd, "'a' && 'b'");
+  assert.equal(innerQuotesStdin.probe_cmd, "'echo' 'ok'");
+
+  const fullWf = JSON.parse(
+    runHelper([
+      "parse",
+      '--stateful --reset-every 3 --verify --verifier-model=pro --verify-cmd="npm test" --verify-timeout 45s --probe "git status" --probe-timeout 15s --probe-until-pass --targets "pkg/a, pkg/b" --max-tokens 80000 --max-duration 2h fix CI',
+    ]).stdout
+  );
+  assert.equal(fullWf.action, "run");
+  assert.equal(fullWf.engine, "workflow");
+  assert.equal(fullWf.state_mode, "stateful");
+  assert.equal(fullWf.reset_every, 3);
+  assert.equal(fullWf.verify, true);
+  assert.equal(fullWf.verifier_model, "pro");
+  assert.equal(fullWf.verify_cmd, "npm test");
+  assert.equal(fullWf.verify_timeout_sec, 45);
+  assert.equal(fullWf.probe_cmd, "git status");
+  assert.equal(fullWf.probe_timeout_sec, 15);
+  assert.equal(fullWf.probe_until_pass, true);
+  assert.deepEqual(fullWf.targets, ["pkg/a", "pkg/b"]);
+  assert.equal(fullWf.max_tokens, 80000);
+  assert.equal(fullWf.max_duration_sec, 7200);
+  assert.equal(fullWf.prompt, "fix CI");
+
+  for (const wfTrigger of [
+    "--verify check",
+    "--verifier-model flash check",
+    '--verify-cmd "true" check',
+    '--probe "true" check',
+    "--targets a,b check",
+    "--max-tokens 1000 check",
+    "--max-duration 10m check",
+    "--stateful --reset-every 2 check",
+  ]) {
+    const parsed = JSON.parse(runHelper(["parse", wfTrigger]).stdout);
+    assert.equal(parsed.engine, "workflow", `Expected engine=workflow for '${wfTrigger}'`);
+  }
+
+  // 2. All v1.3 conflict & invalid flag errors (Exit 2)
+  const conflictInputs = [
+    "5m check --cron --engine workflow",
+    "5m check --exact --verify",
+    "5m check --daemon --targets a,b",
+    "check --engine schedule --verify",
+    'check --engine schedule --verify-cmd "true"',
+    'check --engine schedule --probe "true"',
+    "check --engine schedule --targets a,b",
+    "check --engine schedule --max-tokens 100",
+    "check --engine schedule --max-duration 5m",
+    "check --engine schedule --stateful --reset-every 2",
+    "check --reset-every 2",
+    "check --probe-until-pass",
+    "check --engine bogus",
+    "check --verifier-model ultra",
+    'check --verify-cmd ""',
+    "check --verify-timeout 0s",
+    "check --probe-timeout 1.5m",
+    "check --verify-timeout 30s --engine schedule",
+    "check --probe-timeout 30s --engine schedule",
+    "check --verify-timeout 30s",
+    "check --probe-timeout 30s",
+    'check --targets ""',
+    "check --targets a,,b",
+    "check --max-tokens 0",
+    "check --max-duration 0m",
+    "check --verify=true",
+    "check --probe-until-pass=true",
+    "check --verify-command true",
+  ];
+  for (const bad of conflictInputs) {
+    const res = runHelper(["parse", bad]);
+    assert.equal(res.status, 2, `Expected exit 2 for '${bad}', got ${res.status}: ${res.stdout}`);
+    assert.ok(JSON.parse(res.stdout).error);
+  }
+
+  // 3. nudge / wake parse actions
+  const nudgeParsed = JSON.parse(runHelper(["parse", "nudge latest check auth --wake"]).stdout);
+  assert.deepEqual(nudgeParsed, {
+    action: "nudge",
+    target: "latest",
+    message: "check auth",
+    wake: true,
+  });
+
+  const nudgeQuoted = JSON.parse(
+    runHelper(["parse", 'nudge lp_20261122T000000Z_aaaa "check $(id)"']).stdout
+  );
+  assert.equal(nudgeQuoted.action, "nudge");
+  assert.equal(nudgeQuoted.target, "lp_20261122T000000Z_aaaa");
+  assert.equal(nudgeQuoted.message, "check $(id)");
+  assert.equal(nudgeQuoted.wake, false);
+
+  const wakeParsed = JSON.parse(runHelper(["parse", "/agy-loop:loop wake latest"]).stdout);
+  assert.deepEqual(wakeParsed, { action: "wake", target: "latest" });
+
+  for (const badNw of ["nudge", "nudge latest", "nudge --bad latest hi", "wake", "wake a b", "wake --bad"]) {
+    const res = runHelper(["parse", badNw]);
+    assert.equal(res.status, 2, `Expected exit 2 for '${badNw}'`);
+    assert.ok(JSON.parse(res.stdout).error);
+  }
+
+  // 4. inbox-push atomic enqueue + latest resolution + state-stop dual write & field preservation
+  const wfParseJson = runHelper([
+    "parse",
+    '--verify --verify-cmd "npm test" --targets api,web --max-tokens 5000 run tests',
+  ]).stdout;
+  const st1 = JSON.parse(runHelper(["state-init", workspace, "--stdin"], wfParseJson).stdout);
+  assert.equal(st1.engine, "workflow");
+  assert.equal(st1.verify, true);
+  assert.equal(st1.verify_cmd, "npm test");
+  assert.deepEqual(st1.targets, ["api", "web"]);
+  assert.equal(st1.max_tokens, 5000);
+
+  // Add extra custom fields to st1 to verify state-stop preserves them
+  const st1Path = path.join(workspace, ".agents", ".agy-loop", "loops", st1.loop_id, "state.json");
+  const st1Data = JSON.parse(fs.readFileSync(st1Path, "utf8"));
+  st1Data.usage_totals = { total_tokens: 321 };
+  fs.writeFileSync(st1Path, JSON.stringify(st1Data) + "\n", "utf8");
+
+  // Create second running loop (stopped shortly) so `latest` picks active running st1
+  const st2 = JSON.parse(runHelper(["state-init", workspace, "--stdin"], wfParseJson).stdout);
+  assert.equal(runHelper(["state-stop", workspace, st2.loop_id]).status, 0);
+
+  // #72 2.2: Create running schedule loop and dead-PID headless loop; inbox-push must reject both & `latest` picks active workflow st1
+  const schedParseJson = runHelper(["parse", "30s schedule only"]).stdout;
+  const stSched = JSON.parse(runHelper(["state-init", workspace, "--stdin"], schedParseJson).stdout);
+  const stDeadHeadless = JSON.parse(runHelper(["state-init", workspace, "--stdin"], wfParseJson).stdout);
+  const stDeadPath = path.join(workspace, ".agents", ".agy-loop", "loops", stDeadHeadless.loop_id, "state.json");
+  const stDeadObj = JSON.parse(fs.readFileSync(stDeadPath, "utf8"));
+  stDeadObj.engine = "headless";
+  stDeadObj.pid = 99999999;
+  stDeadObj.updated_at = "2099-01-01T00:00:00Z";
+  fs.writeFileSync(stDeadPath, JSON.stringify(stDeadObj) + "\n", "utf8");
+
+  const rejectSched = runHelper(["inbox-push", workspace, stSched.loop_id, "wake"]);
+  assert.equal(rejectSched.status, 2);
+  assert.match(JSON.parse(rejectSched.stdout).error, /do not consume inbox/i);
+
+  const rejectDead = runHelper(["inbox-push", workspace, stDeadHeadless.loop_id, "wake"]);
+  assert.equal(rejectDead.status, 2);
+  assert.match(JSON.parse(rejectDead.stdout).error, /not alive/i);
+
+  // Check st2 dual-wrote control.json and inbox/ stop message
+  const loopDir2 = path.join(workspace, ".agents", ".agy-loop", "loops", st2.loop_id);
+  const ctrl2 = JSON.parse(fs.readFileSync(path.join(loopDir2, "control.json"), "utf8"));
+  assert.equal(ctrl2.stop_requested, true);
+  assert.equal(ctrl2.mode, "immediate");
+  const inboxFiles2 = fs.readdirSync(path.join(loopDir2, "inbox")).filter((f) => f.endsWith(".json"));
+  assert.equal(inboxFiles2.length, 1);
+  const inboxStop2 = JSON.parse(fs.readFileSync(path.join(loopDir2, "inbox", inboxFiles2[0]), "utf8"));
+  assert.equal(inboxStop2.type, "stop");
+  assert.equal(inboxStop2.mode, "immediate");
+
+  // inbox-push latest nudge --wake --stdin (metacharacters untouched, resolves to active st1)
+  const pwnMarker = path.join(workspace, "inbox-pwned");
+  const pushNudge = runHelper(
+    ["inbox-push", workspace, "latest", "nudge", "--wake", "--stdin"],
+    `Inspect $(touch ${pwnMarker}) & \`id\``
+  );
+  assert.equal(pushNudge.status, 0, pushNudge.stdout + pushNudge.stderr);
+  assert.equal(fs.existsSync(pwnMarker), false);
+  const pushNudgeJson = JSON.parse(pushNudge.stdout);
+  assert.equal(pushNudgeJson.ok, true);
+  assert.equal(pushNudgeJson.loop_id, st1.loop_id);
+  assert.equal(pushNudgeJson.type, "nudge");
+  assert.equal(fs.existsSync(pushNudgeJson.file), true);
+  const pushedNudgeObj = JSON.parse(fs.readFileSync(pushNudgeJson.file, "utf8"));
+  assert.equal(pushedNudgeObj.type, "nudge");
+  assert.equal(pushedNudgeObj.wake, true);
+  assert.match(pushedNudgeObj.message, /\$\(touch/);
+
+  const pushWake = runHelper(["inbox-push", workspace, st1.loop_id, "wake", "--message", "go"]);
+  assert.equal(pushWake.status, 0, pushWake.stdout + pushWake.stderr);
+  const pushWakeJson = JSON.parse(pushWake.stdout);
+  assert.equal(pushWakeJson.type, "wake");
+  assert.equal(JSON.parse(fs.readFileSync(pushWakeJson.file, "utf8")).reason, "go");
+
+  // Also verify live-PID headless loop beats older st1 on `latest`
+  const stLiveHeadless = JSON.parse(runHelper(["state-init", workspace, "--stdin"], wfParseJson).stdout);
+  const stLivePath = path.join(workspace, ".agents", ".agy-loop", "loops", stLiveHeadless.loop_id, "state.json");
+  const stLiveObj = JSON.parse(fs.readFileSync(stLivePath, "utf8"));
+  stLiveObj.engine = "headless";
+  stLiveObj.pid = process.pid;
+  stLiveObj.updated_at = "2098-01-01T00:00:00Z";
+  fs.writeFileSync(stLivePath, JSON.stringify(stLiveObj) + "\n", "utf8");
+  const pushLatestLive = runHelper(["inbox-push", workspace, "latest", "wake"]);
+  assert.equal(pushLatestLive.status, 0, pushLatestLive.stdout + pushLatestLive.stderr);
+  assert.equal(JSON.parse(pushLatestLive.stdout).loop_id, stLiveHeadless.loop_id);
+  assert.equal(runHelper(["state-stop", workspace, stLiveHeadless.loop_id]).status, 0);
+
+  // Reject inbox-push on stopped st2 or empty nudge message
+  assert.equal(runHelper(["inbox-push", workspace, st2.loop_id, "wake"]).status, 2);
+  assert.equal(runHelper(["inbox-push", workspace, st1.loop_id, "nudge"]).status, 2);
+  assert.equal(runHelper(["inbox-push", workspace, st1.loop_id, "bogus"]).status, 2);
+
+  // Stop st1 with --after-current and verify extra usage_totals survived + dual-write mode=after_current
+  const stop1 = runHelper(["state-stop", workspace, st1.loop_id, "--after-current"]);
+  assert.equal(stop1.status, 0, stop1.stderr);
+  const st1After = JSON.parse(fs.readFileSync(st1Path, "utf8"));
+  assert.deepEqual(st1After.usage_totals, { total_tokens: 321 });
+  assert.equal(st1After.stop_mode, "after_current");
+  const ctrl1 = JSON.parse(
+    fs.readFileSync(path.join(workspace, ".agents", ".agy-loop", "loops", st1.loop_id, "control.json"), "utf8")
+  );
+  assert.equal(ctrl1.mode, "after_current");
+});
+
+test("doctor --json flips verifierToolsCheck and workflowBundleCheck to ok: false when broken in installed plugin dir", (t) => {
+  const { home, workspace, envWithMockAgy } = makeSandbox(t);
+  const cliPath = path.join(REPO_ROOT, "bin", "agy-loop.mjs");
+  const runCli = (args) =>
+    spawnSync(process.execPath, [cliPath, ...args], {
+      cwd: workspace,
+      env: envWithMockAgy,
+      encoding: "utf8",
+    });
+
+  // Mark plugin installed at ${home}/.gemini/config/plugins/agy-loop
+  assert.equal(runCli(["install", "--json"]).status, 0);
+  const installedDir = path.join(home, ".gemini", "config", "plugins", "agy-loop");
+
+  // Baseline ok (installedDir doesn't exist on disk yet, falls back to PLUGIN_ROOT)
+  const baseDoc = JSON.parse(runCli(["doctor", "--json"]).stdout);
+  assert.equal(baseDoc.ok, true);
+  assert.equal(baseDoc.verifierToolsCheck.ok, true);
+  assert.equal(baseDoc.workflowBundleCheck.ok, true);
+
+  // Seed complete valid installed plugin dir on disk first
+  const installedWorker = path.join(installedDir, "agents", "loop-worker.md");
+  const installedVerifier = path.join(installedDir, "agents", "loop-verifier.md");
+  const installedWfDir = path.join(installedDir, "workflows", "loop-runner");
+  fs.mkdirSync(path.dirname(installedWorker), { recursive: true });
+  fs.mkdirSync(installedWfDir, { recursive: true });
+  fs.copyFileSync(path.join(REPO_ROOT, "agents", "loop-worker.md"), installedWorker);
+  fs.copyFileSync(path.join(REPO_ROOT, "agents", "loop-verifier.md"), installedVerifier);
+  fs.copyFileSync(path.join(REPO_ROOT, "workflows", "loop-runner", "workflow.json"), path.join(installedWfDir, "workflow.json"));
+  fs.copyFileSync(path.join(REPO_ROOT, "workflows", "loop-runner", "workflow.py"), path.join(installedWfDir, "workflow.py"));
+
+  const validInstalledDoc = JSON.parse(runCli(["doctor", "--json"]).stdout);
+  assert.equal(validInstalledDoc.ok, true);
+  assert.equal(validInstalledDoc.agentToolsCheck.ok, true);
+  assert.equal(validInstalledDoc.verifierToolsCheck.ok, true);
+  assert.equal(validInstalledDoc.workflowBundleCheck.ok, true);
+
+  // 1a. Missing agents/loop-verifier.md in existing installed dir -> verifierToolsCheck.ok === false & ok === false (no silent repo fallback!)
+  fs.rmSync(installedVerifier, { force: true });
+  const missingVerDoc = JSON.parse(runCli(["doctor", "--json"]).stdout);
+  assert.equal(missingVerDoc.verifierToolsCheck.ok, false);
+  assert.equal(missingVerDoc.ok, false);
+
+  // 1b. Break installed loop-verifier.md by adding write_to_file -> verifierToolsCheck.ok === false & ok === false
+  fs.writeFileSync(
+    installedVerifier,
+    "---\nname: loop-verifier\nmodel: pro\ntools:\n  - view_file\n  - write_to_file\n---\nBroken verifier\n",
+    "utf8"
+  );
+  const badVerDoc = JSON.parse(runCli(["doctor", "--json"]).stdout);
+  assert.equal(badVerDoc.verifierToolsCheck.ok, false);
+  assert.deepEqual(badVerDoc.verifierToolsCheck.writeTools, ["write_to_file"]);
+  assert.equal(badVerDoc.ok, false);
+
+  // Restore valid installedVerifier before isolating workflowBundleCheck
+  fs.copyFileSync(path.join(REPO_ROOT, "agents", "loop-verifier.md"), installedVerifier);
+
+  // 2a. Missing workflows/loop-runner/workflow.json in existing installed dir -> workflowBundleCheck.ok === false & ok === false
+  fs.rmSync(path.join(installedWfDir, "workflow.json"), { force: true });
+  const missingWfDoc = JSON.parse(runCli(["doctor", "--json"]).stdout);
+  assert.equal(missingWfDoc.verifierToolsCheck.ok, true);
+  assert.equal(missingWfDoc.workflowBundleCheck.ok, false);
+  assert.equal(missingWfDoc.ok, false);
+
+  // 2b. Restore workflow.json and seed forbidden .md inside workflows/ -> workflowBundleCheck.ok === false & ok === false
+  fs.copyFileSync(path.join(REPO_ROOT, "workflows", "loop-runner", "workflow.json"), path.join(installedWfDir, "workflow.json"));
+  fs.writeFileSync(path.join(installedDir, "workflows", "FORBIDDEN.md"), "# nope\n", "utf8");
+
+  const badWfDoc = JSON.parse(runCli(["doctor", "--json"]).stdout);
+  assert.equal(badWfDoc.verifierToolsCheck.ok, true);
+  assert.equal(badWfDoc.workflowBundleCheck.ok, false);
+  assert.deepEqual(badWfDoc.workflowBundleCheck.mdFiles, ["FORBIDDEN.md"]);
+  assert.equal(badWfDoc.ok, false);
+});
+

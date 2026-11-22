@@ -33,7 +33,7 @@ import {
   resolveModelSlug,
 } from "../lib/models.mjs";
 import { formatRunHelp, parseRunArgs } from "../lib/parse-run-args.mjs";
-import { EXIT_CODES, runHeadlessLoop, sleepInterruptible } from "../lib/runner.mjs";
+import { EXIT_CODES, resumeHeadlessLoop, runHeadlessLoop, sleepInterruptible } from "../lib/runner.mjs";
 import {
   ITERATION_RESULT_SCHEMA,
   VERIFIER_RESULT_SCHEMA,
@@ -45,15 +45,21 @@ import {
   writeSchemaFiles,
 } from "../lib/schemas.mjs";
 import {
+  appendEvent,
+  claimInboxMessages,
   createLoopState,
+  enqueueInboxMessage,
   listLoops,
+  peekInboxFlags,
   readControl,
   readEvents,
+  readGlobalIndex,
   readLoopState,
   resolveLoopMdTask,
   updateLoopState,
   upsertGlobalIndex,
   validateLoopId,
+  withFileLock,
   writeControlStop,
 } from "../lib/state-store.mjs";
 import { StreamSession } from "../lib/stream-client.mjs";
@@ -2986,4 +2992,1191 @@ test("regression #49 #6 & #7: leading-dash -p= flag, StreamSession startup stder
     await sess3.close();
   }
 });
+
+// ============================================================================
+// 7. V1.3 STATE CONSISTENCY, TWO-STAGE GATE, INBOX STEERING & RESUME TESTS
+// ============================================================================
+
+test("v1.3 finally double-insurance: uncaught exception in runHeadlessLoop sets status='error' and clears in_flight_iteration", async (t) => {
+  const sb = makeHeadlessSandbox(t);
+
+  // Case A: exception thrown inside inter-iteration sleep (outside inner iteration try/finally)
+  sb.setScenario({
+    jsonTurns: [
+      {
+        envelope: {
+          status: "SUCCESS",
+          usage: { total_tokens: 25 },
+          structured_output: {
+            iteration: 1,
+            loop_status: "CONTINUE",
+            next_delay_sec: 15,
+            summary: "Iter 1 ok before sleep crash",
+            next_hint: "Continue",
+          },
+        },
+      },
+    ],
+  });
+  const cfgA = parseRunArgs(["10s", "--max", "3", "--quiet", "sleep crash test"]);
+  cfgA.cwd = sb.workspace;
+  const resA = await runHeadlessLoop(cfgA, {
+    agyBin: sb.mockAgyPath,
+    env: sb.baseEnv,
+    stdout: { write: () => {} },
+    stderr: { write: () => {} },
+    sleepFn: () => {
+      throw new Error("boom inside sleepFn");
+    },
+    registerSignals: false,
+  });
+  assert.equal(resA.exitCode, EXIT_CODES.ERROR);
+  assert.equal(resA.state.status, "error");
+  assert.notEqual(resA.state.status, "done");
+  assert.equal(resA.state.exit_reason, "unhandled_exception");
+  assert.match(resA.state.last_summary, /boom inside sleepFn/);
+  const savedA = readLoopState(sb.stateDir, resA.state.loop_id);
+  assert.equal(savedA.status, "error");
+  assert.equal(savedA.exit_reason, "unhandled_exception");
+  assert.equal(savedA.in_flight_iteration, null);
+  assert.equal(savedA.in_flight_snapshot_hash, null);
+  const eventsA = readEvents(sb.stateDir, resA.state.loop_id);
+  assert.ok(eventsA.some((e) => e.event === "finish" && e.exit_reason === "unhandled_exception" && e.exit_code === 1));
+
+  // Case B: exception thrown inside retry sleep (inside inner iteration try/finally AND outer try/catch)
+  sb.setScenario({
+    jsonTurns: [
+      {
+        exitCode: 3,
+        stderr: 'AGY_ERROR: {"status":429,"error_code":"RESOURCE_EXHAUSTED","retryable":true,"short_error":"rate limit"}\n',
+        envelope: { status: "ERROR", error: "rate limit" },
+      },
+    ],
+  });
+  const cfgB = parseRunArgs(["--once", "--max-retries", "2", "--quiet", "retry sleep crash test"]);
+  cfgB.cwd = sb.workspace;
+  const resB = await runHeadlessLoop(cfgB, {
+    agyBin: sb.mockAgyPath,
+    env: sb.baseEnv,
+    stdout: { write: () => {} },
+    stderr: { write: () => {} },
+    sleepFn: () => {
+      throw new Error("boom during retry sleep");
+    },
+    registerSignals: false,
+  });
+  assert.equal(resB.exitCode, EXIT_CODES.ERROR);
+  assert.equal(resB.state.status, "error");
+  assert.equal(resB.state.exit_reason, "unhandled_exception");
+  const savedB = readLoopState(sb.stateDir, resB.state.loop_id);
+  assert.equal(savedB.in_flight_iteration, null);
+  const eventsB = readEvents(sb.stateDir, resB.state.loop_id);
+  assert.ok(eventsB.some((e) => e.event === "iteration_start" && e.iteration === 1));
+  assert.ok(eventsB.some((e) => e.event === "iteration_end" && e.iteration === 1));
+});
+
+test("v1.3 upsertGlobalIndex & withFileLock: multi-process concurrent upserts lose 0 entries and reclaim dead/stale locks", async (t) => {
+  const sb = makeHeadlessSandbox(t);
+  const stateStoreUrl = new URL("../lib/state-store.mjs", import.meta.url).href;
+  const lockEnv = { ...sb.baseEnv, AGY_LOOP_INDEX_PATH: sb.indexPath };
+
+  // 1. Multi-process concurrent upserts: 6 workers x 5 distinct loops = 30 entries
+  const workers = [];
+  for (let w = 0; w < 6; w += 1) {
+    const script = `
+      import { upsertGlobalIndex } from ${JSON.stringify(stateStoreUrl)};
+      const workerId = ${w};
+      for (let j = 0; j < 5; j += 1) {
+        const lid = \`lp_20261122T010\${workerId}\${j}Z_aa\${workerId}\${j}\`;
+        const ok = upsertGlobalIndex({
+          loop_id: lid,
+          status: "done",
+          iteration: 1,
+          max_iterations: 1,
+          updated_at: \`2026-11-22T01:0\${workerId}:0\${j}Z\`,
+        }, ${JSON.stringify(sb.stateDir)}, { homeDir: ${JSON.stringify(sb.home)}, env: process.env });
+        if (!ok) throw new Error("upsert returned false for " + lid);
+      }
+    `;
+    const child = spawn(process.execPath, ["--input-type=module", "-e", script], {
+      cwd: sb.workspace,
+      env: lockEnv,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    workers.push(
+      new Promise((resolve) => {
+        let stderr = "";
+        child.stderr.on("data", (d) => {
+          stderr += d.toString("utf8");
+        });
+        child.on("close", (status) => resolve({ status, stderr }));
+      })
+    );
+  }
+  const workerResults = await Promise.all(workers);
+  for (const r of workerResults) {
+    assert.equal(r.status, 0, r.stderr);
+  }
+
+  const indexEntries = readGlobalIndex({ homeDir: sb.home, env: lockEnv });
+  assert.equal(indexEntries.length, 30, `Expected all 30 concurrent entries preserved, got ${indexEntries.length}`);
+  assert.equal(fs.existsSync(`${sb.indexPath}.lock`), false);
+
+  // 2. Dead-PID stale lockfile is reclaimed automatically by upsertGlobalIndex
+  const lockPath = `${sb.indexPath}.lock`;
+  fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+  fs.writeFileSync(
+    lockPath,
+    JSON.stringify({ pid: 99999999, acquired_at: new Date().toISOString() }) + "\n",
+    "utf8"
+  );
+  const reclaimedOk = upsertGlobalIndex(
+    {
+      loop_id: "lp_20261122T020000Z_dead",
+      status: "running",
+      updated_at: "2026-11-22T02:00:00Z",
+    },
+    sb.stateDir,
+    { homeDir: sb.home, env: lockEnv }
+  );
+  assert.equal(reclaimedOk, true);
+  assert.equal(fs.existsSync(lockPath), false);
+  assert.ok(
+    readGlobalIndex({ homeDir: sb.home, env: lockEnv }).some(
+      (e) => e.loop_id === "lp_20261122T020000Z_dead"
+    )
+  );
+
+  // 3. Timed-out mtime stale lock with live PID is also reclaimed when age > staleMs
+  const customLockPath = path.join(sb.root, "ttl.lock");
+  fs.writeFileSync(
+    customLockPath,
+    JSON.stringify({ pid: process.pid, acquired_at: "2020-01-01T00:00:00Z" }) + "\n",
+    "utf8"
+  );
+  const oldDate = new Date(Date.now() - 60000);
+  fs.utimesSync(customLockPath, oldDate, oldDate);
+  const ttlResult = withFileLock(customLockPath, () => "acquired_after_ttl", { staleMs: 100 });
+  assert.equal(ttlResult, "acquired_after_ttl");
+  assert.equal(fs.existsSync(customLockPath), false);
+});
+
+test("v1.3 --verify-cmd & --verify-timeout: Stage 1 fail skips verifier, Stage 1 pass feeds Stage 2, and sticky budget skips verifier", async (t) => {
+  const sb = makeHeadlessSandbox(t);
+
+  // 1. parseRunArgs parsing + help + alias check
+  const parsedVerify = parseRunArgs(["--verify-cmd", "npm test", "--verify-timeout", "45s", "check"]);
+  assert.equal(parsedVerify.ok, true);
+  assert.equal(parsedVerify.verifyCmd, "npm test");
+  assert.equal(parsedVerify.verifyTimeoutSec, 45);
+  assert.equal(parseRunArgs(["check"]).verifyTimeoutSec, 60);
+  const aliasVerify = parseRunArgs(["--verify-command", "npm test", "check"]);
+  assert.equal(aliasVerify.ok, false);
+  assert.match(aliasVerify.error, /--verify-cmd/);
+  assert.match(formatRunHelp(), /--verify-cmd/);
+  assert.match(formatRunHelp(), /--verify-timeout/);
+
+  // 2. Failing --verify-cmd on iter 1 skips --verifier-model and continues; passing on iter 2 invokes --verifier-model
+  const marker = path.join(sb.workspace, "verify-stage1-ready");
+  sb.setScenario({
+    jsonTurns: [
+      {
+        envelope: {
+          status: "SUCCESS",
+          usage: { total_tokens: 50 },
+          structured_output: {
+            iteration: 1,
+            loop_status: "DONE",
+            next_delay_sec: 1,
+            summary: "Iter 1 claimed done prematurely",
+            next_hint: "None",
+          },
+        },
+      },
+      {
+        mutateFile: { path: marker, content: "green\n" },
+        envelope: {
+          status: "SUCCESS",
+          usage: { total_tokens: 60 },
+          structured_output: {
+            iteration: 2,
+            loop_status: "DONE",
+            next_delay_sec: 0,
+            summary: "Iter 2 fixed verify_cmd",
+            next_hint: "None",
+          },
+        },
+      },
+    ],
+    verifierTurns: [
+      {
+        envelope: {
+          status: "SUCCESS",
+          usage: { total_tokens: 30 },
+          structured_output: {
+            passed: true,
+            summary: "Stage 1 and code verified",
+            issues: [],
+          },
+        },
+      },
+    ],
+  });
+
+  const verifyScript = `if test -f "${marker}"; then echo "STAGE1_OK"; exit 0; else echo "STAGE1_MISSING_MARKER" >&2; exit 1; fi`;
+  const twoStageCfg = parseRunArgs([
+    "1s",
+    "--max",
+    "3",
+    "--verify-cmd",
+    verifyScript,
+    "--verify-timeout",
+    "15s",
+    "--verifier-model",
+    "gemini-4-neon-xhigh",
+    "--json",
+    "two-stage check",
+  ]);
+  twoStageCfg.cwd = sb.workspace;
+  const twoStageRes = await runHeadlessLoop(twoStageCfg, {
+    agyBin: sb.mockAgyPath,
+    env: sb.baseEnv,
+    stdout: { write: () => {} },
+    stderr: { write: () => {} },
+    sleepFn: async () => {},
+    registerSignals: false,
+  });
+  assert.equal(twoStageRes.exitCode, EXIT_CODES.DONE);
+  assert.equal(twoStageRes.state.status, "done");
+  assert.equal(twoStageRes.state.iteration, 2);
+
+  const calls2 = sb.readCalls();
+  const workerCalls2 = calls2.filter((c) => c.mode === "json" && c.turnKind === "worker");
+  const verifierCalls2 = calls2.filter((c) => c.mode === "json" && c.turnKind === "verifier");
+  assert.equal(workerCalls2.length, 2);
+  assert.equal(verifierCalls2.length, 1, "Verifier must NOT be called when Stage 1 verify_cmd fails");
+  assert.match(workerCalls2[1].args[workerCalls2[1].args.length - 1], /STAGE1_MISSING_MARKER/);
+  assert.match(
+    verifierCalls2[0].args[verifierCalls2[0].args.length - 1],
+    /Stage 1 Deterministic Check \(--verify-cmd\)[\s\S]*STAGE1_OK/
+  );
+  const events2 = readEvents(sb.stateDir, twoStageRes.state.loop_id);
+  const vcmdEvents = events2.filter((e) => e.event === "verify_cmd");
+  assert.equal(vcmdEvents.length, 2);
+  assert.equal(vcmdEvents[0].passed, false);
+  assert.equal(vcmdEvents[0].exit_code, 1);
+  assert.equal(vcmdEvents[1].passed, true);
+
+  // 3. Failing --verify-cmd at --once -> BLOCKED verify_cmd_failed exit 3, 0 verifier calls
+  sb.setScenario({
+    jsonTurns: [
+      {
+        envelope: {
+          status: "SUCCESS",
+          usage: { total_tokens: 40 },
+          structured_output: {
+            iteration: 1,
+            loop_status: "DONE",
+            next_delay_sec: 0,
+            summary: "Claimed done",
+            next_hint: "None",
+          },
+        },
+      },
+    ],
+    verifierTurns: [
+      {
+        envelope: {
+          status: "SUCCESS",
+          usage: { total_tokens: 10 },
+          structured_output: { passed: true, summary: "never called", issues: [] },
+        },
+      },
+    ],
+  });
+  const onceFailRes = sb.runCli([
+    "run",
+    "--once",
+    "--verify-cmd",
+    "echo FAIL_ONCE >&2; exit 2",
+    "--verifier-model",
+    "gemini-4-neon-xhigh",
+    "--json",
+    "verify once fail",
+  ]);
+  assert.equal(onceFailRes.status, 3);
+  const onceFailPayload = JSON.parse(onceFailRes.stdout);
+  assert.equal(onceFailPayload.status, "blocked");
+  assert.equal(onceFailPayload.exit_reason, "verify_cmd_failed");
+  assert.equal(sb.readCalls().filter((c) => c.mode === "json" && c.turnKind === "verifier").length, 0);
+
+  // 4. Sticky maxTokens guard: Worker hits maxTokens on DONE -> Stage 2 verifier skipped, exit 4 max_reached
+  sb.setScenario({
+    jsonTurns: [
+      {
+        envelope: {
+          status: "SUCCESS",
+          usage: { total_tokens: 120 },
+          structured_output: {
+            iteration: 1,
+            loop_status: "DONE",
+            next_delay_sec: 0,
+            summary: "Done at token budget",
+            next_hint: "None",
+          },
+        },
+      },
+    ],
+    verifierTurns: [
+      {
+        envelope: {
+          status: "SUCCESS",
+          usage: { total_tokens: 50 },
+          structured_output: { passed: true, summary: "must not spend tokens", issues: [] },
+        },
+      },
+    ],
+  });
+  const stickyTokRes = sb.runCli([
+    "run",
+    "--once",
+    "--max-tokens",
+    "100",
+    "--verifier-model",
+    "gemini-4-neon-xhigh",
+    "--json",
+    "sticky tokens",
+  ]);
+  assert.equal(stickyTokRes.status, 4);
+  const stickyTokPayload = JSON.parse(stickyTokRes.stdout);
+  assert.equal(stickyTokPayload.status, "max_reached");
+  assert.equal(stickyTokPayload.exit_reason, "max_tokens");
+  assert.equal(stickyTokPayload.last_status, "CONTINUE");
+  assert.equal(sb.readCalls().filter((c) => c.mode === "json" && c.turnKind === "verifier").length, 0);
+  const stickyTokEvents = readEvents(sb.stateDir, stickyTokPayload.loop_id);
+  assert.equal(stickyTokEvents.find((e) => e.event === "iteration")?.last_status, "CONTINUE");
+  const skippedTokVerEv = stickyTokEvents.find((e) => e.event === "verifier");
+  assert.equal(skippedTokVerEv?.skipped_due_to_budget, true);
+  assert.equal(skippedTokVerEv?.unverified_due_to_budget, true);
+
+  // 5. Sticky maxDurationSec guard: clock passes maxDurationSec after worker DONE -> verifier skipped, exit 4
+  sb.setScenario({
+    jsonTurns: [
+      {
+        envelope: {
+          status: "SUCCESS",
+          usage: { total_tokens: 40 },
+          structured_output: {
+            iteration: 1,
+            loop_status: "DONE",
+            next_delay_sec: 0,
+            summary: "Done at duration limit",
+            next_hint: "None",
+          },
+        },
+      },
+    ],
+    verifierTurns: [
+      {
+        envelope: {
+          status: "SUCCESS",
+          usage: { total_tokens: 20 },
+          structured_output: { passed: true, summary: "must not run", issues: [] },
+        },
+      },
+    ],
+  });
+  let clockCall = 0;
+  const stickyDurCfg = parseRunArgs([
+    "--once",
+    "--max-duration",
+    "5s",
+    "--verifier-model",
+    "gemini-4-neon-xhigh",
+    "--quiet",
+    "sticky duration",
+  ]);
+  stickyDurCfg.cwd = sb.workspace;
+  const stickyDurRes = await runHeadlessLoop(stickyDurCfg, {
+    agyBin: sb.mockAgyPath,
+    env: sb.baseEnv,
+    stdout: { write: () => {} },
+    stderr: { write: () => {} },
+    nowMs: () => {
+      clockCall += 1;
+      // Call 1: startMs; Call 2: snapshot createdAtMs; Call 3+: getElapsedSec() after worker finishes -> +10s
+      return clockCall <= 2 ? 1_700_000_000_000 : 1_700_000_010_000;
+    },
+    registerSignals: false,
+  });
+  assert.equal(stickyDurRes.exitCode, EXIT_CODES.MAX_REACHED);
+  assert.equal(stickyDurRes.state.status, "max_reached");
+  assert.equal(stickyDurRes.state.exit_reason, "max_duration");
+  assert.equal(stickyDurRes.state.last_status, "CONTINUE");
+  assert.equal(sb.readCalls().filter((c) => c.mode === "json" && c.turnKind === "verifier").length, 0);
+  const stickyDurEvents = readEvents(sb.stateDir, stickyDurRes.state.loop_id);
+  assert.equal(stickyDurEvents.find((e) => e.event === "iteration")?.last_status, "CONTINUE");
+  assert.ok(stickyDurEvents.some((e) => e.event === "verifier" && e.unverified_due_to_budget === true));
+});
+
+test("v1.3 frozen IterationSnapshot and paired iteration_start / iteration_end lifecycle", (t) => {
+  const sb = makeHeadlessSandbox(t);
+  fs.mkdirSync(path.join(sb.workspace, ".agents"), { recursive: true });
+  const loopMdPath = path.join(sb.workspace, ".agents", "loop.md");
+  fs.writeFileSync(loopMdPath, "INITIAL_FROZEN_OBJECTIVE\n", "utf8");
+
+  sb.setScenario({
+    jsonTurns: [
+      {
+        mutateFile: {
+          path: loopMdPath,
+          content: "MID_ITERATION_MUTATED_OBJECTIVE\n",
+        },
+        envelope: {
+          status: "SUCCESS",
+          usage: { total_tokens: 60 },
+          structured_output: {
+            iteration: 1,
+            loop_status: "DONE",
+            next_delay_sec: 0,
+            summary: "Completed initial task",
+            next_hint: "None",
+          },
+        },
+      },
+    ],
+    verifierTurns: [
+      {
+        envelope: {
+          status: "SUCCESS",
+          usage: { total_tokens: 25 },
+          structured_output: {
+            passed: true,
+            summary: "Verified against frozen snapshot",
+            issues: [],
+          },
+        },
+      },
+    ],
+  });
+
+  const res = sb.runCli([
+    "run",
+    "--once",
+    "--verifier-model",
+    "gemini-4-neon-xhigh",
+    "--json",
+  ]);
+  assert.equal(res.status, 0, res.stderr);
+  const payload = JSON.parse(res.stdout);
+  assert.equal(payload.status, "done");
+
+  const verifierCall = sb.readCalls().find((c) => c.mode === "json" && c.turnKind === "verifier");
+  assert.ok(verifierCall);
+  const verifierPrompt = verifierCall.args[verifierCall.args.length - 1];
+  assert.match(verifierPrompt, /INITIAL_FROZEN_OBJECTIVE/);
+  assert.doesNotMatch(verifierPrompt, /MID_ITERATION_MUTATED_OBJECTIVE/);
+
+  const savedState = readLoopState(sb.stateDir, payload.loop_id);
+  assert.equal(savedState.in_flight_iteration, null);
+  assert.equal(savedState.in_flight_snapshot_hash, null);
+
+  const events = readEvents(sb.stateDir, payload.loop_id);
+  const startEv = events.find((e) => e.event === "iteration_start" && e.iteration === 1);
+  const endEv = events.find((e) => e.event === "iteration_end" && e.iteration === 1);
+  assert.ok(startEv);
+  assert.ok(endEv);
+  assert.match(startEv.snapshot_hash, /^[0-9a-f]{12}$/);
+  assert.equal(endEv.snapshot_hash, startEv.snapshot_hash);
+  assert.equal(endEv.outcome, "DONE");
+});
+
+test("v1.3 agy-loop nudge & wake: deferred nudge, --wake sleep interrupt, mid-iteration wakeRequested, and rejections", async (t) => {
+  const sb = makeHeadlessSandbox(t);
+
+  // 1. Live CLI nudge (default deferred vs --wake interrupt) and prompt injection
+  sb.setScenario({
+    jsonTurns: [
+      {
+        envelope: {
+          status: "SUCCESS",
+          usage: { total_tokens: 30 },
+          structured_output: {
+            iteration: 1,
+            loop_status: "CONTINUE",
+            next_delay_sec: 30,
+            summary: "Sleeping after iter 1",
+            next_hint: "Wait",
+          },
+        },
+      },
+      {
+        envelope: {
+          status: "SUCCESS",
+          usage: { total_tokens: 40 },
+          structured_output: {
+            iteration: 2,
+            loop_status: "DONE",
+            next_delay_sec: 0,
+            summary: "Applied nudges",
+            next_hint: "None",
+          },
+        },
+      },
+    ],
+  });
+
+  const liveProc = sb.spawnCli(["run", "30s", "--max", "3", "--json", "nudge wake test"]);
+  const loopId = await waitFor(() => {
+    const loops = listLoops(sb.stateDir, { includeAll: false });
+    if (loops.length === 0) return null;
+    const evs = readEvents(sb.stateDir, loops[0].loop_id);
+    return evs.some((e) => e.event === "iteration" && e.iteration === 1) ? loops[0].loop_id : null;
+  });
+
+  // 1a. Default nudge (no --wake) queues without waking 30s sleep
+  const nudgeNoWake = sb.runCli(["nudge", "latest", "First deferred hint", "--json"]);
+  assert.equal(nudgeNoWake.status, 0, nudgeNoWake.stderr);
+  const noWakeJson = JSON.parse(nudgeNoWake.stdout);
+  assert.equal(noWakeJson.wake, false);
+  assert.equal(peekInboxFlags(sb.stateDir, loopId).wake, false);
+  assert.equal(peekInboxFlags(sb.stateDir, loopId).nudgeCount, 1);
+
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(liveProc.child.exitCode, null, "Deferred nudge must not wake sleep early");
+
+  // 1b. Second nudge WITH --wake interrupts sleep immediately
+  const wakeStart = performance.now();
+  const nudgeWake = sb.runCli(["nudge", loopId, "Second urgent hint", "--wake", "--json"]);
+  assert.equal(nudgeWake.status, 0, nudgeWake.stderr);
+  assert.equal(JSON.parse(nudgeWake.stdout).wake, true);
+
+  const exitRes = await liveProc.done;
+  const wakeElapsedMs = performance.now() - wakeStart;
+  assert.equal(exitRes.status, 0, exitRes.stderr);
+  assert.ok(wakeElapsedMs < 3000, `Expected --wake to interrupt 30s sleep quickly, took ${wakeElapsedMs}ms`);
+
+  const workerCalls = sb.readCalls().filter((c) => c.mode === "json" && c.turnKind === "worker");
+  assert.equal(workerCalls.length, 2);
+  const iter2Prompt = workerCalls[1].args[workerCalls[1].args.length - 1];
+  assert.match(iter2Prompt, /Operator Steering \/ Nudge Messages/);
+  assert.match(iter2Prompt, /First deferred hint/);
+  assert.match(iter2Prompt, /Second urgent hint/);
+  const events = readEvents(sb.stateDir, loopId);
+  assert.ok(events.some((e) => e.event === "inbox_claim" && e.iteration === 2 && e.count === 2));
+
+  // 2. Mid-iteration `agy-loop wake` sets wakeRequested and skips post-iteration sleep completely
+  sb.setScenario({
+    jsonTurns: [
+      {
+        sleepMs: 400,
+        envelope: {
+          status: "SUCCESS",
+          usage: { total_tokens: 20 },
+          structured_output: {
+            iteration: 1,
+            loop_status: "CONTINUE",
+            next_delay_sec: 30,
+            summary: "Turn 1 finishing after wake",
+            next_hint: "Continue",
+          },
+        },
+      },
+      {
+        envelope: {
+          status: "SUCCESS",
+          usage: { total_tokens: 20 },
+          structured_output: {
+            iteration: 2,
+            loop_status: "DONE",
+            next_delay_sec: 0,
+            summary: "Turn 2 skipped sleep",
+            next_hint: "None",
+          },
+        },
+      },
+    ],
+  });
+  const cfgMid = parseRunArgs(["30s", "--max", "3", "--quiet", "mid-iter wake test"]);
+  cfgMid.cwd = sb.workspace;
+  const sleepsMid = [];
+  const midPromise = runHeadlessLoop(cfgMid, {
+    agyBin: sb.mockAgyPath,
+    env: sb.baseEnv,
+    stdout: { write: () => {} },
+    stderr: { write: () => {} },
+    sleepFn: async (ms) => sleepsMid.push(ms),
+    registerSignals: false,
+  });
+  const midLoopId = await waitFor(() => {
+    const running = listLoops(sb.stateDir, { includeAll: false });
+    if (running.length === 0) return null;
+    const evs = readEvents(sb.stateDir, running[0].loop_id);
+    return evs.some((e) => e.event === "iteration_start" && e.iteration === 1)
+      ? running[0].loop_id
+      : null;
+  });
+  const wakeMidRes = sb.runCli(["wake", midLoopId, "--reason", "urgent check", "--json"]);
+  assert.equal(wakeMidRes.status, 0, wakeMidRes.stderr);
+  assert.equal(JSON.parse(wakeMidRes.stdout).type, "wake");
+
+  const midDone = await midPromise;
+  assert.equal(midDone.exitCode, EXIT_CODES.DONE);
+  assert.equal(sleepsMid.length, 0, "Mid-iteration wakeRequested must skip post-iteration sleep completely");
+
+  // 3. Reject stale, stopped/done, and interactive loops
+  const staleLoop = createLoopState(sb.stateDir, {
+    loop_id: "lp_20261122T030001Z_st01",
+    status: "running",
+    workspace_dir: sb.workspace,
+    engine: "headless",
+    pid: 99999999,
+  });
+  const staleNudge = sb.runCli(["nudge", staleLoop.loop_id, "hi", "--json"]);
+  assert.equal(staleNudge.status, 1);
+  assert.match(JSON.parse(staleNudge.stdout).error, /stale/i);
+
+  const stoppedNudge = sb.runCli(["nudge", loopId, "too late", "--json"]);
+  assert.equal(stoppedNudge.status, 1);
+  assert.match(JSON.parse(stoppedNudge.stdout).error, /requires a running loop/i);
+
+  const interactiveLoop = createLoopState(sb.stateDir, {
+    loop_id: "lp_20261122T030002Z_in01",
+    status: "running",
+    workspace_dir: sb.workspace,
+    engine: "schedule",
+  });
+  const interWake = sb.runCli(["wake", interactiveLoop.loop_id, "--json"]);
+  assert.equal(interWake.status, 2);
+  assert.match(JSON.parse(interWake.stdout).error, /headless or workflow/i);
+});
+
+test("v1.3 agy-loop resume & logs: crash reconciliation, worktree/conversation/usage preservation, budget guard, rejections, and log rendering", async (t) => {
+  const sb = makeHeadlessSandbox(t);
+  sb.initGitRepo();
+
+  // 1. Seed a crashed/stale stateful worktree loop with orphan in_flight_iteration=2 and prior usage_totals
+  sb.setScenario({
+    streamSessions: [
+      {
+        conversationId: "conv-resumed-1",
+        turns: [
+          {
+            gitCommit: { file: "step1.txt", content: "wip\n", message: "step 1 wip" },
+            result: {
+              status: "SUCCESS",
+              usage: { total_tokens: 75 },
+              structured_output: {
+                iteration: 1,
+                loop_status: "CONTINUE",
+                next_delay_sec: 1,
+                summary: "Pre-crash iter 1",
+                next_hint: "Finish iter 2",
+              },
+            },
+          },
+        ],
+      },
+    ],
+  });
+
+  // First run 1 iter (--max 1) in stateful + worktree + settingsArg so we get a real worktree + conversation_id + max_reached
+  const settingsFile = path.join(sb.workspace, "secret-settings.json");
+  fs.writeFileSync(settingsFile, '{"secret":"DO_NOT_SAVE"}\n', "utf8");
+  const initRun = sb.runCli([
+    "run",
+    "1s",
+    "--stateful",
+    "--worktree",
+    "--max",
+    "1",
+    "--settings",
+    "./secret-settings.json",
+    "--json",
+    "resume worktree task",
+  ]);
+  assert.equal(initRun.status, 4, initRun.stderr);
+  const initPayload = JSON.parse(initRun.stdout);
+  assert.equal(initPayload.status, "max_reached");
+  assert.equal(initPayload.exit_reason, "max_iterations");
+  const loopId = initPayload.loop_id;
+  const savedInit = readLoopState(sb.stateDir, loopId);
+  assert.equal(savedInit.run_config_snapshot.settingsArg, undefined);
+  assert.ok(savedInit.worktree_path && fs.existsSync(savedInit.worktree_path));
+  assert.equal(savedInit.conversation_id, "conv-resumed-1");
+
+  // 2. max_reached without higher --max fails Exit 2
+  const failNoBump = sb.runCli(["resume", loopId, "--json"]);
+  assert.equal(failNoBump.status, 2);
+  assert.match(JSON.parse(failNoBump.stdout).error, /--max/);
+
+  // Simulate orphan in_flight_iteration=2 crash on a stale running loop
+  updateLoopState(sb.stateDir, loopId, {
+    status: "running",
+    pid: 99999999,
+    iteration: 2,
+    in_flight_iteration: 2,
+    in_flight_snapshot_hash: "deadbeef1234",
+    exit_reason: null,
+  });
+  appendEvent(sb.stateDir, loopId, {
+    event: "iteration_start",
+    iteration: 2,
+    snapshot_hash: "deadbeef1234",
+  });
+
+  // 3. Resume with --max 3 (reconciles orphan iter 2 -> interrupted, resumes at iter 2, reuses worktree & conversation_id!)
+  sb.setScenario({
+    streamSessions: [
+      {
+        conversationId: "conv-resumed-1",
+        turns: [
+          {
+            gitCommit: { file: "resumed.txt", content: "fixed\n", message: "resumed fix" },
+            result: {
+              status: "SUCCESS",
+              usage: { total_tokens: 125 },
+              structured_output: {
+                iteration: 2,
+                loop_status: "DONE",
+                next_delay_sec: 0,
+                summary: "Completed after resume",
+                next_hint: "None",
+              },
+            },
+          },
+        ],
+      },
+    ],
+  });
+
+  const resumeRes = sb.runCli(["resume", loopId, "--max", "3", "--json"]);
+  assert.equal(resumeRes.status, 0, resumeRes.stderr);
+  const resumePayload = JSON.parse(resumeRes.stdout);
+  assert.equal(resumePayload.status, "done");
+  assert.equal(resumePayload.iterations, 2);
+  assert.equal(resumePayload.usage_totals.total_tokens, 200);
+  assert.equal(resumePayload.conversation_id, "conv-resumed-1");
+  assert.equal(resumePayload.worktree.preserved, true);
+
+  const resumedState = readLoopState(sb.stateDir, loopId);
+  assert.equal(resumedState.resume_count, 1);
+  assert.equal(resumedState.resumed_from_iteration, 2);
+  assert.equal(resumedState.in_flight_iteration, null);
+
+  const streamStarts = sb.readCalls().filter((c) => c.mode === "stream-start");
+  assert.equal(streamStarts.length, 1);
+  assert.equal(streamStarts[0].conversationArg, "conv-resumed-1");
+  assert.equal(fs.realpathSync(streamStarts[0].cwd), fs.realpathSync(savedInit.worktree_path));
+
+  const events = readEvents(sb.stateDir, loopId);
+  assert.ok(
+    events.some(
+      (e) => e.event === "iteration_end" && e.iteration === 2 && e.outcome === "interrupted"
+    )
+  );
+  assert.ok(
+    events.some(
+      (e) =>
+        e.event === "resume" &&
+        e.resumed_from_iteration === 2 &&
+        e.previous_status === "running" &&
+        e.resume_count === 1
+    )
+  );
+
+  // 4. Reject resuming `done` loop (Exit 2)
+  const doneReject = sb.runCli(["resume", loopId, "--max", "5", "--json"]);
+  assert.equal(doneReject.status, 2);
+  assert.match(JSON.parse(doneReject.stdout).error, /already finished/i);
+
+  // 5. Resume `blocked`, `error`, and `max_tokens` (requires higher --max-tokens)
+  const errLoop = createLoopState(sb.stateDir, {
+    loop_id: "lp_20261122T040001Z_er01",
+    status: "error",
+    workspace_dir: sb.workspace,
+    engine: "headless",
+    iteration: 1,
+    max_iterations: 2,
+    exit_reason: "unhandled_exception",
+    usage_totals: { total_tokens: 40 },
+    run_config_snapshot: { maxIterations: 2, prompt: "recover error" },
+  });
+  sb.setScenario({
+    jsonTurns: [
+      {
+        envelope: {
+          status: "SUCCESS",
+          usage: { total_tokens: 60 },
+          structured_output: {
+            iteration: 1,
+            loop_status: "DONE",
+            next_delay_sec: 0,
+            summary: "Error loop recovered",
+            next_hint: "None",
+          },
+        },
+      },
+    ],
+  });
+  const errResume = sb.runCli(["resume", errLoop.loop_id, "--json"]);
+  assert.equal(errResume.status, 0, errResume.stderr);
+  assert.equal(JSON.parse(errResume.stdout).status, "done");
+
+  const tokLoop = createLoopState(sb.stateDir, {
+    loop_id: "lp_20261122T040002Z_tk01",
+    status: "max_reached",
+    workspace_dir: sb.workspace,
+    engine: "headless",
+    iteration: 1,
+    max_iterations: 4,
+    max_tokens: 100,
+    last_status: "CONTINUE",
+    last_delay_sec: 1,
+    exit_reason: "max_tokens",
+    usage_totals: { total_tokens: 120 },
+    run_config_snapshot: { maxIterations: 4, maxTokens: 100, prompt: "bump tokens" },
+  });
+  appendEvent(sb.stateDir, tokLoop.loop_id, {
+    event: "iteration",
+    iteration: 1,
+    last_status: "CONTINUE",
+  });
+  const tokFail = sb.runCli(["resume", tokLoop.loop_id, "--max-tokens", "110", "--json"]);
+  assert.equal(tokFail.status, 2);
+  assert.match(JSON.parse(tokFail.stdout).error, /--max-tokens/);
+
+  sb.setScenario({
+    jsonTurns: [
+      {
+        envelope: {
+          status: "SUCCESS",
+          usage: { total_tokens: 50 },
+          structured_output: {
+            iteration: 2,
+            loop_status: "DONE",
+            next_delay_sec: 0,
+            summary: "Resumed with higher max_tokens",
+            next_hint: "None",
+          },
+        },
+      },
+    ],
+  });
+  const tokOk = sb.runCli(["resume", tokLoop.loop_id, "--max-tokens", "300", "--json"]);
+  assert.equal(tokOk.status, 0, tokOk.stderr);
+  assert.equal(JSON.parse(tokOk.stdout).usage_totals.total_tokens, 170);
+
+  // 6. Reject live PID (Exit 1) and deleted worktree (Exit 2)
+  const livePidLoop = createLoopState(sb.stateDir, {
+    loop_id: "lp_20261122T040003Z_lv01",
+    status: "running",
+    workspace_dir: sb.workspace,
+    engine: "headless",
+    pid: process.pid,
+  });
+  const liveReject = sb.runCli(["resume", livePidLoop.loop_id, "--json"]);
+  assert.equal(liveReject.status, 1);
+  assert.match(JSON.parse(liveReject.stdout).error, /currently running/i);
+
+  const missingWtLoop = createLoopState(sb.stateDir, {
+    loop_id: "lp_20261122T040004Z_wt01",
+    status: "stopped",
+    workspace_dir: sb.workspace,
+    engine: "headless",
+    worktree_path: path.join(sb.root, "deleted-worktree"),
+  });
+  const wtReject = sb.runCli(["resume", missingWtLoop.loop_id, "--json"]);
+  assert.equal(wtReject.status, 2);
+  assert.match(JSON.parse(wtReject.stdout).error, /worktree directory is missing/i);
+
+  // 7. Human-readable `agy-loop logs` renders v1.3 events cleanly
+  appendEvent(sb.stateDir, loopId, {
+    event: "inbox_claim",
+    iteration: 2,
+    count: 1,
+    types: ["nudge"],
+  });
+  appendEvent(sb.stateDir, loopId, {
+    event: "verify_cmd",
+    iteration: 2,
+    cmd: "npm test",
+    passed: true,
+    exit_code: 0,
+  });
+  const logsText = sb.runCli(["logs", loopId]);
+  assert.equal(logsText.status, 0, logsText.stderr);
+  assert.match(logsText.stdout, /iteration_start.*snapshot=/);
+  assert.match(logsText.stdout, /iteration_end.*outcome=interrupted/);
+  assert.match(logsText.stdout, /resume.*from=#2.*prev=running.*count=1/);
+  assert.match(logsText.stdout, /inbox_claim.*claimed=1.*types=nudge/);
+  assert.match(logsText.stdout, /verify_cmd.*cmd=npm test.*exit=0/);
+});
+
+test("v1.3 #72 regressions: pre-aborted AbortSignal, async sleepFn rejection, mid-iter SIGINT resume, paused elapsed_sec, and capped delayed one-shot", async (t) => {
+  const sb = makeHeadlessSandbox(t);
+
+  // 1. Pre-aborted AbortSignal -> stopped / exit_reason: "signal" / exitCode: 130 (never "error" / 1)
+  sb.setScenario({ jsonTurns: [] });
+  const preAbortedAc = new AbortController();
+  preAbortedAc.abort(new Error("already aborted"));
+  const cfgPre = parseRunArgs(["--once", "--quiet", "pre-aborted"]);
+  cfgPre.cwd = sb.workspace;
+  const resPre = await runHeadlessLoop(cfgPre, {
+    agyBin: sb.mockAgyPath,
+    env: sb.baseEnv,
+    stdout: { write: () => {} },
+    stderr: { write: () => {} },
+    signal: preAbortedAc.signal,
+    registerSignals: false,
+  });
+  assert.equal(resPre.exitCode, EXIT_CODES.STOPPED);
+  assert.equal(resPre.state.status, "stopped");
+  assert.equal(resPre.state.exit_reason, "signal");
+  assert.equal(sb.readCalls().filter((c) => c.mode === "json").length, 0);
+
+  // 2. Async-rejecting sleepFn WITH active signal -> propagates rejection -> status: "error", exitCode: 1
+  sb.setScenario({
+    jsonTurns: [
+      {
+        envelope: {
+          status: "SUCCESS",
+          usage: { total_tokens: 20 },
+          structured_output: {
+            iteration: 1,
+            loop_status: "CONTINUE",
+            next_delay_sec: 15,
+            summary: "Iter 1 ok",
+            next_hint: "Continue",
+          },
+        },
+      },
+    ],
+  });
+  const asyncAc = new AbortController();
+  const cfgAsync = parseRunArgs(["10s", "--max", "3", "--quiet", "async reject sleep"]);
+  cfgAsync.cwd = sb.workspace;
+  const resAsync = await runHeadlessLoop(cfgAsync, {
+    agyBin: sb.mockAgyPath,
+    env: sb.baseEnv,
+    stdout: { write: () => {} },
+    stderr: { write: () => {} },
+    signal: asyncAc.signal,
+    sleepFn: async () => {
+      throw new Error("async sleep rejection");
+    },
+    registerSignals: false,
+  });
+  assert.equal(resAsync.exitCode, EXIT_CODES.ERROR);
+  assert.equal(resAsync.state.status, "error");
+  assert.equal(resAsync.state.exit_reason, "unhandled_exception");
+  assert.match(resAsync.state.last_summary, /async sleep rejection/);
+
+  // 3. Mid-iteration SIGINT abort during iter 2 -> resume re-runs interrupted iteration 2 (NOT 3!)
+  sb.setScenario({
+    jsonTurns: [
+      {
+        envelope: {
+          status: "SUCCESS",
+          usage: { total_tokens: 30 },
+          structured_output: {
+            iteration: 1,
+            loop_status: "CONTINUE",
+            next_delay_sec: 10,
+            summary: "Iter 1 ok",
+            next_hint: "Start iter 2",
+          },
+        },
+      },
+      {
+        sleepMs: 1500,
+        envelope: {
+          status: "SUCCESS",
+          usage: { total_tokens: 30 },
+          structured_output: {
+            iteration: 2,
+            loop_status: "DONE",
+            next_delay_sec: 0,
+            summary: "Never completes due to abort",
+            next_hint: "None",
+          },
+        },
+      },
+    ],
+  });
+  const midSigAc = new AbortController();
+  const cfgMidSig = parseRunArgs(["10s", "--max", "3", "--quiet", "mid-iter sigint resume"]);
+  cfgMidSig.cwd = sb.workspace;
+  const midSigPromise = runHeadlessLoop(cfgMidSig, {
+    agyBin: sb.mockAgyPath,
+    env: sb.baseEnv,
+    stdout: { write: () => {} },
+    stderr: { write: () => {} },
+    signal: midSigAc.signal,
+    sleepFn: async () => {},
+    registerSignals: false,
+  });
+  const midSigLoopId = await waitFor(() => {
+    const running = listLoops(sb.stateDir, { includeAll: false });
+    if (running.length === 0) return null;
+    const evs = readEvents(sb.stateDir, running[0].loop_id);
+    return evs.some((e) => e.event === "iteration_start" && e.iteration === 2)
+      ? running[0].loop_id
+      : null;
+  });
+  await new Promise((r) => setTimeout(r, 80));
+  midSigAc.abort(new Error("SIGINT"));
+  const midSigRes = await midSigPromise;
+  assert.equal(midSigRes.exitCode, EXIT_CODES.STOPPED);
+  assert.equal(midSigRes.state.status, "stopped");
+  assert.equal(midSigRes.state.iteration, 2);
+  assert.equal(midSigRes.state.in_flight_iteration, null);
+  const midSigEvents = readEvents(sb.stateDir, midSigLoopId);
+  assert.ok(
+    midSigEvents.some(
+      (e) => e.event === "iteration_end" && e.iteration === 2 && e.outcome === "stopped"
+    )
+  );
+
+  // Resume midSigLoopId -> must re-run iteration 2 (NOT skip to 3)
+  sb.setScenario({
+    jsonTurns: [
+      {
+        envelope: {
+          status: "SUCCESS",
+          usage: { total_tokens: 45 },
+          structured_output: {
+            iteration: 2,
+            loop_status: "DONE",
+            next_delay_sec: 0,
+            summary: "Resumed iter 2 completed",
+            next_hint: "None",
+          },
+        },
+      },
+    ],
+  });
+  const resumedMid = await resumeHeadlessLoop(
+    midSigLoopId,
+    { cwd: sb.workspace, quiet: true },
+    {
+      agyBin: sb.mockAgyPath,
+      env: sb.baseEnv,
+      stdout: { write: () => {} },
+      stderr: { write: () => {} },
+      registerSignals: false,
+    }
+  );
+  assert.equal(resumedMid.exitCode, EXIT_CODES.DONE);
+  assert.equal(resumedMid.state.status, "done");
+  assert.equal(resumedMid.state.iteration, 2);
+  const resumedWorkerCall = sb.readCalls().find((c) => c.mode === "json");
+  assert.match(resumedWorkerCall.args[resumedWorkerCall.args.length - 1], /\[AGY-LOOP ITERATION 2\/3\]/);
+
+  // 4. Paused --max-duration across a long wall-clock pause -> resume uses persisted elapsed_sec
+  sb.setScenario({
+    jsonTurns: [
+      {
+        envelope: {
+          status: "SUCCESS",
+          usage: { total_tokens: 25 },
+          structured_output: {
+            iteration: 1,
+            loop_status: "CONTINUE",
+            next_delay_sec: 10,
+            summary: "Active 2s then stopped",
+            next_hint: "Finish on resume",
+          },
+        },
+      },
+    ],
+  });
+  let pauseClockMs = 1_700_000_000_000;
+  const pauseAc = new AbortController();
+  const cfgPause = parseRunArgs(["10s", "--max", "3", "--max-duration", "60s", "--quiet", "paused duration"]);
+  cfgPause.cwd = sb.workspace;
+  const pauseFirst = await runHeadlessLoop(cfgPause, {
+    agyBin: sb.mockAgyPath,
+    env: sb.baseEnv,
+    stdout: { write: () => {} },
+    stderr: { write: () => {} },
+    signal: pauseAc.signal,
+    nowMs: () => pauseClockMs,
+    sleepFn: async () => {
+      pauseClockMs += 2000;
+      pauseAc.abort(new Error("SIGINT"));
+    },
+    registerSignals: false,
+  });
+  assert.equal(pauseFirst.exitCode, EXIT_CODES.STOPPED);
+  assert.ok(
+    typeof pauseFirst.state.elapsed_sec === "number" && pauseFirst.state.elapsed_sec < 10,
+    `Expected active elapsed_sec < 10, got ${pauseFirst.state.elapsed_sec}`
+  );
+  // Simulate 2-hour wall-clock pause between stop and resume (7200s >> max_duration_sec 60s)
+  updateLoopState(sb.stateDir, pauseFirst.state.loop_id, {
+    started_at: "2026-11-22T00:00:00Z",
+    finished_at: "2026-11-22T02:00:00Z",
+    elapsed_sec: 2,
+  });
+
+  sb.setScenario({
+    jsonTurns: [
+      {
+        envelope: {
+          status: "SUCCESS",
+          usage: { total_tokens: 35 },
+          structured_output: {
+            iteration: 2,
+            loop_status: "DONE",
+            next_delay_sec: 0,
+            summary: "Resumed within active budget",
+            next_hint: "None",
+          },
+        },
+      },
+    ],
+  });
+  let resumeClockMs = 1_700_010_000_000;
+  const pauseResumed = await resumeHeadlessLoop(
+    pauseFirst.state.loop_id,
+    { cwd: sb.workspace, quiet: true },
+    {
+      agyBin: sb.mockAgyPath,
+      env: sb.baseEnv,
+      stdout: { write: () => {} },
+      stderr: { write: () => {} },
+      nowMs: () => resumeClockMs,
+      registerSignals: false,
+    }
+  );
+  assert.equal(pauseResumed.exitCode, EXIT_CODES.DONE);
+  assert.equal(pauseResumed.state.status, "done");
+  assert.equal(pauseResumed.state.iteration, 2);
+
+  // 5. Delayed one-shot (once: true, intervalSec: 30 > maxDurationSec: 5) capped by maxDurationSec -> max_reached/max_duration
+  sb.setScenario({ jsonTurns: [] });
+  let delayedClockMs = 1_700_020_000_000;
+  const delayedSleeps = [];
+  const cfgDelayed = parseRunArgs(["in", "30s", "--max-duration", "5s", "--quiet", "capped delayed one-shot"]);
+  cfgDelayed.cwd = sb.workspace;
+  const resDelayed = await runHeadlessLoop(cfgDelayed, {
+    agyBin: sb.mockAgyPath,
+    env: sb.baseEnv,
+    stdout: { write: () => {} },
+    stderr: { write: () => {} },
+    nowMs: () => delayedClockMs,
+    sleepFn: async (ms) => {
+      delayedSleeps.push(ms);
+      delayedClockMs += ms;
+    },
+    registerSignals: false,
+  });
+  assert.equal(resDelayed.exitCode, EXIT_CODES.MAX_REACHED);
+  assert.equal(resDelayed.state.status, "max_reached");
+  assert.equal(resDelayed.state.exit_reason, "max_duration");
+  assert.equal(delayedSleeps.reduce((a, b) => a + b, 0), 5000);
+  assert.equal(sb.readCalls().filter((c) => c.mode === "json").length, 0);
+});
+
 

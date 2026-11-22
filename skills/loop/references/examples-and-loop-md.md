@@ -106,6 +106,21 @@ Sleeps non-blockingly first, runs a single isolated pass when the timer triggers
 /agy-loop:loop --once 10m check if docker multi-arch build finished
 ```
 
+### Live Steering (`nudge` & `wake`) Without Restarting
+Queue steering instructions or cut an inter-iteration sleep short for an active `workflow` or `headless` loop via `<workspace>/.agents/.agy-loop/loops/<loop_id>/inbox/`:
+```text
+/agy-loop:loop nudge latest "focus on tests/auth.test.mjs first"
+/agy-loop:loop nudge lp_20261122T160000Z_ab12 "check flaky port binding" --wake
+/agy-loop:loop wake latest
+```
+
+### Dynamic Workflow Engine (`--engine workflow`, `--verify`, `--verify-cmd`, `--targets`)
+Passing `--engine workflow` or any workflow-only option (`--verify`, `--verifier-model`, `--verify-cmd`, `--probe`, `--targets`, `--max-tokens`, `--max-duration`, `--reset-every`) routes `/agy-loop:loop` through `run_workflow` (`agy >= 1.5.9`), reducing main-session turns by ~95% and enabling two-stage verification plus parallel target fan-out. See [workflow-engine.md](workflow-engine.md) for the complete `Args` mapping, fallback rules, and recipes:
+```text
+/agy-loop:loop fix auth regression --verify-cmd "npm test" --verify --verifier-model pro --max 5
+/agy-loop:loop audit lint warnings --targets "packages/core,packages/cli" --engine workflow --max 4
+```
+
 ---
 
 ## 3. Interactive Antigravity CLI (`agy`) TUI Controls
@@ -115,7 +130,9 @@ While `/agy-loop:loop` runs asynchronously in the background, users have full in
 | Control | Where to Use | Effect |
 | :--- | :--- | :--- |
 | `/agy-loop:loop status [--all]` | Main chat prompt | Lists active (or all) persisted `.agents/.agy-loop/` loops correlated with `manage_task` timers/crons and `manage_subagents` workers. |
-| `/agy-loop:loop stop [<id1> <id2>\|all] [--after-current]` | Main chat prompt | Cancels linked `schedule` timers and terminates loop subagents (or drains gracefully after the current pass with `--after-current`). |
+| `/agy-loop:loop nudge <id\|latest> "<msg>" [--wake]` | Main chat prompt | Atomically queues steering instructions into `inbox/` for the next iteration (pass `--wake` to also interrupt sleep or skip post-turn sleep). |
+| `/agy-loop:loop wake <id\|latest>` | Main chat prompt | Atomically queues a `wake` signal in `inbox/` to interrupt inter-iteration sleep (or skip post-turn sleep if mid-iteration). |
+| `/agy-loop:loop stop [<id1> <id2>\|all] [--after-current]` | Main chat prompt | Cancels linked `schedule` timers, writes `control.json` + `inbox/` `stop`, and terminates loop subagents (or drains gracefully after the current pass with `--after-current`). |
 | `/agy-loop:loop doctor [--clean-shadow]` | Main chat prompt | Checks shadow files in `~/.gemini/...` (optionally archiving to UTC backup), `skills.json` filters, active `loop.md`, and `active_loops`. |
 | `/agy-loop:loop help` | Main chat prompt | Prints concise `/agy-loop:loop` modes, flags, and lifecycle reference without starting a loop. |
 | `/tasks` -> `k` | `agy` TUI panel | Opens background task manager; highlight a scheduled timer or cron job and press `k` to kill future wake-ups (`x` removes finished entries). |
