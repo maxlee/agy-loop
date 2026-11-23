@@ -1,25 +1,44 @@
 # `/agy-loop:loop` Recipes, `.agents/loop.md` Templates & CLI TUI Controls
 
-Progressive-disclosure reference for `skills/loop/SKILL.md` (`agy-loop`). Load this file via `read_file` or `view_file` only when the user asks for `.agents/loop.md` starter templates, advanced `/agy-loop:loop` recipes, or interactive CLI controls.
+Progressive-disclosure reference for `skills/loop/SKILL.md` (`agy-loop` v2.0.0). Load this file via `read_file` or `view_file` when the user asks for `.agents/loop.md` / `.agents/loops/<name>.md` starter templates, advanced `/agy-loop:loop` recipes, or interactive CLI controls. For the full YAML v2 frontmatter schema, `--trust-profile-commands` security rules, Four-Gate Lease Locks, and persistent `agy-loop daemon` setup, see [profiles-and-daemons.md](profiles-and-daemons.md).
 
 > **Why `/agy-loop:loop`?** Antigravity native plugins namespace bundled skills as `/<plugin>:<skill>` across Desktop Marketplace and CLI (`agy`), avoiding writes outside the plugin bundle (`~/.gemini/config/skills/`).
 
 ---
 
-## 1. Ready-to-Use `.agents/loop.md` Templates
+## 1. Ready-to-Use `.agents/loop.md` & Named Profile Templates
 
-When `/agy-loop:loop` or `/agy-loop:loop <interval>` is invoked without an inline prompt, `skills/loop/scripts/loop-helper.sh resolve-task` evaluates files on **every wake-up** (up to `25,000` bytes) in strict priority order:
+When `/agy-loop:loop`, `/agy-loop:loop <interval>`, or `--profile <name>` / `--file <path>` is invoked without an inline prompt, `skills/loop/scripts/loop-helper.sh resolve-task` (and `workflow.py` / `runner.mjs`) resolves instructions on **every wake-up** in strict order:
 
-1. `<workspace>/.agents/loop.md` — Team or repository-specific loop policy (commit to git or gitignore per preference)
-2. `<workspace>/loop.md` — Workspace root loop policy
-3. `~/.gemini/config/loop.md` — Personal global fallback across repositories
-4. Built-in branch, incremental test, and PR maintenance fallback
+- **Named profile (`--profile <name>`)**:
+  1. `<workspace>/.agents/loops/<name>.md` (repository/team profile)
+  2. `~/.gemini/config/loops/<name>.md` (personal global profile)
+- **Explicit file (`--file <path>`)**: `<path>` resolved relative to `<workspace>` (mutually exclusive with `--profile` and inline prompts)
+- **Default lookup (no `--profile` / `--file`)**:
+  1. `<workspace>/.agents/loop.md` — Team or repository-specific loop policy
+  2. `<workspace>/loop.md` — Workspace root loop policy
+  3. `~/.gemini/config/loop.md` — Personal global fallback across repositories
+  4. Built-in branch, incremental test, and PR maintenance fallback
 
-Live edits to any `loop.md` file take effect automatically on the next scheduled tick without restarting `/agy-loop:loop`.
+Optional YAML v2 frontmatter (`--- ... ---`) is stripped before measuring the `25,000`-byte UTF-8-safe cap on the Markdown body (`has_frontmatter: false` for plain `v1.x` Markdown). Live edits to the Markdown body take effect automatically on the next scheduled tick without restarting `/agy-loop:loop`. See [profiles-and-daemons.md](profiles-and-daemons.md) for the complete 33-key frontmatter reference.
 
-### Template A: PR Babysitter & CI Healer (`.agents/loop.md`)
+### Template A: Named PR Babysitter & CI Healer Profile (`.agents/loops/ci.md` with YAML v2 Frontmatter)
 
 ```markdown
+---
+name: ci
+description: "PR babysitter and CI failure healer"
+interval: 3m
+max_iterations: 15
+state_mode: stateful
+reset_every: 5
+worktree: true
+verify: true
+verifier_model: pro
+singleton: profile
+max_duration: 90m
+---
+
 # PR Babysitter & CI Healer
 
 1. Inspect `git status -sb` and run fast incremental verification (`npm test` or targeted tests for modified files).
@@ -32,7 +51,9 @@ Live edits to any `loop.md` file take effect automatically on the next scheduled
    - Otherwise return `LOOP_STATUS: CONTINUE` with `NEXT_DELAY_SEC` set to `45` while builds just started, `180` while queued in CI, or `900` when green and monitoring.
 ```
 
-### Template B: Local TDD / Refactoring Watchdog (`.agents/loop.md`)
+> **Security note**: Never rely on frontmatter `probe_cmd` / `verify_cmd` executing automatically in untrusted repos—interactive `run_workflow` blocks frontmatter commands completely (pass `--probe` / `--verify-cmd` explicitly), and Headless `agy-loop run` requires explicit `--trust-profile-commands`. See [profiles-and-daemons.md](profiles-and-daemons.md#4-security-boundary---trust-profile-commands--sidecar-grants).
+
+### Template B: Local TDD / Refactoring Watchdog (`.agents/loop.md` or `.agents/loops/tdd.md`, Plain Markdown)
 
 ```markdown
 # Incremental Test & Typecheck Watchdog
@@ -60,6 +81,24 @@ Live edits to any `loop.md` file take effect automatically on the next scheduled
 
 ## 2. Advanced `/agy-loop:loop` Recipes
 
+### Discover & Run Named Profiles (`profiles`, `--profile`, `--file`)
+List workspace and global profiles (`default`, `.agents/loops/*.md`, `~/.gemini/config/loops/*.md`) or launch a named profile directly (CLI flags always override frontmatter defaults):
+```text
+/agy-loop:loop profiles
+/agy-loop:loop profiles --json
+/agy-loop:loop --profile ci
+/agy-loop:loop --profile ci --max 8 --verify-cmd "npm test"
+/agy-loop:loop --file .agents/loops/custom.md
+```
+
+### Single-Instance Lease Locks (`--singleton`, `--on-conflict`)
+Prevent overlapping loop runs across sessions and terminals using the Four-Gate Lease Lock (`<stateRoot>/locks/<scope_key>.lock.json`). Passing `--singleton` or `--on-conflict` routes `/agy-loop:loop` through `run_workflow` (`workflow.py`), and defaults to `profile` scope whenever `--profile` or `--file` is set:
+```text
+/agy-loop:loop --profile ci --singleton profile --on-conflict wake
+/agy-loop:loop run tests and fix failures --singleton workspace --on-conflict fail
+```
+*(In terminal Headless mode, use `agy-loop run --profile ci --singleton profile --on-conflict wake --relay-on-wake`, or install cross-reboot automation with `agy-loop daemon install` — see [profiles-and-daemons.md](profiles-and-daemons.md).)*
+
 ### Sub-Minute & Compound Duration Local Readiness (`DurationSeconds`)
 Beats 1-minute cron floors using non-overlapping one-shot timers, and supports prefix `every` plus compound durations (`1h30m`, `2m30s`, `1d12h`):
 ```text
@@ -81,7 +120,7 @@ Runs inside `Workspace: "branch"` so uncommitted edits in your active terminal r
 ```
 
 ### Escaping Command Flags (`--` & Two-Tier Validation)
-Unrecognized flags in leading option slots or close typos (`--statefull`, `--max-iter`) fail fast with Exit `2`, while command flags embedded mid/trailing prompt (`gh pr checks --required`) pass through with a non-blocking warning (or pass `--` to treat everything after as literal prompt text):
+Unrecognized flags in leading option slots or close typos (`--statefull`, `--max-iter`, `--profiles`) fail fast with Exit `2`, while command flags embedded mid/trailing prompt (`gh pr checks --required`) pass through with a non-blocking warning (or pass `--` to treat everything after as literal prompt text):
 ```text
 /agy-loop:loop 3m -- gh pr checks --required
 ```
@@ -115,7 +154,7 @@ Queue steering instructions or cut an inter-iteration sleep short for an active 
 ```
 
 ### Dynamic Workflow Engine (`--engine workflow`, `--verify`, `--verify-cmd`, `--targets`)
-Passing `--engine workflow` or any workflow-only option (`--verify`, `--verifier-model`, `--verify-cmd`, `--probe`, `--targets`, `--max-tokens`, `--max-duration`, `--reset-every`) routes `/agy-loop:loop` through `run_workflow` (`agy >= 1.5.9`), reducing main-session turns by ~95% and enabling two-stage verification plus parallel target fan-out. See [workflow-engine.md](workflow-engine.md) for the complete `Args` mapping, fallback rules, and recipes:
+Passing `--engine workflow` or any workflow-only / lease option (`--verify`, `--verifier-model`, `--verify-cmd`, `--probe`, `--targets`, `--max-tokens`, `--max-duration`, `--reset-every`, `--singleton`, `--on-conflict`) routes `/agy-loop:loop` through `run_workflow` (`agy >= 1.5.9`), reducing main-session turns by ~95% and enabling two-stage verification plus parallel target fan-out. See [workflow-engine.md](workflow-engine.md) for the complete `Args` mapping, fallback rules, and recipes:
 ```text
 /agy-loop:loop fix auth regression --verify-cmd "npm test" --verify --verifier-model pro --max 5
 /agy-loop:loop audit lint warnings --targets "packages/core,packages/cli" --engine workflow --max 4
@@ -130,8 +169,9 @@ While `/agy-loop:loop` runs asynchronously in the background, users have full in
 | Control | Where to Use | Effect |
 | :--- | :--- | :--- |
 | `/agy-loop:loop status [--all]` | Main chat prompt | Lists active (or all) persisted `.agents/.agy-loop/` loops correlated with `manage_task` timers/crons and `manage_subagents` workers. |
+| `/agy-loop:loop profiles [--json]` | Main chat prompt | Discovers default `loop.md`, `.agents/loops/*.md`, and `~/.gemini/config/loops/*.md` profiles, reporting frontmatter status and blocked command notices. |
 | `/agy-loop:loop nudge <id\|latest> "<msg>" [--wake]` | Main chat prompt | Atomically queues steering instructions into `inbox/` for the next iteration (pass `--wake` to also interrupt sleep or skip post-turn sleep). |
-| `/agy-loop:loop wake <id\|latest>` | Main chat prompt | Atomically queues a `wake` signal in `inbox/` to interrupt inter-iteration sleep (or skip post-turn sleep if mid-iteration). |
+| `/agy-loop:loop wake <id\|latest>` | Main chat prompt | Atomically queues a `wake` signal in `inbox/` to interrupt inter-iteration sleep (or skip post-turn sleep / trigger terminal relay on `DONE`). |
 | `/agy-loop:loop stop [<id1> <id2>\|all] [--after-current]` | Main chat prompt | Cancels linked `schedule` timers, writes `control.json` + `inbox/` `stop`, and terminates loop subagents (or drains gracefully after the current pass with `--after-current`). |
 | `/agy-loop:loop doctor [--clean-shadow]` | Main chat prompt | Checks shadow files in `~/.gemini/...` (optionally archiving to UTC backup), `skills.json` filters, active `loop.md`, and `active_loops`. |
 | `/agy-loop:loop help` | Main chat prompt | Prints concise `/agy-loop:loop` modes, flags, and lifecycle reference without starting a loop. |

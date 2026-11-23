@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -141,6 +141,11 @@ test("workflows/loop-runner/workflow.json satisfies schema contract and workflow
     "max_errors",
     "include_trajectory",
     "state_dir",
+    "profile",
+    "profile_file",
+    "singleton",
+    "on_conflict",
+    "relay_on_wake",
   ];
   for (const key of expectedProps) {
     assert.ok(
@@ -148,6 +153,9 @@ test("workflows/loop-runner/workflow.json satisfies schema contract and workflow
       `workflow.json args.properties missing '${key}'`
     );
   }
+  assert.deepEqual(manifest.args.properties.singleton.enum, ["profile", "workspace", "none", null]);
+  assert.deepEqual(manifest.args.properties.on_conflict.enum, ["wake", "skip", "fail", null]);
+  assert.equal(manifest.args.properties.relay_on_wake.type, "boolean");
 });
 
 test("workflows/loop-runner/workflow.py compiles with ast.PyCF_ALLOW_TOP_LEVEL_AWAIT", () => {
@@ -1089,4 +1097,762 @@ asyncio.run(main())
 `;
   runPythonHarness(script, { cwd: sb.workspace, env: sb.env });
 });
+
+test("workflow.py v2.0: multi-profile resolution, frontmatter defaults, STRICT block of frontmatter probe_cmd/verify_cmd, and Gate 4 terminal wake relay", (t) => {
+  const sb = makeWorkflowSandbox(t);
+  const pwnProbe = path.join(sb.workspace, "pwn-fm-probe");
+  const pwnVerify = path.join(sb.workspace, "pwn-fm-verify");
+  const pwnReloadProbe = path.join(sb.workspace, "pwn-fm-reload-probe");
+
+  const wsLoopsDir = path.join(sb.workspace, ".agents", "loops");
+  const globalLoopsDir = path.join(sb.home, ".gemini", "config", "loops");
+  fs.mkdirSync(wsLoopsDir, { recursive: true });
+  fs.mkdirSync(globalLoopsDir, { recursive: true });
+
+  fs.writeFileSync(
+    path.join(globalLoopsDir, "shared.md"),
+    "---\nworker_model: flash\nmax_iterations: 2\n---\nGlobal shared profile body\n",
+    "utf8"
+  );
+  fs.writeFileSync(
+    path.join(wsLoopsDir, "ci.md"),
+    [
+      "---",
+      "name: ci",
+      "interval: 15s",
+      "max_iterations: 4",
+      "state_mode: stateful",
+      "reset_every: 2",
+      "worker_model: flash",
+      "verify: true",
+      "verifier_model: pro",
+      "worktree: true",
+      "budget_tokens: 5000",
+      "max_errors: 2",
+      "targets: [api, web]",
+      "singleton: profile",
+      `probe_cmd: "touch '${pwnProbe}' && exit 0"`,
+      "probe_until_pass: true",
+      `verify_cmd: "touch '${pwnVerify}' && exit 1"`,
+      "---",
+      "Workspace CI profile body v1",
+    ].join("\n"),
+    "utf8"
+  );
+  const customProfileFile = path.join(sb.workspace, "custom-task.md");
+  fs.writeFileSync(
+    customProfileFile,
+    "---\nmax_iterations: 3\n---\nCustom file body\n",
+    "utf8"
+  );
+
+  const script = `
+async def main():
+    ws = ${JSON.stringify(sb.workspace)}
+    state_dir = ${JSON.stringify(sb.stateDir)}
+    ci_path = ${JSON.stringify(path.join(wsLoopsDir, "ci.md"))}
+    pwn_probe = ${JSON.stringify(pwnProbe)}
+    pwn_verify = ${JSON.stringify(pwnVerify)}
+    pwn_reload = ${JSON.stringify(pwnReloadProbe)}
+
+    async def mock_parallel(items, fn):
+        return await asyncio.gather(*(fn(x) for x in items))
+
+    async def mock_with_budget(awaitable, **kw):
+        return await awaitable
+
+    # 1. Workspace profile overrides global & applies safe frontmatter defaults while NEVER executing frontmatter commands!
+    logs_1 = []
+    worker_calls_1 = []
+    verifier_calls_1 = []
+
+    def mock_agent_1(prompt, **kwargs):
+        if kwargs.get("type_name") == "loop-verifier":
+            async def _ver():
+                verifier_calls_1.append({"prompt": prompt, "kwargs": kwargs})
+                return {"passed": True, "summary": "Verified without fm cmds", "issues": []}
+            return _ver()
+        worker_calls_1.append({"prompt": prompt, "kwargs": kwargs})
+        async def _send(turn_prompt, schema=None):
+            worker_calls_1.append({"turn_prompt": turn_prompt})
+            return {
+                "iteration": 1,
+                "loop_status": "DONE",
+                "next_delay_sec": 0,
+                "summary": "Target done",
+                "next_hint": "None",
+            }
+        return _send
+
+    res_ci = await run_loop_workflow({
+        "workspace_dir": ws,
+        "profile": "ci",
+        # Override targets=[] explicitly to run single worker; verify frontmatter defaults for model/verify/max_iterations
+        "targets": [],
+        "max_iterations": 2,  # Explicit override > frontmatter 4
+    }, {
+        "phase": lambda _n: None,
+        "log": lambda *a: logs_1.append(" ".join(str(x) for x in a)),
+        "agent": mock_agent_1,
+        "parallel": mock_parallel,
+        "with_budget": mock_with_budget,
+        "tokens_used": lambda _s=None: {"total_tokens": 30},
+        "BudgetExceeded": MockBudgetExceeded,
+        "sleep_fn": lambda _s: asyncio.sleep(0),
+        "output_fn": lambda *a: None,
+    })
+
+    assert res_ci["ok"] is True
+    assert res_ci["status"] == "done"
+    assert res_ci["profile_name"] == "ci"
+    assert res_ci["singleton"] == "profile"
+    assert res_ci["max_iterations"] == 2
+    assert not pathlib.Path(pwn_probe).exists(), "Frontmatter probe_cmd MUST NEVER execute in workflow.py"
+    assert not pathlib.Path(pwn_verify).exists(), "Frontmatter verify_cmd MUST NEVER execute in workflow.py"
+    assert any("Skipping untrusted frontmatter probe_cmd/verify_cmd" in line for line in logs_1)
+    assert len(verifier_calls_1) == 1
+    assert verifier_calls_1[0]["kwargs"]["model"] == "pro"
+    assert worker_calls_1[0]["kwargs"]["model"] == "flash"
+    assert worker_calls_1[0]["kwargs"]["workspace"] == "branch"
+    assert "Workspace CI profile body v1" in worker_calls_1[1]["turn_prompt"]
+    assert "probe_cmd:" not in worker_calls_1[1]["turn_prompt"]
+
+    # 2. Global profile lookup + profile_file lookup + validation errors
+    res_global = await run_loop_workflow({
+        "workspace_dir": ws,
+        "profile": "shared",
+    }, {
+        "phase": lambda _n: None,
+        "log": lambda *a: None,
+        "agent": lambda p, **kw: (lambda: asyncio.sleep(0, result={
+            "iteration": 1, "loop_status": "DONE", "next_delay_sec": 0, "summary": "ok", "next_hint": "None"
+        }))(),
+        "parallel": mock_parallel,
+        "with_budget": mock_with_budget,
+        "tokens_used": lambda _s=None: {"total_tokens": 10},
+        "BudgetExceeded": MockBudgetExceeded,
+        "output_fn": lambda *a: None,
+    })
+    assert res_global["status"] == "done"
+    assert res_global["profile_name"] == "shared"
+    assert res_global["max_iterations"] == 2
+
+    res_file = await run_loop_workflow({
+        "workspace_dir": ws,
+        "profile_file": "custom-task.md",
+    }, {
+        "phase": lambda _n: None,
+        "log": lambda *a: None,
+        "agent": lambda p, **kw: (lambda: asyncio.sleep(0, result={
+            "iteration": 1, "loop_status": "DONE", "next_delay_sec": 0, "summary": "file ok", "next_hint": "None"
+        }))(),
+        "parallel": mock_parallel,
+        "with_budget": mock_with_budget,
+        "tokens_used": lambda _s=None: {"total_tokens": 10},
+        "BudgetExceeded": MockBudgetExceeded,
+        "output_fn": lambda *a: None,
+    })
+    assert res_file["status"] == "done"
+    assert res_file["profile_name"] == "custom-task"
+    assert res_file["max_iterations"] == 3
+
+    # Reject traversal and mutually exclusive profile + profile_file
+    for bad_args in [
+        {"workspace_dir": ws, "profile": "../evil"},
+        {"workspace_dir": ws, "profile": "ci", "profile_file": "custom-task.md"},
+        {"workspace_dir": ws, "profile": "ci", "prompt": "inline conflict"},
+    ]:
+        raised = False
+        try:
+            await run_loop_workflow(bad_args, {
+                "agent": lambda *a, **kw: None, "parallel": mock_parallel, "with_budget": mock_with_budget,
+            })
+        except ValueError:
+            raised = True
+        assert raised, f"Expected ValueError for {bad_args}"
+
+    # 3. Gate 4 terminal wake_requested relay + live-reloaded frontmatter command never runs
+    relay_path = pathlib.Path(ws, ".agents", "loops", "relay.md")
+    relay_path.write_text("---\\nsingleton: profile\\nmax_iterations: 3\\n---\\nInitial relay profile v1\\n", encoding="utf-8")
+    lid_relay = "lp_20261123T001000Z_rel1"
+    prompts_relay = []
+
+    def mock_agent_relay(prompt, **kwargs):
+        async def _run():
+            prompts_relay.append(prompt)
+            it = len(prompts_relay)
+            if it == 1:
+                # Mutate relay.md with untrusted probe_cmd AND push nudge --wake before DONE finishes!
+                relay_path.write_text(
+                    f"---\\nprobe_cmd: \\"touch '{pwn_reload}'\\"\\n---\\nReloaded body v2\\n",
+                    encoding="utf-8",
+                )
+                inbox_dir = pathlib.Path(state_dir, "loops", lid_relay, "inbox")
+                inbox_dir.mkdir(parents=True, exist_ok=True)
+                pathlib.Path(inbox_dir, "9000_wake.json").write_text(
+                    json.dumps({"type": "nudge", "message": "Handle relayed work", "wake": True}) + "\\n",
+                    encoding="utf-8",
+                )
+                return {"iteration": 1, "loop_status": "DONE", "next_delay_sec": 0, "summary": "First pass done", "next_hint": "None"}
+            return {"iteration": 2, "loop_status": "DONE", "next_delay_sec": 0, "summary": "Relayed pass done", "next_hint": "None"}
+        return _run()
+
+    res_relay = await run_loop_workflow({
+        "loop_id": lid_relay,
+        "workspace_dir": ws,
+        "profile": "relay",
+        "state_mode": "fresh",
+        "verify": False,
+        "max_iterations": 3,
+        "relay_on_wake": True,
+    }, {
+        "phase": lambda _n: None,
+        "log": lambda *a: None,
+        "agent": mock_agent_relay,
+        "parallel": mock_parallel,
+        "with_budget": mock_with_budget,
+        "tokens_used": lambda _s=None: {"total_tokens": len(prompts_relay) * 20},
+        "BudgetExceeded": MockBudgetExceeded,
+        "sleep_fn": lambda _s: asyncio.sleep(0),
+        "output_fn": lambda *a: None,
+    })
+
+    assert res_relay["ok"] is True
+    assert res_relay["status"] == "done"
+    assert res_relay["iteration"] == 2
+    assert res_relay["relay_count"] == 1
+    assert len(prompts_relay) == 2
+    assert "Reloaded body v2" in prompts_relay[1]
+    assert "Handle relayed work" in prompts_relay[1]
+    assert not pathlib.Path(pwn_reload).exists(), "Reloaded frontmatter probe_cmd MUST NOT execute"
+    st_relay = read_state(state_dir, lid_relay)
+    assert st_relay["relay_count"] == 1
+    evs_relay = read_events(state_dir, lid_relay)
+    assert any(e["event"] == "relay" and e["relay_count"] == 1 for e in evs_relay)
+
+asyncio.run(main())
+`;
+  runPythonHarness(script, { cwd: sb.workspace, env: sb.env });
+  assert.equal(fs.existsSync(pwnProbe), false);
+  assert.equal(fs.existsSync(pwnVerify), false);
+  assert.equal(fs.existsSync(pwnReloadProbe), false);
+});
+
+test("workflow.py <-> lib/lease-lock.mjs cross-runtime lock parity, Node<->Python coalescing/blocking, and dead-PID reclaim", async (t) => {
+  const sb = makeWorkflowSandbox(t);
+  const { computeLockScope, acquireLeaseLock, releaseLeaseLock, getLeaseLockPath } = await import(
+    "../lib/lease-lock.mjs"
+  );
+  const { createLoopState, peekInboxFlags, claimInboxMessages } = await import(
+    "../lib/state-store.mjs"
+  );
+
+  // 1. Byte-for-byte computeLockScope parity between Node and Python
+  const scopePairs = [
+    ["none", null],
+    ["workspace", null],
+    ["profile", null],
+    ["profile", "ci"],
+    ["profile", "nightly.audit_v2"],
+  ];
+  const nodeScopes = scopePairs.map(([singleton, profileName]) =>
+    computeLockScope({ singleton, workspaceDir: sb.workspace, profileName })
+  );
+
+  const parityScript = `
+async def main():
+    ws = ${JSON.stringify(sb.workspace)}
+    pairs = json.loads(${JSON.stringify(JSON.stringify(scopePairs))})
+    expected = json.loads(${JSON.stringify(JSON.stringify(nodeScopes))})
+    py_scopes = [NS["compute_lock_scope"](s, ws, p) for s, p in pairs]
+    assert py_scopes == expected, f"Scope mismatch: {py_scopes} vs {expected}"
+asyncio.run(main())
+`;
+  runPythonHarness(parityScript, { cwd: sb.workspace, env: sb.env });
+
+  // Ensure ci profile exists in this fresh sandbox for run_loop_workflow lock tests
+  const wsLoopsDir = path.join(sb.workspace, ".agents", "loops");
+  fs.mkdirSync(wsLoopsDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(wsLoopsDir, "ci.md"),
+    "---\nsingleton: profile\n---\nCI cross-runtime parity body\n",
+    "utf8"
+  );
+
+  // 2. Live Node lock coalesced/skipped/blocked by Python workflow.py + dead-PID reclaim
+  const scopeKey = computeLockScope({
+    singleton: "profile",
+    workspaceDir: sb.workspace,
+    profileName: "ci",
+  });
+  const nodeLoop = createLoopState(sb.stateDir, {
+    loop_id: "lp_20261123T002000Z_node",
+    status: "running",
+    workspace_dir: sb.workspace,
+    engine: "headless",
+    pid: process.pid,
+  });
+  const nodeHandleRes = await acquireLeaseLock({
+    stateRoot: sb.stateDir,
+    scope: "profile",
+    scopeKey,
+    loopId: nodeLoop.loop_id,
+    pid: process.pid,
+    profileName: "ci",
+    workspaceDir: sb.workspace,
+    leaseTtlMs: 60000,
+    onConflict: "fail",
+  });
+  assert.equal(nodeHandleRes.acquired, true);
+
+  const nodeHoldsPyContends = `
+async def main():
+    ws = ${JSON.stringify(sb.workspace)}
+    state_dir = ${JSON.stringify(sb.stateDir)}
+    spawned = []
+    async def mock_parallel(items, fn):
+        return await asyncio.gather(*(fn(x) for x in items))
+    async def mock_with_budget(awaitable, **kw):
+        return await awaitable
+    rt = {
+        "phase": lambda _n: None,
+        "log": lambda *a: None,
+        "agent": lambda *a, **kw: spawned.append(1),
+        "parallel": mock_parallel,
+        "with_budget": mock_with_budget,
+        "tokens_used": lambda _s=None: {"total_tokens": 0},
+        "BudgetExceeded": MockBudgetExceeded,
+        "output_fn": lambda *a: None,
+    }
+
+    res_fail = await run_loop_workflow({
+        "workspace_dir": ws, "profile": "ci", "singleton": "profile", "on_conflict": "fail",
+    }, rt)
+    assert res_fail["ok"] is False
+    assert res_fail["status"] == "lock_conflict"
+    assert res_fail["exit_reason"] == "lock_conflict"
+    assert res_fail["active_loop_id"] == ${JSON.stringify(nodeLoop.loop_id)}
+
+    res_skip = await run_loop_workflow({
+        "workspace_dir": ws, "profile": "ci", "singleton": "profile", "on_conflict": "skip",
+    }, rt)
+    assert res_skip["ok"] is True
+    assert res_skip["status"] == "skipped"
+    assert res_skip["exit_reason"] == "singleton_skipped"
+
+    res_wake = await run_loop_workflow({
+        "workspace_dir": ws, "profile": "ci", "singleton": "profile", "on_conflict": "wake",
+    }, rt)
+    assert res_wake["ok"] is True
+    assert res_wake["status"] == "coalesced"
+    assert res_wake["exit_reason"] == "singleton_coalesced"
+    assert len(spawned) == 0
+
+asyncio.run(main())
+`;
+  runPythonHarness(nodeHoldsPyContends, { cwd: sb.workspace, env: sb.env });
+  assert.equal(peekInboxFlags(sb.stateDir, nodeLoop.loop_id).wake, true);
+  const claimedInNode = claimInboxMessages(sb.stateDir, nodeLoop.loop_id);
+  assert.equal(claimedInNode.length, 1);
+  assert.equal(claimedInNode[0].type, "wake");
+  assert.equal(claimedInNode[0].reason, "singleton_coalesced");
+  assert.equal(releaseLeaseLock(nodeHandleRes.handle), true);
+
+  // 3. Python workflow.py reclaims dead-PID lock cleanly
+  fs.mkdirSync(path.dirname(getLeaseLockPath(sb.stateDir, scopeKey)), { recursive: true });
+  fs.writeFileSync(
+    getLeaseLockPath(sb.stateDir, scopeKey),
+    JSON.stringify({
+      scope: "profile",
+      scope_key: scopeKey,
+      loop_id: "lp_20261123T002001Z_dead",
+      pid: 99999999,
+      engine: "headless",
+      profile: "ci",
+      workspace_dir: sb.workspace,
+      acquired_at: new Date().toISOString(),
+      heartbeat_at: new Date().toISOString(),
+      lease_ttl_ms: 60000,
+      draining: false,
+    }),
+    "utf8"
+  );
+  const pyReclaimScript = `
+async def main():
+    ws = ${JSON.stringify(sb.workspace)}
+    res = await run_loop_workflow({
+        "workspace_dir": ws, "profile": "ci", "singleton": "profile", "on_conflict": "fail", "once": True,
+    }, {
+        "phase": lambda _n: None,
+        "log": lambda *a: None,
+        "agent": lambda p, **kw: (lambda: asyncio.sleep(0, result={
+            "iteration": 1, "loop_status": "DONE", "next_delay_sec": 0, "summary": "reclaimed", "next_hint": "None"
+        }))(),
+        "parallel": lambda items, fn: asyncio.gather(*(fn(x) for x in items)),
+        "with_budget": lambda aw, **kw: aw,
+        "tokens_used": lambda _s=None: {"total_tokens": 10},
+        "BudgetExceeded": MockBudgetExceeded,
+        "output_fn": lambda *a: None,
+    })
+    assert res["status"] == "done"
+    assert res["lock_scope_key"] == ${JSON.stringify(scopeKey)}
+asyncio.run(main())
+`;
+  runPythonHarness(pyReclaimScript, { cwd: sb.workspace, env: sb.env });
+  assert.equal(fs.existsSync(getLeaseLockPath(sb.stateDir, scopeKey)), false);
+
+  // 4. Live Python lock coalesced/blocked by Node lib/lease-lock.mjs
+  const pyHolderLoopId = "lp_20261123T002002Z_pyhd";
+  const pyHolderSrc = `
+import ast, asyncio, inspect, pathlib, sys
+SRC = pathlib.Path(${JSON.stringify(WORKFLOW_PY_PATH)}).read_text(encoding="utf-8")
+NS = {"__file__": ${JSON.stringify(WORKFLOW_PY_PATH)}, "__name__": "py_holder"}
+CODE_OBJ = compile(SRC, ${JSON.stringify(WORKFLOW_PY_PATH)}, "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+async def main():
+    res = eval(CODE_OBJ, NS, NS)
+    if inspect.iscoroutine(res):
+        await res
+    lock_res = await NS["acquire_lease_lock"](
+        state_root=${JSON.stringify(sb.stateDir)},
+        scope="profile",
+        scope_key=${JSON.stringify(scopeKey)},
+        loop_id=${JSON.stringify(pyHolderLoopId)},
+        engine="workflow",
+        profile_name="ci",
+        workspace_dir=${JSON.stringify(sb.workspace)},
+        lease_ttl_ms=60000,
+        on_conflict="fail",
+    )
+    assert lock_res["acquired"] is True
+    sys.stdout.write("LOCKED\\n")
+    sys.stdout.flush()
+    await asyncio.get_event_loop().run_in_executor(None, sys.stdin.read)
+    flags = NS["peek_inbox_flags"](${JSON.stringify(sb.stateDir)}, ${JSON.stringify(pyHolderLoopId)})
+    claimed = NS["claim_inbox_messages"](${JSON.stringify(sb.stateDir)}, ${JSON.stringify(pyHolderLoopId)})
+    assert flags["wake"] is True
+    assert any(m.get("type") == "wake" and m.get("reason") == "singleton_coalesced" for m in claimed)
+    NS["release_lease_lock"](lock_res["handle"])
+asyncio.run(main())
+`;
+  const pyHolder = spawn("python3", ["-c", pyHolderSrc], {
+    cwd: sb.workspace,
+    env: sb.env,
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  t.after(() => {
+    try {
+      pyHolder.kill("SIGKILL");
+    } catch {
+      // Ignore cleanup errors
+    }
+  });
+
+  await new Promise((resolve, reject) => {
+    let out = "";
+    let err = "";
+    pyHolder.stdout.on("data", (d) => {
+      out += d.toString("utf8");
+      if (out.includes("LOCKED")) resolve();
+    });
+    pyHolder.stderr.on("data", (d) => {
+      err += d.toString("utf8");
+    });
+    pyHolder.on("close", (code) => {
+      if (!out.includes("LOCKED")) {
+        reject(new Error(`Python holder exited early (${code}): ${err}`));
+      }
+    });
+  });
+
+  const nodeFail = await acquireLeaseLock({
+    stateRoot: sb.stateDir,
+    scope: "profile",
+    scopeKey,
+    loopId: "lp_20261123T002003Z_nct1",
+    pid: process.pid + 1,
+    profileName: "ci",
+    workspaceDir: sb.workspace,
+    onConflict: "fail",
+  });
+  assert.equal(nodeFail.acquired, false);
+  assert.equal(nodeFail.action, "conflict");
+  assert.equal(nodeFail.holder.loop_id, pyHolderLoopId);
+
+  const nodeWake = await acquireLeaseLock({
+    stateRoot: sb.stateDir,
+    scope: "profile",
+    scopeKey,
+    loopId: "lp_20261123T002004Z_nct2",
+    pid: process.pid + 2,
+    profileName: "ci",
+    workspaceDir: sb.workspace,
+    onConflict: "wake",
+  });
+  assert.equal(nodeWake.acquired, false);
+  assert.equal(nodeWake.action, "coalesced");
+
+  pyHolder.stdin.end();
+  const pyExit = await new Promise((resolve) => {
+    let err = "";
+    pyHolder.stderr.on("data", (d) => {
+      err += d.toString("utf8");
+    });
+    pyHolder.on("close", (status) => resolve({ status, err }));
+  });
+  assert.equal(pyExit.status, 0, pyExit.err);
+  assert.equal(fs.existsSync(getLeaseLockPath(sb.stateDir, scopeKey)), false);
+});
+
+test("workflow.py #95 regressions: default loop.md name: parity, once/targets=[] overrides, guarded Gate 2 reclaim, validation, & max_agents relay guard", async (t) => {
+  const sb = makeWorkflowSandbox(t);
+  const { computeLockScope, getLeaseLockPath } = await import("../lib/lease-lock.mjs");
+
+  // Default .agents/loop.md with `name: main-ci` MUST match Node computeLockScope byte-for-byte
+  const defaultDir = path.join(sb.workspace, ".agents");
+  const wsLoopsDir = path.join(defaultDir, "loops");
+  fs.mkdirSync(wsLoopsDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(defaultDir, "loop.md"),
+    "---\nname: main-ci\nsingleton: profile\n---\nDefault main-ci loop\n",
+    "utf8"
+  );
+  const expectedDefaultScope = computeLockScope({
+    singleton: "profile",
+    workspaceDir: sb.workspace,
+    profileName: "main-ci",
+  });
+
+  // Profile with max_iterations: 15, targets: [api, web] + once/stateful profiles
+  fs.writeFileSync(
+    path.join(wsLoopsDir, "ci.md"),
+    "---\nmax_iterations: 15\ntargets: [api, web]\nsingleton: profile\n---\nCI body\n",
+    "utf8"
+  );
+  fs.writeFileSync(
+    path.join(wsLoopsDir, "onceonly.md"),
+    "---\nonce: true\n---\nOnce body\n",
+    "utf8"
+  );
+  fs.writeFileSync(
+    path.join(wsLoopsDir, "stateful.md"),
+    "---\nstate_mode: stateful\nreset_every: 4\n---\nStateful body\n",
+    "utf8"
+  );
+
+  // Seed one dead-PID stale lock for multi-coro / multi-process Gate 2 guarded reclaim
+  const raceScopeKey = computeLockScope({
+    singleton: "profile",
+    workspaceDir: sb.workspace,
+    profileName: "race",
+  });
+  const raceLockPath = getLeaseLockPath(sb.stateDir, raceScopeKey);
+  fs.mkdirSync(path.dirname(raceLockPath), { recursive: true });
+  fs.writeFileSync(
+    raceLockPath,
+    JSON.stringify({
+      scope: "profile",
+      scope_key: raceScopeKey,
+      loop_id: "lp_20261123T005100Z_dead",
+      pid: 99999999,
+      engine: "workflow",
+      profile: "race",
+      workspace_dir: sb.workspace,
+      acquired_at: new Date().toISOString(),
+      heartbeat_at: new Date().toISOString(),
+      lease_ttl_ms: 60000,
+      draining: false,
+    }),
+    { encoding: "utf8", mode: 0o600 }
+  );
+
+  const script = `
+import subprocess
+
+async def main():
+    ws = ${JSON.stringify(sb.workspace)}
+    home_dir = ${JSON.stringify(sb.home)}
+    state_dir = ${JSON.stringify(sb.stateDir)}
+    expected_default_scope = ${JSON.stringify(expectedDefaultScope)}
+
+    async def mock_parallel(items, fn):
+        return await asyncio.gather(*(fn(x) for x in items))
+    async def mock_with_budget(aw, **kw):
+        return await aw
+
+    # 1. Default .agents/loop.md with name: main-ci produces byte-identical pf_<16hex> lock_scope_key vs Node
+    resolved_default = NS["resolve_profile_task"](ws, home_dir)
+    assert resolved_default["profile_name"] == "main-ci"
+    res_default = await run_loop_workflow({"workspace_dir": ws, "once": True}, {
+        "phase": lambda _n: None,
+        "log": lambda *a: None,
+        "agent": lambda p, **kw: (lambda: asyncio.sleep(0, result={
+            "iteration": 1, "loop_status": "DONE", "next_delay_sec": 0, "summary": "default ok", "next_hint": "None"
+        }))(),
+        "parallel": mock_parallel,
+        "with_budget": mock_with_budget,
+        "tokens_used": lambda _s=None: {"total_tokens": 5},
+        "BudgetExceeded": MockBudgetExceeded,
+        "output_fn": lambda *a: None,
+    })
+    assert res_default["profile_name"] == "main-ci"
+    assert res_default["lock_scope_key"] == expected_default_scope
+
+    # 2. {profile: "ci", once: True} overrides fm.max_iterations=15 AND {profile: "ci", targets: []} honors empty []
+    single_agent_calls = []
+    def mock_agent_ci(prompt, **kw):
+        single_agent_calls.append(prompt)
+        return asyncio.sleep(0, result={
+            "iteration": 1, "loop_status": "DONE", "next_delay_sec": 0, "summary": "override ok", "next_hint": "None"
+        })
+    res_override = await run_loop_workflow({
+        "workspace_dir": ws, "profile": "ci", "once": True, "targets": [],
+    }, {
+        "phase": lambda _n: None,
+        "log": lambda *a: None,
+        "agent": mock_agent_ci,
+        "parallel": mock_parallel,
+        "with_budget": mock_with_budget,
+        "tokens_used": lambda _s=None: {"total_tokens": 10},
+        "BudgetExceeded": MockBudgetExceeded,
+        "output_fn": lambda *a: None,
+    })
+    assert res_override["status"] == "done"
+    assert res_override["max_iterations"] == 1
+    assert len(single_agent_calls) == 1, f"Expected single-worker call with targets=[], got {len(single_agent_calls)}"
+
+    # Explicit max_iterations > 1 overrides fm.once=true; explicit state_mode="fresh" ignores fm.reset_every=4
+    res_max = await run_loop_workflow({
+        "workspace_dir": ws, "profile": "onceonly", "max_iterations": 5,
+    }, {
+        "phase": lambda _n: None, "log": lambda *a: None,
+        "agent": lambda p, **kw: asyncio.sleep(0, result={
+            "iteration": 1, "loop_status": "DONE", "next_delay_sec": 0, "summary": "ok", "next_hint": "None"
+        }),
+        "parallel": mock_parallel, "with_budget": mock_with_budget,
+        "tokens_used": lambda _s=None: {"total_tokens": 5}, "BudgetExceeded": MockBudgetExceeded, "output_fn": lambda *a: None,
+    })
+    assert res_max["max_iterations"] == 5
+
+    res_fresh = await run_loop_workflow({
+        "workspace_dir": ws, "profile": "stateful", "state_mode": "fresh",
+    }, {
+        "phase": lambda _n: None, "log": lambda *a: None,
+        "agent": lambda p, **kw: asyncio.sleep(0, result={
+            "iteration": 1, "loop_status": "DONE", "next_delay_sec": 0, "summary": "ok", "next_hint": "None"
+        }),
+        "parallel": mock_parallel, "with_budget": mock_with_budget,
+        "tokens_used": lambda _s=None: {"total_tokens": 5}, "BudgetExceeded": MockBudgetExceeded, "output_fn": lambda *a: None,
+    })
+    assert res_fresh["status"] == "done"
+
+    # 3. Strict validation: validate_sidecar_grants, validate_cron_expression, validate_profile_name, newlines
+    assert NS["validate_profile_name"]("a..b") is False
+    for bad_grant in ["read_file(///)", "read_file(/.)", "read_file(/..)", "mcp(*:*)", "read_file(C:\\\\)", "read_file(a\\nb)"]:
+        try:
+            NS["validate_sidecar_grants"]([bad_grant])
+            raise AssertionError(f"Expected ValueError for grant {bad_grant!r}")
+        except ValueError:
+            pass
+    for bad_cron in ["99 99 99 99 99", "0 25 * * *", "* * 0 * *"]:
+        try:
+            NS["validate_cron_expression"](bad_cron)
+            raise AssertionError(f"Expected ValueError for cron {bad_cron!r}")
+        except ValueError:
+            pass
+    for bad_fm in ['---\\nname: a..b\\n---\\nBody\\n', '---\\nworker_model: "a\\\\nb"\\n---\\nBody\\n']:
+        try:
+            NS["parse_profile_document"](bad_fm.encode("utf-8"), source_label="bad.md")
+            raise AssertionError(f"Expected ValueError for frontmatter {bad_fm!r}")
+        except ValueError:
+            pass
+
+    # 4. Gate 4 _try_terminal_relay() respects max_agents=1 in state_mode="fresh"
+    lid_max_ag = "lp_20261123T005200Z_mags"
+    def mock_agent_max_ag(prompt, **kw):
+        inbox_dir = pathlib.Path(state_dir, "loops", lid_max_ag, "inbox")
+        inbox_dir.mkdir(parents=True, exist_ok=True)
+        pathlib.Path(inbox_dir, "9000_wake.json").write_text(
+            json.dumps({"type": "wake", "reason": "singleton_coalesced"}), encoding="utf-8"
+        )
+        return asyncio.sleep(0, result={
+            "iteration": 1, "loop_status": "DONE", "next_delay_sec": 0, "summary": "max agents cap", "next_hint": "None"
+        })
+    res_max_ag = await run_loop_workflow({
+        "loop_id": lid_max_ag, "workspace_dir": ws, "state_mode": "fresh",
+        "max_iterations": 3, "max_agents": 1, "relay_on_wake": True, "verify": False,
+    }, {
+        "phase": lambda _n: None, "log": lambda *a: None, "agent": mock_agent_max_ag,
+        "parallel": mock_parallel, "with_budget": mock_with_budget,
+        "tokens_used": lambda _s=None: {"total_tokens": 5}, "BudgetExceeded": MockBudgetExceeded, "output_fn": lambda *a: None,
+    })
+    assert res_max_ag["status"] == "done"
+    assert res_max_ag["iteration"] == 1
+    assert res_max_ag["relay_count"] == 0
+
+asyncio.run(main())
+`;
+  runPythonHarness(script, { cwd: sb.workspace, env: sb.env });
+
+  // 5. Multi-process Gate 2 guarded stale reclaim race in Python workflow.py + 0o600 mode
+  const pyRacerSrc = `
+import ast, asyncio, inspect, json, os, pathlib, sys
+SRC = pathlib.Path(${JSON.stringify(WORKFLOW_PY_PATH)}).read_text(encoding="utf-8")
+NS = {"__file__": ${JSON.stringify(WORKFLOW_PY_PATH)}, "__name__": "py_racer"}
+CODE_OBJ = compile(SRC, ${JSON.stringify(WORKFLOW_PY_PATH)}, "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+async def main():
+    res = eval(CODE_OBJ, NS, NS)
+    if inspect.iscoroutine(res):
+        await res
+    idx = int(sys.argv[1])
+    lock_res = await NS["acquire_lease_lock"](
+        state_root=${JSON.stringify(sb.stateDir)},
+        scope="profile",
+        scope_key=${JSON.stringify(raceScopeKey)},
+        loop_id=f"lp_20261123T005300Z_pr{idx}",
+        engine="workflow",
+        profile_name="race",
+        workspace_dir=${JSON.stringify(sb.workspace)},
+        lease_ttl_ms=60000,
+        on_conflict="fail",
+    )
+    if lock_res["acquired"]:
+        mode = os.stat(lock_res["lock_path"]).st_mode & 0o777
+        await asyncio.sleep(0.15)
+        NS["release_lease_lock"](lock_res["handle"])
+        sys.stdout.write(json.dumps({"acquired": True, "mode": mode}) + "\\n")
+    else:
+        sys.stdout.write(json.dumps({"acquired": False, "action": lock_res["action"]}) + "\\n")
+asyncio.run(main())
+`;
+  const pyRacers = Array.from({ length: 4 }, (_, i) =>
+    new Promise((resolve, reject) => {
+      const child = spawn("python3", ["-c", pyRacerSrc, String(i)], {
+        cwd: sb.workspace,
+        env: sb.env,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let out = "";
+      let err = "";
+      child.stdout.on("data", (d) => (out += d.toString("utf8")));
+      child.stderr.on("data", (d) => (err += d.toString("utf8")));
+      child.on("close", (code) => {
+        if (code !== 0) reject(new Error(`Py racer ${i} failed (${code}): ${err}`));
+        else resolve(JSON.parse(out.trim()));
+      });
+    })
+  );
+  const pyResults = await Promise.all(pyRacers);
+  const pyWinners = pyResults.filter((r) => r.acquired);
+  const pyLosers = pyResults.filter((r) => !r.acquired);
+  assert.equal(pyWinners.length, 1);
+  assert.equal(pyWinners[0].mode, 0o600);
+  assert.equal(pyLosers.length, 3);
+  for (const l of pyLosers) {
+    assert.equal(l.action, "conflict");
+  }
+  assert.equal(fs.existsSync(raceLockPath), false);
+  assert.equal(fs.existsSync(`${raceLockPath}.reclaim.lock`), false);
+});
+
+
 

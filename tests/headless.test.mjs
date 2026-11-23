@@ -64,6 +64,15 @@ import {
 } from "../lib/state-store.mjs";
 import { StreamSession } from "../lib/stream-client.mjs";
 import { handleStatusline } from "../lib/cli-commands.mjs";
+import {
+  acquireLeaseLock,
+  computeLockScope,
+  getLeaseLockPath,
+  listLeaseLocks,
+  markLeaseDraining,
+  releaseLeaseLock,
+  unmarkLeaseDraining,
+} from "../lib/lease-lock.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -4178,5 +4187,766 @@ test("v1.3 #72 regressions: pre-aborted AbortSignal, async sleepFn rejection, mi
   assert.equal(delayedSleeps.reduce((a, b) => a + b, 0), 5000);
   assert.equal(sb.readCalls().filter((c) => c.mode === "json").length, 0);
 });
+
+test("v2.0 headless: --profile/--file merging, CLI precedence, --trust-profile-commands red line, and hot-reload", (t) => {
+  const sb = makeHeadlessSandbox(t);
+  const wsLoopsDir = path.join(sb.workspace, ".agents", "loops");
+  fs.mkdirSync(wsLoopsDir, { recursive: true });
+
+  const untrustedProbeMarker = path.join(sb.workspace, "untrusted-probe-ran");
+  const untrustedVerifyMarker = path.join(sb.workspace, "untrusted-verify-ran");
+
+  fs.writeFileSync(
+    path.join(wsLoopsDir, "ci.md"),
+    [
+      "---",
+      "name: ci",
+      "interval: 1s",
+      "max_iterations: 4",
+      "state_mode: fresh",
+      "worker_model: gemini-4-hydrogen-xhigh",
+      "effort: high",
+      "singleton: profile",
+      `probe_cmd: "echo FM_PROBE_OK && ! test -f '${untrustedProbeMarker}'"`,
+      `verify_cmd: "echo FM_VERIFY_OK"`,
+      "---",
+      "Profile CI prompt v1",
+    ].join("\n"),
+    "utf8"
+  );
+
+  fs.writeFileSync(
+    path.join(wsLoopsDir, "badcmds.md"),
+    [
+      "---",
+      `probe_cmd: "touch '${untrustedProbeMarker}'"`,
+      `verify_cmd: "touch '${untrustedVerifyMarker}'"`,
+      "---",
+      "Untrusted command body",
+    ].join("\n"),
+    "utf8"
+  );
+
+  const customFile = path.join(sb.workspace, "custom.md");
+  fs.writeFileSync(
+    customFile,
+    "---\nworker_model: gemini-4-carbon-low\n---\nCustom file objective\n",
+    "utf8"
+  );
+
+  // 1. Untrusted frontmatter probe_cmd/verify_cmd blocked without --trust-profile-commands (Exit 2, 0 agy calls)
+  sb.setScenario({ jsonTurns: [] });
+  const blockedRes = sb.runCli(["run", "--profile", "badcmds", "--json"]);
+  assert.equal(blockedRes.status, 2);
+  assert.match(JSON.parse(blockedRes.stdout).error, /--trust-profile-commands/);
+  assert.equal(sb.readCalls().length, 0);
+  assert.equal(fs.existsSync(untrustedProbeMarker), false);
+  assert.equal(fs.existsSync(untrustedVerifyMarker), false);
+
+  // 2. CLI overriding both --probe and --verify-cmd succeeds WITHOUT --trust-profile-commands
+  sb.setScenario({
+    jsonTurns: [
+      {
+        envelope: {
+          status: "SUCCESS",
+          usage: { total_tokens: 20 },
+          structured_output: {
+            iteration: 1,
+            loop_status: "DONE",
+            next_delay_sec: 0,
+            summary: "CLI override cmds ok",
+            next_hint: "None",
+          },
+        },
+      },
+    ],
+  });
+  const overrideRes = sb.runCli([
+    "run",
+    "--profile",
+    "badcmds",
+    "--once",
+    "--probe",
+    "echo SAFE_CLI_PROBE",
+    "--verify-cmd",
+    "echo SAFE_CLI_VERIFY",
+    "--json",
+  ]);
+  assert.equal(overrideRes.status, 0, overrideRes.stderr);
+  assert.equal(fs.existsSync(untrustedProbeMarker), false);
+  assert.equal(fs.existsSync(untrustedVerifyMarker), false);
+  const overrideEvents = readEvents(sb.stateDir, JSON.parse(overrideRes.stdout).loop_id);
+  assert.ok(overrideEvents.some((e) => e.event === "verify_cmd" && e.cmd === "echo SAFE_CLI_VERIFY"));
+
+  // 3. --profile ci --trust-profile-commands merges frontmatter, respects CLI overrides, and hot-reloads body
+  sb.setScenario({
+    jsonTurns: [
+      {
+        mutateFile: {
+          path: ".agents/loops/ci.md",
+          content:
+            "---\nname: ci\nmax_iterations: 4\nworker_model: gemini-4-hydrogen-xhigh\n---\nProfile CI prompt v2\n",
+        },
+        envelope: {
+          status: "SUCCESS",
+          usage: { total_tokens: 30 },
+          structured_output: {
+            iteration: 1,
+            loop_status: "CONTINUE",
+            next_delay_sec: 1,
+            summary: "Iter 1 ok",
+            next_hint: "Next",
+          },
+        },
+      },
+      {
+        envelope: {
+          status: "SUCCESS",
+          usage: { total_tokens: 40 },
+          structured_output: {
+            iteration: 2,
+            loop_status: "DONE",
+            next_delay_sec: 0,
+            summary: "Iter 2 done",
+            next_hint: "None",
+          },
+        },
+      },
+    ],
+  });
+  const ciRes = sb.runCli([
+    "run",
+    "--profile",
+    "ci",
+    "--trust-profile-commands",
+    "--model",
+    "gemini-4-carbon-low",
+    "--max",
+    "2",
+    "--json",
+  ]);
+  assert.equal(ciRes.status, 0, ciRes.stderr);
+  const ciPayload = JSON.parse(ciRes.stdout);
+  assert.equal(ciPayload.status, "done");
+  assert.equal(ciPayload.iterations, 2);
+  assert.equal(ciPayload.active_model, "gemini-4-carbon-low");
+  assert.equal(ciPayload.profile_name, "ci");
+  assert.equal(ciPayload.singleton, "profile");
+  assert.match(ciPayload.lock_scope_key, /^pf_[0-9a-f]{16}$/);
+
+  const ciWorkerCalls = sb.readCalls().filter((c) => c.mode === "json");
+  assert.equal(ciWorkerCalls.length, 2);
+  assert.match(ciWorkerCalls[0].args[ciWorkerCalls[0].args.length - 1], /Profile CI prompt v1/);
+  assert.match(ciWorkerCalls[0].args[ciWorkerCalls[0].args.length - 1], /FM_PROBE_OK/);
+  assert.match(ciWorkerCalls[1].args[ciWorkerCalls[1].args.length - 1], /Profile CI prompt v2/);
+
+  // 4. --file custom.md works cleanly
+  sb.setScenario({
+    jsonTurns: [
+      {
+        envelope: {
+          status: "SUCCESS",
+          usage: { total_tokens: 15 },
+          structured_output: {
+            iteration: 1,
+            loop_status: "DONE",
+            next_delay_sec: 0,
+            summary: "Custom file ok",
+            next_hint: "None",
+          },
+        },
+      },
+    ],
+  });
+  const fileRes = sb.runCli(["run", "--file", "custom.md", "--once", "--json"]);
+  assert.equal(fileRes.status, 0, fileRes.stderr);
+  const filePayload = JSON.parse(fileRes.stdout);
+  assert.equal(filePayload.active_model, "gemini-4-carbon-low");
+  assert.equal(filePayload.profile_name, "custom");
+  assert.equal(filePayload.singleton, "profile");
+});
+
+test("v2.0 headless: --singleton profile|workspace + --on-conflict fail|skip|wake (0 orphans, Exit 5 vs 0) & terminal wake relay + resume", async (t) => {
+  const sb = makeHeadlessSandbox(t);
+  sb.initGitRepo();
+
+  const wsLoopsDir = path.join(sb.workspace, ".agents", "loops");
+  fs.mkdirSync(wsLoopsDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(wsLoopsDir, "ci.md"),
+    "---\ninterval: 30s\nmax_iterations: 4\nsingleton: profile\n---\nCI singleton task\n",
+    "utf8"
+  );
+  fs.writeFileSync(
+    path.join(wsLoopsDir, "tdd.md"),
+    "---\nmax_iterations: 2\nsingleton: profile\n---\nTDD isolated task\n",
+    "utf8"
+  );
+
+  // 1. Live holder running `--profile ci` (sleeping between iter 1 and iter 2)
+  sb.setScenario({
+    jsonTurns: [
+      {
+        envelope: {
+          status: "SUCCESS",
+          usage: { total_tokens: 25 },
+          structured_output: {
+            iteration: 1,
+            loop_status: "CONTINUE",
+            next_delay_sec: 30,
+            summary: "Holder sleeping",
+            next_hint: "Wait or wake",
+          },
+        },
+      },
+      {
+        envelope: {
+          status: "SUCCESS",
+          usage: { total_tokens: 25 },
+          structured_output: {
+            iteration: 2,
+            loop_status: "DONE",
+            next_delay_sec: 0,
+            summary: "Holder woke and finished",
+            next_hint: "None",
+          },
+        },
+      },
+    ],
+  });
+
+  const holderProc = sb.spawnCli(["run", "--profile", "ci", "--json"]);
+  const holderId = await waitFor(() => {
+    const loops = listLoops(sb.stateDir, { includeAll: false });
+    if (loops.length === 0) return null;
+    const evs = readEvents(sb.stateDir, loops[0].loop_id);
+    return evs.some((e) => e.event === "iteration" && e.iteration === 1) ? loops[0].loop_id : null;
+  });
+
+  const beforeLoopCount = listLoops(sb.stateDir, { includeAll: true }).length;
+  const worktreesDir = path.join(sb.stateDir, "worktrees");
+
+  // 1a. Contender with --on-conflict fail + --worktree -> Exit 5 LOCK_CONFLICT, 0 orphan loop dirs or worktrees
+  const failRes = sb.runCli([
+    "run",
+    "--profile",
+    "ci",
+    "--on-conflict",
+    "fail",
+    "--worktree",
+    "--json",
+  ]);
+  assert.equal(failRes.status, EXIT_CODES.LOCK_CONFLICT);
+  const failJson = JSON.parse(failRes.stdout);
+  assert.equal(failJson.ok, false);
+  assert.equal(failJson.exit_code, 5);
+  assert.equal(failJson.conflict, true);
+  assert.equal(failJson.holder.loop_id, holderId);
+  assert.equal(listLoops(sb.stateDir, { includeAll: true }).length, beforeLoopCount);
+  assert.equal(fs.existsSync(worktreesDir) ? fs.readdirSync(worktreesDir).length : 0, 0);
+
+  // 1b. Contender with --on-conflict skip + --worktree -> Exit 0, 0 orphans
+  const skipRes = sb.runCli([
+    "run",
+    "--profile",
+    "ci",
+    "--on-conflict",
+    "skip",
+    "--worktree",
+    "--json",
+  ]);
+  assert.equal(skipRes.status, 0, skipRes.stderr);
+  const skipJson = JSON.parse(skipRes.stdout);
+  assert.equal(skipJson.ok, true);
+  assert.equal(skipJson.skipped, true);
+  assert.equal(skipJson.active_loop_id, holderId);
+  assert.equal(listLoops(sb.stateDir, { includeAll: true }).length, beforeLoopCount);
+  assert.equal(fs.existsSync(worktreesDir) ? fs.readdirSync(worktreesDir).length : 0, 0);
+
+  // 1c. Contender with --on-conflict wake + --worktree -> Exit 0 coalesced, wakes 30s sleeping holder immediately!
+  const wakeRes = sb.runCli([
+    "run",
+    "--profile",
+    "ci",
+    "--on-conflict",
+    "wake",
+    "--worktree",
+    "--json",
+  ]);
+  assert.equal(wakeRes.status, 0, wakeRes.stderr);
+  const wakeJson = JSON.parse(wakeRes.stdout);
+  assert.equal(wakeJson.ok, true);
+  assert.equal(wakeJson.coalesced, true);
+  assert.equal(wakeJson.active_loop_id, holderId);
+  assert.equal(listLoops(sb.stateDir, { includeAll: true }).length, beforeLoopCount);
+  assert.equal(fs.existsSync(worktreesDir) ? fs.readdirSync(worktreesDir).length : 0, 0);
+
+  const holderDone = await holderProc.done;
+  assert.equal(holderDone.status, 0, holderDone.stderr);
+  assert.equal(JSON.parse(holderDone.stdout).status, "done");
+  assert.equal(listLeaseLocks(sb.stateDir).length, 0);
+
+  // 1d. Workspace-scope holder (--singleton workspace) blocks even a different profile (`tdd`) with Exit 5 & wakes across profiles
+  sb.setScenario({
+    jsonTurns: [
+      {
+        envelope: {
+          status: "SUCCESS",
+          usage: { total_tokens: 20 },
+          structured_output: {
+            iteration: 1,
+            loop_status: "CONTINUE",
+            next_delay_sec: 30,
+            summary: "Workspace lock holder sleeping",
+            next_hint: "Wait or wake",
+          },
+        },
+      },
+      {
+        envelope: {
+          status: "SUCCESS",
+          usage: { total_tokens: 20 },
+          structured_output: {
+            iteration: 2,
+            loop_status: "DONE",
+            next_delay_sec: 0,
+            summary: "Workspace lock holder woke across profile",
+            next_hint: "None",
+          },
+        },
+      },
+    ],
+  });
+  const wsHolderProc = sb.spawnCli(["run", "--profile", "ci", "--singleton", "workspace", "--json"]);
+  const wsHolderId = await waitFor(() => {
+    const running = listLoops(sb.stateDir, { includeAll: false });
+    if (running.length === 0) return null;
+    const evs = readEvents(sb.stateDir, running[0].loop_id);
+    return evs.some((e) => e.event === "iteration" && e.iteration === 1) ? running[0].loop_id : null;
+  });
+  const beforeWsCount = listLoops(sb.stateDir, { includeAll: true }).length;
+
+  const wsBlockRes = sb.runCli([
+    "run",
+    "--profile",
+    "tdd",
+    "--singleton",
+    "workspace",
+    "--on-conflict",
+    "fail",
+    "--json",
+  ]);
+  assert.equal(wsBlockRes.status, EXIT_CODES.LOCK_CONFLICT);
+  const wsBlockJson = JSON.parse(wsBlockRes.stdout);
+  assert.equal(wsBlockJson.ok, false);
+  assert.equal(wsBlockJson.conflict, true);
+  assert.equal(wsBlockJson.holder.loop_id, wsHolderId);
+  assert.equal(listLoops(sb.stateDir, { includeAll: true }).length, beforeWsCount);
+
+  const wsWakeRes = sb.runCli([
+    "run",
+    "--profile",
+    "tdd",
+    "--singleton",
+    "workspace",
+    "--on-conflict",
+    "wake",
+    "--json",
+  ]);
+  assert.equal(wsWakeRes.status, 0, wsWakeRes.stderr);
+  assert.equal(JSON.parse(wsWakeRes.stdout).coalesced, true);
+  assert.equal(JSON.parse(wsWakeRes.stdout).active_loop_id, wsHolderId);
+
+  const wsHolderDone = await wsHolderProc.done;
+  assert.equal(wsHolderDone.status, 0, wsHolderDone.stderr);
+  assert.equal(JSON.parse(wsHolderDone.stdout).status, "done");
+  assert.equal(listLeaseLocks(sb.stateDir).length, 0);
+
+  // 2. Gate 4 terminal wakeRequested relay (--relay-on-wake) + logs rendering
+  sb.setScenario({
+    jsonTurns: [
+      {
+        sleepMs: 400,
+        envelope: {
+          status: "SUCCESS",
+          usage: { total_tokens: 30 },
+          structured_output: {
+            iteration: 1,
+            loop_status: "DONE",
+            next_delay_sec: 0,
+            summary: "Iter 1 DONE right as wake arrives",
+            next_hint: "None",
+          },
+        },
+      },
+      {
+        envelope: {
+          status: "SUCCESS",
+          usage: { total_tokens: 45 },
+          structured_output: {
+            iteration: 2,
+            loop_status: "DONE",
+            next_delay_sec: 0,
+            summary: "Relayed turn 2 DONE",
+            next_hint: "None",
+          },
+        },
+      },
+    ],
+  });
+
+  const relayProc = sb.spawnCli(["run", "--profile", "ci", "--relay-on-wake", "--json"]);
+  const relayLoopId = await waitFor(() => {
+    const running = listLoops(sb.stateDir, { includeAll: false });
+    if (running.length === 0) return null;
+    const evs = readEvents(sb.stateDir, running[0].loop_id);
+    return evs.some((e) => e.event === "iteration_start" && e.iteration === 1)
+      ? running[0].loop_id
+      : null;
+  });
+
+  const nudgeWake = sb.runCli(["nudge", relayLoopId, "Handle new webhook event", "--wake", "--json"]);
+  assert.equal(nudgeWake.status, 0, nudgeWake.stderr);
+
+  const relayDone = await relayProc.done;
+  assert.equal(relayDone.status, 0, relayDone.stderr);
+  const relayPayload = JSON.parse(relayDone.stdout);
+  assert.equal(relayPayload.ok, true);
+  assert.equal(relayPayload.status, "done");
+  assert.equal(relayPayload.iterations, 2);
+  assert.equal(relayPayload.relay_count, 1);
+
+  const relayCalls = sb.readCalls().filter((c) => c.mode === "json");
+  assert.equal(relayCalls.length, 2);
+  assert.match(relayCalls[1].args[relayCalls[1].args.length - 1], /Handle new webhook event/);
+
+  const relayLogs = sb.runCli(["logs", relayLoopId]);
+  assert.equal(relayLogs.status, 0, relayLogs.stderr);
+  assert.match(relayLogs.stdout, /relay.*relay=#1/);
+
+  // 3. agy-loop resume restores profile & re-acquires Lease lock (respecting conflict!)
+  sb.setScenario({
+    jsonTurns: [
+      {
+        envelope: {
+          status: "SUCCESS",
+          usage: { total_tokens: 20 },
+          structured_output: {
+            iteration: 1,
+            loop_status: "CONTINUE",
+            next_delay_sec: 1,
+            summary: "Paused at max 1",
+            next_hint: "Continue to 2",
+          },
+        },
+      },
+    ],
+  });
+  const pausedProfileRun = sb.runCli(["run", "--profile", "ci", "--max", "1", "--json"]);
+  assert.equal(pausedProfileRun.status, 4, pausedProfileRun.stderr);
+  const pausedId = JSON.parse(pausedProfileRun.stdout).loop_id;
+  const ciScopeKey = computeLockScope({
+    singleton: "profile",
+    workspaceDir: sb.workspace,
+    profileName: "ci",
+  });
+  assert.equal(fs.existsSync(getLeaseLockPath(sb.stateDir, ciScopeKey)), false);
+
+  // Hold lock temporarily -> resume fails Exit 5
+  const blocker = await acquireLeaseLock({
+    stateRoot: sb.stateDir,
+    scope: "profile",
+    scopeKey: ciScopeKey,
+    loopId: "lp_20261123T003000Z_blck",
+    pid: process.pid,
+    profileName: "ci",
+    workspaceDir: sb.workspace,
+    onConflict: "fail",
+  });
+  assert.equal(blocker.acquired, true);
+  const blockedResume = sb.runCli(["resume", pausedId, "--max", "2", "--json"]);
+  assert.equal(blockedResume.status, EXIT_CODES.LOCK_CONFLICT);
+  assert.equal(releaseLeaseLock(blocker.handle), true);
+
+  // Release blocker -> resume succeeds & preserves profile metadata
+  sb.setScenario({
+    jsonTurns: [
+      {
+        envelope: {
+          status: "SUCCESS",
+          usage: { total_tokens: 25 },
+          structured_output: {
+            iteration: 2,
+            loop_status: "DONE",
+            next_delay_sec: 0,
+            summary: "Resumed profile ok",
+            next_hint: "None",
+          },
+        },
+      },
+    ],
+  });
+  const resumedProfile = sb.runCli(["resume", pausedId, "--max", "2", "--json"]);
+  assert.equal(resumedProfile.status, 0, resumedProfile.stderr);
+  const resumedJson = JSON.parse(resumedProfile.stdout);
+  assert.equal(resumedJson.status, "done");
+  assert.equal(resumedJson.profile_name, "ci");
+  assert.equal(resumedJson.singleton, "profile");
+  assert.equal(resumedJson.lock_scope_key, ciScopeKey);
+  assert.equal(fs.existsSync(getLeaseLockPath(sb.stateDir, ciScopeKey)), false);
+});
+
+test("v2.0 headless Gate 4 #95: draining before wake check, unmarkLeaseDraining on relay, probe_until_pass relay, and stop over relay", async (t) => {
+  const sb = makeHeadlessSandbox(t);
+  const wsLoopsDir = path.join(sb.workspace, ".agents", "loops");
+  fs.mkdirSync(wsLoopsDir, { recursive: true });
+
+  // 1. probe_until_pass Gate 4 relay: probe passes iter 1 while wake+nudge arrive, unmarks draining, iter 2 probe fails -> worker receives nudge & sees draining===false
+  const probeMarker = path.join(sb.workspace, "probe-gate4.marker");
+  fs.writeFileSync(
+    path.join(wsLoopsDir, "proberelay.md"),
+    [
+      "---",
+      "max_iterations: 3",
+      "interval: 1s",
+      "singleton: profile",
+      `probe_cmd: "if [ ! -f '${probeMarker}' ]; then touch '${probeMarker}' && sleep 0.8 && exit 0; else exit 1; fi"`,
+      "probe_until_pass: true",
+      "---",
+      "Probe relay body",
+    ].join("\n"),
+    "utf8"
+  );
+  const probeScopeKey = computeLockScope({
+    singleton: "profile",
+    workspaceDir: sb.workspace,
+    profileName: "proberelay",
+  });
+  const probeLockPath = getLeaseLockPath(sb.stateDir, probeScopeKey);
+
+  sb.setScenario({
+    jsonTurns: [
+      {
+        sleepMs: 500,
+        envelope: {
+          status: "SUCCESS",
+          usage: { total_tokens: 35 },
+          structured_output: {
+            iteration: 2,
+            loop_status: "DONE",
+            next_delay_sec: 0,
+            summary: "Worker handled relayed probe nudge",
+            next_hint: "None",
+          },
+        },
+      },
+    ],
+  });
+
+  const probeProc = sb.spawnCli([
+    "run",
+    "--profile",
+    "proberelay",
+    "--trust-profile-commands",
+    "--relay-on-wake",
+    "--json",
+  ]);
+
+  // Wait until probe 1 is running (marker created & lock exists), then send wake+nudge
+  const probeLoopId = await waitFor(() => {
+    if (!fs.existsSync(probeMarker) || !fs.existsSync(probeLockPath)) return null;
+    const running = listLoops(sb.stateDir, { includeAll: false });
+    return running.length > 0 ? running[0].loop_id : null;
+  });
+  assert.equal(JSON.parse(fs.readFileSync(probeLockPath, "utf8")).draining, false);
+  const probeNudge = sb.runCli(["nudge", probeLoopId, "Carry probe nudge", "--wake", "--json"]);
+  assert.equal(probeNudge.status, 0, probeNudge.stderr);
+
+  // During iter 2 worker turn (sleeping 500ms), verify relay unmarked draining back to false!
+  const iter2State = await waitFor(() => {
+    const evs = readEvents(sb.stateDir, probeLoopId);
+    if (!evs.some((e) => e.event === "iteration_start" && e.iteration === 2)) return null;
+    if (!fs.existsSync(probeLockPath)) return null;
+    return { draining: JSON.parse(fs.readFileSync(probeLockPath, "utf8")).draining };
+  });
+  assert.equal(iter2State.draining, false);
+
+  const probeDone = await probeProc.done;
+  assert.equal(probeDone.status, 0, probeDone.stderr);
+  const probeJson = JSON.parse(probeDone.stdout);
+  assert.equal(probeJson.ok, true);
+  assert.equal(probeJson.status, "done");
+  assert.equal(probeJson.iterations, 2);
+  assert.equal(probeJson.relay_count, 1);
+  assert.equal(fs.existsSync(probeLockPath), false);
+
+  const probeCalls = sb.readCalls().filter((c) => c.mode === "json");
+  assert.equal(probeCalls.length, 1);
+  assert.match(probeCalls[0].args[probeCalls[0].args.length - 1], /Carry probe nudge/);
+  const probeEvents = readEvents(sb.stateDir, probeLoopId);
+  assert.equal(probeEvents.some((e) => e.event === "probe_skip" && e.iteration === 1), true);
+  assert.equal(probeEvents.some((e) => e.event === "relay" && e.relay_count === 1), true);
+
+  // 2. DONE relay: unmarks draining during iter 2 AND honors stop over wake
+  fs.writeFileSync(
+    path.join(wsLoopsDir, "donerelay.md"),
+    "---\nmax_iterations: 3\ninterval: 1s\nsingleton: profile\n---\nDONE relay body\n",
+    "utf8"
+  );
+  const doneScopeKey = computeLockScope({
+    singleton: "profile",
+    workspaceDir: sb.workspace,
+    profileName: "donerelay",
+  });
+  const doneLockPath = getLeaseLockPath(sb.stateDir, doneScopeKey);
+
+  // 2a. DONE -> wake -> relay clears draining=false on iter 2
+  sb.setScenario({
+    jsonTurns: [
+      {
+        sleepMs: 700,
+        envelope: {
+          status: "SUCCESS",
+          usage: { total_tokens: 20 },
+          structured_output: {
+            iteration: 1,
+            loop_status: "DONE",
+            next_delay_sec: 0,
+            summary: "Done 1",
+            next_hint: "None",
+          },
+        },
+      },
+      {
+        sleepMs: 500,
+        envelope: {
+          status: "SUCCESS",
+          usage: { total_tokens: 20 },
+          structured_output: {
+            iteration: 2,
+            loop_status: "DONE",
+            next_delay_sec: 0,
+            summary: "Done 2 after unmark",
+            next_hint: "None",
+          },
+        },
+      },
+    ],
+  });
+  const doneRelayProc = sb.spawnCli(["run", "--profile", "donerelay", "--relay-on-wake", "--json"]);
+  const doneLoopId = await waitFor(() => {
+    const running = listLoops(sb.stateDir, { includeAll: false });
+    if (running.length === 0) return null;
+    const evs = readEvents(sb.stateDir, running[0].loop_id);
+    return evs.some((e) => e.event === "iteration_start" && e.iteration === 1) ? running[0].loop_id : null;
+  });
+  assert.equal(sb.runCli(["nudge", doneLoopId, "Carry done nudge", "--wake", "--json"]).status, 0);
+
+  const doneIter2State = await waitFor(() => {
+    const evs = readEvents(sb.stateDir, doneLoopId);
+    if (!evs.some((e) => e.event === "iteration_start" && e.iteration === 2)) return null;
+    if (!fs.existsSync(doneLockPath)) return null;
+    return { draining: JSON.parse(fs.readFileSync(doneLockPath, "utf8")).draining };
+  });
+  assert.equal(doneIter2State.draining, false);
+  const doneRelayRes = await doneRelayProc.done;
+  assert.equal(doneRelayRes.status, 0, doneRelayRes.stderr);
+  assert.equal(JSON.parse(doneRelayRes.stdout).relay_count, 1);
+
+  // 2b. Stop guards Gate 4 relay on DONE (pending wake does NOT trigger iteration 2)
+  sb.setScenario({
+    jsonTurns: [
+      {
+        sleepMs: 500,
+        envelope: {
+          status: "SUCCESS",
+          usage: { total_tokens: 20 },
+          structured_output: {
+            iteration: 1,
+            loop_status: "DONE",
+            next_delay_sec: 0,
+            summary: "Done 1 before stop",
+            next_hint: "None",
+          },
+        },
+      },
+      {
+        envelope: {
+          status: "SUCCESS",
+          usage: { total_tokens: 20 },
+          structured_output: {
+            iteration: 2,
+            loop_status: "DONE",
+            next_delay_sec: 0,
+            summary: "Should never run",
+            next_hint: "None",
+          },
+        },
+      },
+    ],
+  });
+  const stopRelayProc = sb.spawnCli(["run", "--profile", "donerelay", "--relay-on-wake", "--json"]);
+  const stopLoopId = await waitFor(() => {
+    const running = listLoops(sb.stateDir, { includeAll: false });
+    if (running.length === 0) return null;
+    const evs = readEvents(sb.stateDir, running[0].loop_id);
+    return evs.some((e) => e.event === "iteration_start" && e.iteration === 1) ? running[0].loop_id : null;
+  });
+  enqueueInboxMessage(sb.stateDir, stopLoopId, { type: "wake", reason: "singleton_coalesced" });
+  enqueueInboxMessage(sb.stateDir, stopLoopId, { type: "stop", mode: "after_current" });
+
+  const stopRelayDone = await stopRelayProc.done;
+  assert.equal(stopRelayDone.status, 0, stopRelayDone.stderr);
+  const stopRelayJson = JSON.parse(stopRelayDone.stdout);
+  assert.equal(stopRelayJson.ok, true);
+  assert.equal(stopRelayJson.status, "done");
+  assert.equal(stopRelayJson.iterations, 1);
+  assert.equal(stopRelayJson.relay_count, 0);
+  assert.equal(sb.readCalls().filter((c) => c.mode === "json").length, 1);
+
+  // 2c. Stop guards Gate 4 relay on probe_until_pass too (0 LLM calls despite pending wake)
+  const stopProbeMarker = path.join(sb.workspace, "stop-probe-gate4.marker");
+  fs.writeFileSync(
+    path.join(wsLoopsDir, "stopprobe.md"),
+    [
+      "---",
+      "max_iterations: 3",
+      "interval: 1s",
+      "singleton: profile",
+      `probe_cmd: "touch '${stopProbeMarker}' && sleep 0.5 && exit 0"`,
+      "probe_until_pass: true",
+      "---",
+      "Stop probe relay body",
+    ].join("\n"),
+    "utf8"
+  );
+  sb.setScenario({ jsonTurns: [] });
+  const stopProbeProc = sb.spawnCli([
+    "run",
+    "--profile",
+    "stopprobe",
+    "--trust-profile-commands",
+    "--relay-on-wake",
+    "--json",
+  ]);
+  const stopProbeLoopId = await waitFor(() => {
+    if (!fs.existsSync(stopProbeMarker)) return null;
+    const running = listLoops(sb.stateDir, { includeAll: false });
+    return running.length > 0 ? running[0].loop_id : null;
+  });
+  enqueueInboxMessage(sb.stateDir, stopProbeLoopId, { type: "wake", reason: "singleton_coalesced" });
+  enqueueInboxMessage(sb.stateDir, stopProbeLoopId, { type: "stop", mode: "after_current" });
+
+  const stopProbeDone = await stopProbeProc.done;
+  assert.equal(stopProbeDone.status, 0, stopProbeDone.stderr);
+  const stopProbeJson = JSON.parse(stopProbeDone.stdout);
+  assert.equal(stopProbeJson.ok, true);
+  assert.equal(stopProbeJson.status, "done");
+  assert.equal(stopProbeJson.iterations, 1);
+  assert.equal(stopProbeJson.relay_count, 0);
+  assert.equal(sb.readCalls().filter((c) => c.mode === "json").length, 0);
+});
+
+
 
 

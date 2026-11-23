@@ -2,7 +2,7 @@
   "$schema": "https://antigravity.google/schemas/v1/plugin.json",
   "name": "agy-loop",
   "displayName": "AGY Loop",
-  "version": "1.3.0",
+  "version": "2.0.0",
   "description": "Non-blocking /agy-loop:loop scheduler for Antigravity Desktop & CLI — recurring prompts, adaptive self-pacing, isolated subagents, and live-reloading loop.md.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [

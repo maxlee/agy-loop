@@ -1,6 +1,6 @@
 ---
 name: loop
-description: "Schedules non-blocking recurring prompts, dynamic run_workflow loops (--verify, --targets, --probe, --max-tokens), and live-reloading loop.md checks. Use when the user invokes /agy-loop:loop (or /loop), asks to monitor/poll builds or PRs, or runs status, stop, nudge, wake, doctor, or help."
+description: "Schedules non-blocking recurring prompts, dynamic run_workflow loops (--verify, --targets, --probe, --max-tokens), named --profile YAML loops, and live-reloading loop.md checks. Use when the user invokes /agy-loop:loop (or /loop), asks to monitor/poll builds or PRs, or runs status, stop, nudge, wake, profiles, doctor, or help."
 ---
 
 # `/agy-loop:loop` Non-Blocking Loop Orchestrator (`agy-loop`)
@@ -16,7 +16,7 @@ Act as a **non-blocking Loop Orchestrator** whenever the user invokes `/agy-loop
 
 ---
 
-## Phase 0: Parse & Lifecycle Commands (`status` | `stop` | `nudge` | `wake` | `doctor` | `help`)
+## Phase 0: Parse & Lifecycle Commands (`status` | `stop` | `nudge` | `wake` | `profiles` | `doctor` | `help`)
 
 Normalize user arguments safely via single-quoted heredoc so quotes, `$()`, backticks, and `$VAR` never expand:
 
@@ -53,14 +53,18 @@ AGY_LOOP_ARGS
 1. Run `sh "<skill_dir>/scripts/loop-helper.sh" inbox-push "<workspace_dir>" "<target>" wake`.
 2. On Exit `2`, report the error; otherwise confirm wake signal queued for `loop_id`.
 
-### 5. `{"action":"doctor", ...}` (`doctor [--clean-shadow]`)
+### 5. `{"action":"profiles", ...}` (`profiles [--json]`)
+1. Run `sh "<skill_dir>/scripts/loop-helper.sh" list-profiles "<workspace_dir>"`.
+2. If `json == true`, print the JSON; otherwise summarize `name`, `scope`, `source`, `has_frontmatter`, `blocked_frontmatter_commands`, and `ok`/`error`.
+
+### 6. `{"action":"doctor", ...}` (`doctor [--clean-shadow]`)
 1. If `clean_shadow == true`, run `sh "<skill_dir>/scripts/loop-helper.sh" doctor --clean-shadow "<workspace_dir>"`, report `cleaned_shadows`, `backup_dir`, `ok`, `active_loops`, and remind the user to run `/skills reload`.
 2. Otherwise run `sh "<skill_dir>/scripts/loop-helper.sh" doctor "<workspace_dir>"` and report `ok`, `shadows` (suggest `--clean-shadow` + `/skills reload`), `skill_filter_warnings`, `active_loop_md`, and `active_loops`.
 
-### 6. `{"action":"help"}` (`help`, `--help`, `-h`)
+### 7. `{"action":"help"}` (`help`, `--help`, `-h`)
 Print a concise usage summary:
-- **Modes**: fixed interval (`30s <task>`, `every 5m <task>`, `<task> every 2h`, compound `1h30m` / `2m30s`), self-paced (`/agy-loop:loop <task>`), live-reloading `loop.md` (bare `/agy-loop:loop` or `15m`), delayed one-shot (`in 20m <task>` or `--once`), lifecycle (`status [--all]`, `stop [<ids>|all] [--after-current]`, `nudge <id|latest> <msg> [--wake]`, `wake <id|latest>`, `doctor [--clean-shadow]`, `help`).
-- **Flags**: `--engine <auto|schedule|workflow>`, `--max <N>`, `--stateful`, `--fresh`, `--reset-every <N>`, `--worktree`, `--share`, `--model <inherit|flash_lite|flash|pro>`, `--self`, `--cron`, `--exact`, `--daemon`, `--once`, `--verify`, `--verifier-model <tier>`, `--verify-cmd <cmd>`, `--verify-timeout <dur>`, `--probe <cmd>`, `--probe-timeout <dur>`, `--probe-until-pass`, `--targets <csv>`, `--max-tokens <N>`, `--max-duration <dur>`, and `--`.
+- **Modes**: fixed interval (`30s <task>`, `every 5m <task>`, `<task> every 2h`, compound `1h30m` / `2m30s`), self-paced (`/agy-loop:loop <task>`), profile / live-reloading `loop.md` (bare `/agy-loop:loop`, `--profile <name>`, `--file <path>`), delayed one-shot (`in 20m <task>` or `--once`), lifecycle (`status [--all]`, `stop [<ids>|all] [--after-current]`, `nudge <id|latest> <msg> [--wake]`, `wake <id|latest>`, `profiles [--json]`, `doctor [--clean-shadow]`, `help`).
+- **Flags**: `--engine <auto|schedule|workflow>`, `--profile <name>`, `--file <path>`, `--singleton <profile|workspace|none>`, `--on-conflict <wake|skip|fail>`, `--max <N>`, `--stateful`, `--fresh`, `--reset-every <N>`, `--worktree`, `--share`, `--model <inherit|flash_lite|flash|pro>`, `--self`, `--cron`, `--exact`, `--daemon`, `--once`, `--verify`, `--verifier-model <tier>`, `--verify-cmd <cmd>`, `--verify-timeout <dur>`, `--probe <cmd>`, `--probe-timeout <dur>`, `--probe-until-pass`, `--targets <csv>`, `--max-tokens <N>`, `--max-duration <dur>`, and `--`.
 End turn without dispatching a worker.
 
 ---
@@ -79,9 +83,9 @@ Branch on `parse.engine`:
 
 ### Route 1: `engine == "workflow"` (`run_workflow` on `agy >= 1.5.9`)
 1. Resolve `<plugin_root>` as `../..` relative to `<skill_dir>`, giving `ScriptPath = "<plugin_root>/workflows/loop-runner/workflow.py"`.
-2. Build `Args` from `parse` + `loop_id` using **only** `workflow.json` keys (`loop_id`, `workspace_dir`, `task_source`, `prompt`, `pacing`, `once`, `interval_sec`, `max_iterations`, `state_mode`, `reset_every`, `workspace`, `model`, `delegate`, `verify`, `verifier_model`, `verify_cmd`, `verify_timeout_sec`, `probe_cmd`, `probe_timeout_sec`, `probe_until_pass`, `targets`, `max_tokens`, `max_duration_sec` — see `references/workflow-engine.md`).
+2. Build `Args` from `parse` + `loop_id` using **only** `workflow.json` keys (`loop_id`, `workspace_dir`, `task_source`, `prompt`, `profile`, `profile_file`, `pacing`, `once`, `interval_sec`, `max_iterations`, `state_mode`, `reset_every`, `workspace`, `model`, `delegate`, `verify`, `verifier_model`, `verify_cmd`, `verify_timeout_sec`, `probe_cmd`, `probe_timeout_sec`, `probe_until_pass`, `targets`, `max_tokens`, `max_duration_sec`, `singleton`, `on_conflict` — never forward `explicit_flags` itself; see `references/workflow-engine.md`). When `profile`, `profile_file`, or `task_source == "loop_md_or_default"` is active, omit default keys not listed in `parse.explicit_flags` so profile YAML frontmatter defaults take effect; `workflow.py` blocks frontmatter `probe_cmd`/`verify_cmd`.
 3. Call `run_workflow(ScriptPath="<plugin_root>/workflows/loop-runner/workflow.py", Args=..., Description="agy-loop <loop_id>: <short goal>")`.
-   - If `run_workflow` is unavailable (`agy < 1.5.9`), run `state-stop "<workspace_dir>" "<loop_id>"` and instruct the user to upgrade `agy >= 1.5.9`, re-run with `--engine schedule` (without workflow-only flags), or run `npx agy-loop run` in terminal.
+   - If `run_workflow` is unavailable (`agy < 1.5.9`), run `state-stop "<workspace_dir>" "<loop_id>"` and instruct the user to upgrade `agy >= 1.5.9`, re-run with `--engine schedule` (without workflow/lease flags), or run `npx agy-loop run` in terminal.
 4. Print 1 line (`Started Workflow Loop [<loop_id>] (max <max_iterations>, verify=<verify>, targets=<count_or_1>). Steer with /agy-loop:loop nudge <loop_id> "<msg>". Main prompt is free.`) and **end your turn immediately**. On workflow completion wakeup, summarize results concisely and end your turn.
 
 ### Route 2: `engine == "schedule"` (Three-Turn Reactive Protocol)
@@ -89,7 +93,7 @@ Branch on `parse.engine`:
 #### Turn A: Initial Dispatch
 1. **Resolve Task Instructions**:
    - `task_source == "inline"`: use `prompt`.
-   - `task_source == "loop_md_or_default"`: run `sh "<skill_dir>/scripts/loop-helper.sh" resolve-task "<workspace_dir>"` *(do NOT bypass with direct `read_file`/`view_file` so `.agents/loop.md -> loop.md -> ~/.gemini/config/loop.md -> builtin` precedence and `25,000`-byte cap hold)*. Print a 1-line warning if `"truncated": true`.
+   - `task_source == "loop_md_or_default"`: run `sh "<skill_dir>/scripts/loop-helper.sh" resolve-task "<workspace_dir>"` appending `--profile "<parse.profile>"` or `--file "<parse.profile_file>"` when non-null *(do NOT bypass with direct `read_file`/`view_file` so profile precedence, YAML frontmatter stripping, and `25,000`-byte cap hold)*. Print a 1-line warning if `"truncated": true` or `"blocked_frontmatter_commands": true`.
 2. **Select `delegate`**: default `"loop-worker"` (6 cross-engine verified tools); use `"self"` when `parse.delegate == "self"` (`--self` or `/` prompt) or MCP/browser/other skills are needed.
 3. **Dispatch**:
    - **Delayed One-Shot (`once == true` and `interval_sec != null`)**: call `schedule(DurationSeconds=interval_sec, Prompt="<[LOOP_WAKEUP] block>")`, save `task_id` via `state-update "<workspace_dir>" "<loop_id>" --task-id "<task_id>" --event scheduled`, print 1 line (`Scheduled one-shot [<loop_id>] in <interval_label> (TaskId: <id>). Main prompt is free.`), and **end your turn immediately**.
@@ -151,6 +155,8 @@ fallback_workspace: <inherit|branch|share>
 fallback_model: <model|null>
 fallback_delegate: <loop-worker|self>
 fallback_task_source: <inline|loop_md_or_default>
+fallback_profile: <profile|null>
+fallback_profile_file: <profile_file|null>
 fallback_inline_prompt: <inline prompt or empty>
 fallback_next_hint: <NEXT_HINT>
 ```
@@ -159,7 +165,7 @@ fallback_next_hint: <NEXT_HINT>
 1. **Read Authoritative State FIRST**: run `state-read "<workspace_dir>" "<loop_id>"` (use `fallback_*` only if missing).
 2. **Stop Guard**: if `stop_requested == true` or `status != "running"`, kill any `task_id` via `manage_task` and **end turn cleanly**.
 3. **Cron Overlap Guard**: if `use_cron == true` and `worker_id` is still `Running` in `manage_subagents(Action="list")`, skip this tick and **end turn without incrementing `iteration`**.
-4. **Hot-Reload `loop.md`**: if `task_source == "loop_md_or_default"`, re-run `sh "<skill_dir>/scripts/loop-helper.sh" resolve-task "<workspace_dir>"` *(do NOT bypass with `read_file`/`view_file`)* and warn if `truncated == true`; else use `inline_prompt`.
+4. **Hot-Reload `loop.md` / Profile**: if `task_source == "loop_md_or_default"`, re-run `sh "<skill_dir>/scripts/loop-helper.sh" resolve-task "<workspace_dir>"` (passing `--profile` or `--file` from `state` / `fallback_*` if non-null) *(do NOT bypass with `read_file`/`view_file`)* and warn if `truncated == true` or `blocked_frontmatter_commands == true`; else use `inline_prompt`.
 5. **Dispatch Iteration `N`**: if `state_mode == "stateful"` with `Idle` `worker_id`, call `send_message(Recipient=worker_id, Message=...)`; else call `invoke_subagent` and save `worker_id` via `state-update`. **End your turn immediately**.
 
 ---
@@ -167,4 +173,5 @@ fallback_next_hint: <NEXT_HINT>
 ## Progressive Disclosure References
 
 - `references/workflow-engine.md`: `run_workflow` `Args` mapping, `agy < 1.5.9` fallback, `--verify-cmd` + `loop-verifier`, parallel `--targets`, `--probe`, `nudge`/`wake`, and `agy-loop resume`.
+- `references/profiles-and-daemons.md`: `.agents/loop.md` v2 YAML frontmatter, `.agents/loops/<name>.md` templates, `--trust-profile-commands`, Four-Gate Lease Lock, and `agy-loop daemon`.
 - `references/examples-and-loop-md.md`: `.agents/loop.md` templates, advanced flags, and interactive `agy` TUI controls.

@@ -7,15 +7,21 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
+  handleDaemon,
   handleLogs,
   handleNudge,
+  handleProfiles,
   handlePs,
   handleResume,
   handleRun,
+  handleStatusOverview,
   handleStatusline,
   handleStop,
   handleWake,
 } from "../lib/cli-commands.mjs";
+import { listDaemons } from "../lib/daemon.mjs";
+import { listLeaseLocks } from "../lib/lease-lock.mjs";
+import { listProfiles } from "../lib/profile-parser.mjs";
 import { listLoops, resolveStateRoot } from "../lib/state-store.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -25,9 +31,9 @@ const PLUGIN_ROOT = path.resolve(__dirname, "..");
 function readPluginVersion() {
   try {
     const raw = fs.readFileSync(path.join(PLUGIN_ROOT, "package.json"), "utf8");
-    return JSON.parse(raw).version || "1.3.0";
+    return JSON.parse(raw).version || "2.0.0";
   } catch {
-    return "1.3.0";
+    return "2.0.0";
   }
 }
 
@@ -1105,15 +1111,16 @@ Non-blocking /agy-loop:loop scheduler plugin and headless runner for Antigravity
 Usage:
   agy-loop [command] [options]
 
-Plugin Commands:
+Plugin & Diagnostics Commands:
   install, update     Install or update the agy-loop plugin (default)
   uninstall, remove   Uninstall the agy-loop plugin from Antigravity
-  validate            Run 'agy plugin validate --strict' on the bundled plugin
-  doctor, status      Inspect agy capabilities, plugin, hooks, worker tools, env, loops, and loop.md
+  validate            Run 'agy plugin validate --strict' locally or against --remote [ref]
+  status              Show runtime overview: active loops, managed daemons, lease locks, and health
+  doctor              Inspect agy capabilities, plugin, hooks, worker tools, env, profiles, daemons, and locks
   version             Print package version
   help                Show this help message
 
-Headless Runner Commands:
+Headless Runner & Automation Commands:
   run [interval] [prompt...]      Run a non-interactive headless loop (run 'agy-loop run --help' for options)
   resume <id|prefix|latest>       Resume an eligible stopped, max_reached, blocked, error, or stale loop
   nudge <id|prefix|latest> <msg>  Queue live steering instructions for the next iteration (--wake)
@@ -1122,8 +1129,10 @@ Headless Runner Commands:
   logs [<id|prefix|latest>]       View or follow (-f) loop event logs
   stop <id|prefix|all>            Stop running interactive, workflow, or headless loops (--after-current, --all)
   statusline                      Emit compact single-line status for statusLine/HUD (<5ms, zero subprocesses)
+  profiles                        Discover default, .agents/loops/*.md, and ~/.gemini/config/loops/*.md profiles
+  daemon <subcommand>             Manage persistent Sidecar & OS daemons (install|list|status|remove|logs)
 
-Options (Plugin Commands):
+Options (Plugin & Status Commands):
   --clean-shadow      Move shadowing user-level loop files into a timestamped backup
   --json              Emit machine-readable JSON output
   -h, --help          Show this help message
@@ -1132,7 +1141,12 @@ Options (Plugin Commands):
 Examples:
   npx agy-loop
   npx agy-loop install --clean-shadow
+  npx agy-loop status
   npx agy-loop doctor --json
+  agy-loop validate --remote v${version} --json
+  agy-loop profiles
+  agy-loop run --profile ci --trust-profile-commands
+  agy-loop daemon install --profile ci --mode sidecar --cron "*/30 * * * *" --dry-run
   agy-loop run --once --model gemini-4-carbon-low "Check tests and fix failures"
   agy-loop run 2m --stateful --verify-cmd "npm test" --verifier-model gemini-4-neon-xhigh
   agy-loop nudge latest "Focus on auth tests" --wake
@@ -1389,24 +1403,114 @@ function handleUninstall({ json }) {
   );
 }
 
-function handleValidate({ json }) {
+function emitValidateHelp() {
+  process.stdout.write(`Usage:
+  agy-loop validate [options]
+
+Options:
+  --remote [ref]   Validate GitHub repository tree/<ref> (defaults to v<version>)
+  --json           Emit JSON validation report
+  -h, --help       Show this help message
+`);
+}
+
+function handleValidateCommand(rawArgs = [], { version = readPluginVersion() } = {}) {
+  const jsonHint = Array.isArray(rawArgs) && rawArgs.includes("--json");
+  let json = false;
+  let remote = false;
+  let remoteRef = null;
+
+  for (let i = 0; i < rawArgs.length; i += 1) {
+    const arg = String(rawArgs[i]);
+    if (arg === "-h" || arg === "--help") {
+      emitValidateHelp();
+      return;
+    }
+
+    const { flag, inlineVal } = (() => {
+      const eqIdx = arg.indexOf("=");
+      if (eqIdx > 0 && arg.startsWith("-")) {
+        return { flag: arg.slice(0, eqIdx), inlineVal: arg.slice(eqIdx + 1) };
+      }
+      return { flag: arg, inlineVal: null };
+    })();
+
+    if (flag === "--json") {
+      if (inlineVal !== null) {
+        const msg = "Option --json does not take a value";
+        if (jsonHint) {
+          process.stdout.write(`${JSON.stringify({ ok: false, error: msg }, null, 2)}\n`);
+        }
+        process.stderr.write(`Error: ${msg}\n`);
+        process.exit(2);
+      }
+      json = true;
+    } else if (flag === "--remote") {
+      remote = true;
+      if (inlineVal !== null) {
+        if (!inlineVal.trim()) {
+          const msg = "Missing ref value for --remote=";
+          if (jsonHint) {
+            process.stdout.write(`${JSON.stringify({ ok: false, error: msg }, null, 2)}\n`);
+          }
+          process.stderr.write(`Error: ${msg}\n`);
+          process.exit(2);
+        }
+        remoteRef = inlineVal.trim();
+      } else if (i + 1 < rawArgs.length && !String(rawArgs[i + 1]).startsWith("-")) {
+        remoteRef = String(rawArgs[i + 1]).trim();
+        i += 1;
+      } else {
+        remoteRef = `v${version}`;
+      }
+    } else {
+      const msg = `Unknown argument for validate: ${arg}`;
+      if (jsonHint) {
+        process.stdout.write(`${JSON.stringify({ ok: false, error: msg }, null, 2)}\n`);
+      }
+      process.stderr.write(`Error: ${msg}\n`);
+      process.exit(2);
+    }
+  }
+
+  if (remote) {
+    if (
+      !remoteRef ||
+      !/^[A-Za-z0-9._/-]+$/.test(remoteRef) ||
+      remoteRef.includes("..") ||
+      remoteRef.startsWith("/") ||
+      remoteRef.endsWith("/")
+    ) {
+      const msg = `Invalid --remote ref '${String(remoteRef ?? "")}'`;
+      if (jsonHint) {
+        process.stdout.write(`${JSON.stringify({ ok: false, error: msg }, null, 2)}\n`);
+      }
+      process.stderr.write(`Error: ${msg}\n`);
+      process.exit(2);
+    }
+  }
+
   const probe = runAgy(["--version"]);
   if (!probe.found) {
     emitMissingAgyError(json);
   }
   if (probe.timedOut) {
-    emitAgyTimeoutError(probe, { action: "validate", jsonMode: json });
+    emitAgyTimeoutError(probe, { action: "validate", jsonMode: json, version });
   }
+
+  const target = remote
+    ? `https://github.com/maxlee/agy-loop/tree/${remoteRef}`
+    : PLUGIN_ROOT;
 
   const args = ["plugin", "validate", "--strict"];
   if (json) {
     args.push("--json");
   }
-  args.push(PLUGIN_ROOT);
+  args.push(target);
 
   const res = runAgy(args, { timeoutMs: 30000 });
   if (res.timedOut && json && !res.stdout.trim()) {
-    emitAgyTimeoutError(res, { action: "validate", jsonMode: json });
+    emitAgyTimeoutError(res, { action: "validate", jsonMode: json, version });
   }
   if (res.stdout) {
     process.stdout.write(res.stdout);
@@ -1431,32 +1535,54 @@ function parsePluginListOutput(stdout) {
   return [];
 }
 
-function handleDoctor({ cleanShadow = false, json, version }) {
+export function buildDoctorReport({
+  cleanShadow = false,
+  workspaceDir = process.cwd(),
+  version = readPluginVersion(),
+  allowMissingAgy = false,
+} = {}) {
   const homeDir = resolveHome();
-  const workspaceDir = process.cwd();
+  const resolvedWs = path.resolve(workspaceDir || process.cwd());
+  const stateRoot = resolveStateRoot(resolvedWs);
 
   const verRes = runAgy(["--version"]);
   if (!verRes.found) {
-    emitMissingAgyError(json);
+    if (!allowMissingAgy) {
+      return { _earlyExit: { kind: "missingAgy" } };
+    }
+  } else if (verRes.timedOut) {
+    if (!allowMissingAgy) {
+      return { _earlyExit: { kind: "timeout", res: verRes } };
+    }
   }
-  if (verRes.timedOut) {
-    emitAgyTimeoutError(verRes, { action: "doctor", jsonMode: json, version });
-  }
-  const agyVersion = (verRes.stdout || verRes.stderr).trim() || "unknown";
+
+  const agyFound = Boolean(verRes.found && !verRes.timedOut);
+  const agyVersion = agyFound ? (verRes.stdout || verRes.stderr).trim() || "unknown" : null;
   const capabilities = detectAgyCapabilities(agyVersion);
 
-  const listRes = runAgy(["plugin", "list", "--json"]);
   let pluginEntry = null;
   let pluginListError = null;
-  if (listRes.status === 0) {
-    try {
-      const plugins = parsePluginListOutput(listRes.stdout);
-      pluginEntry = plugins.find((p) => p && p.name === "agy-loop") || null;
-    } catch (err) {
-      pluginListError = `Failed to parse 'agy plugin list --json': ${err.message}`;
+  let listTimedOut = false;
+  let listTimeoutStatus = 124;
+
+  if (agyFound) {
+    const listRes = runAgy(["plugin", "list", "--json"]);
+    listTimedOut = Boolean(listRes.timedOut);
+    listTimeoutStatus = listRes.status || 124;
+    if (listRes.status === 0) {
+      try {
+        const plugins = parsePluginListOutput(listRes.stdout);
+        pluginEntry = plugins.find((p) => p && p.name === "agy-loop") || null;
+      } catch (err) {
+        pluginListError = `Failed to parse 'agy plugin list --json': ${err.message}`;
+      }
+    } else {
+      pluginListError = (listRes.stderr || listRes.stdout || "agy plugin list failed").trim();
     }
   } else {
-    pluginListError = (listRes.stderr || listRes.stdout || "agy plugin list failed").trim();
+    pluginListError = verRes.timedOut
+      ? verRes.stderr || "Antigravity CLI ('agy') timed out."
+      : "Antigravity CLI ('agy') was not found in PATH.";
   }
 
   let backupInfo = null;
@@ -1466,20 +1592,68 @@ function handleDoctor({ cleanShadow = false, json, version }) {
   }
 
   const shadows = detectShadowPaths(homeDir);
-  const skillFilterWarnings = detectSkillFilterWarnings(workspaceDir, homeDir);
-  const loopMd = inspectLoopMd(workspaceDir, homeDir);
-  const { environment, environmentWarnings } = inspectEnvironment(workspaceDir, homeDir);
-  const hookSelfTest = runHookSelfTest(homeDir, workspaceDir);
+  const skillFilterWarnings = detectSkillFilterWarnings(resolvedWs, homeDir);
+  const loopMd = inspectLoopMd(resolvedWs, homeDir);
+  const { environment, environmentWarnings } = inspectEnvironment(resolvedWs, homeDir);
+  const hookSelfTest = runHookSelfTest(homeDir, resolvedWs);
   const agentToolsCheck = inspectAgentTools(pluginEntry, "loop-worker.md");
   const verifierToolsCheck = inspectAgentTools(pluginEntry, "loop-verifier.md", {
     readOnly: true,
   });
   const workflowBundleCheck = inspectWorkflowBundle(pluginEntry);
-  const activeLoops = inspectActiveLoops(workspaceDir);
+  const activeLoops = inspectActiveLoops(resolvedWs);
+
+  const discoveredProfiles = listProfiles(resolvedWs, homeDir);
+  const profilesSummary = {
+    count: discoveredProfiles.length,
+    validCount: discoveredProfiles.filter((p) => p.ok).length,
+    invalidCount: discoveredProfiles.filter((p) => !p.ok).length,
+    items: discoveredProfiles.map((p) => ({
+      name: p.name,
+      scope: p.scope,
+      source: p.source,
+      path: p.path,
+      isDefault: Boolean(p.isDefault),
+      ok: Boolean(p.ok),
+      error: p.error || null,
+      hasFrontmatter: Boolean(p.hasFrontmatter),
+    })),
+  };
+
+  const activeLocks = listLeaseLocks(stateRoot);
+
+  const allDaemons = listDaemons({
+    global: true,
+    homeDir,
+    env: process.env,
+    checkStatus: false,
+  });
+  let realWs = resolvedWs;
+  try {
+    realWs = fs.realpathSync(resolvedWs);
+  } catch {
+    realWs = resolvedWs;
+  }
+  const workspaceDaemonsCount = allDaemons.filter((d) => {
+    if (!d.workspace_dir) return false;
+    try {
+      return fs.realpathSync(d.workspace_dir) === realWs;
+    } catch {
+      return path.resolve(d.workspace_dir) === resolvedWs;
+    }
+  }).length;
+  const daemonsSummary = {
+    total: allDaemons.length,
+    workspace: workspaceDaemonsCount,
+    sidecar: allDaemons.filter((d) => d.mode === "sidecar").length,
+    os: allDaemons.filter((d) => d.mode === "os").length,
+    items: allDaemons,
+  };
 
   const pluginInstalled = Boolean(pluginEntry);
   const pluginEnabled = pluginEntry ? pluginEntry.enabled !== false : false;
   const ok =
+    agyFound &&
     pluginInstalled &&
     pluginEnabled &&
     !pluginListError &&
@@ -1491,11 +1665,14 @@ function handleDoctor({ cleanShadow = false, json, version }) {
     verifierToolsCheck.ok &&
     workflowBundleCheck.ok;
 
-  const report = {
+  return {
     ok,
     version,
+    ...(verRes.timedOut ? { timedOut: true, error: pluginListError } : {}),
+    ...(!verRes.found ? { error: pluginListError } : {}),
     agy: {
-      found: true,
+      found: Boolean(verRes.found),
+      ...(verRes.timedOut ? { timedOut: true } : {}),
       version: agyVersion,
       capabilities,
     },
@@ -1518,20 +1695,73 @@ function handleDoctor({ cleanShadow = false, json, version }) {
     verifierToolsCheck,
     workflowBundleCheck,
     activeLoops,
+    profiles: profilesSummary,
+    activeLocks,
+    daemons: daemonsSummary,
     loopMd: {
       active: loopMd.active,
       activeSource: loopMd.activeSource,
       candidates: loopMd.candidates,
     },
+    _meta: {
+      listTimedOut,
+      listTimeoutStatus,
+    },
   };
+}
+
+function handleDoctor({ cleanShadow = false, json, version }) {
+  const fullReport = buildDoctorReport({
+    cleanShadow,
+    workspaceDir: process.cwd(),
+    version,
+    allowMissingAgy: false,
+  });
+
+  if (fullReport._earlyExit) {
+    if (fullReport._earlyExit.kind === "missingAgy") {
+      emitMissingAgyError(json);
+    }
+    emitAgyTimeoutError(fullReport._earlyExit.res, {
+      action: "doctor",
+      jsonMode: json,
+      version,
+    });
+  }
+
+  const { _meta, ...report } = fullReport;
 
   if (json) {
     process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
-    if (listRes.timedOut) {
-      process.exit(listRes.status || 124);
+    if (_meta.listTimedOut) {
+      process.exit(_meta.listTimeoutStatus || 124);
     }
     return;
   }
+
+  const {
+    agy,
+    plugin,
+    backupDir,
+    movedShadows,
+    shadows,
+    skillFilterWarnings,
+    environmentWarnings,
+    hookSelfTest,
+    agentToolsCheck,
+    verifierToolsCheck,
+    workflowBundleCheck,
+    activeLoops,
+    profiles,
+    activeLocks,
+    daemons,
+    loopMd,
+  } = report;
+  const agyVersion = agy.version || "unknown";
+  const capabilities = agy.capabilities;
+  const pluginInstalled = plugin.installed;
+  const pluginEnabled = plugin.enabled;
+  const pluginListError = plugin.error;
 
   const capLabels = [];
   if (capabilities.worktreeDirtyCarry) capLabels.push("worktree-carry");
@@ -1551,21 +1781,21 @@ function handleDoctor({ cleanShadow = false, json, version }) {
   } else if (pluginInstalled) {
     process.stdout.write(
       `  plugin status:  installed (${pluginEnabled ? "enabled" : "disabled"}${
-        pluginEntry?.version ? `, v${pluginEntry.version}` : ""
+        plugin.version ? `, v${plugin.version}` : ""
       })\n`
     );
-    if (pluginEntry?.path) {
-      process.stdout.write(`  plugin path:    ${pluginEntry.path}\n`);
+    if (plugin.path) {
+      process.stdout.write(`  plugin path:    ${plugin.path}\n`);
     }
   } else {
     process.stdout.write(`  plugin status:  not installed (run 'npx agy-loop install')\n`);
   }
 
-  if (backupInfo && backupInfo.moved.length > 0) {
+  if (movedShadows && movedShadows.length > 0) {
     process.stdout.write(
-      `  cleaned shadow: ${backupInfo.moved.length} archived to ${backupInfo.backupDir}\n`
+      `  cleaned shadow: ${movedShadows.length} archived to ${backupDir}\n`
     );
-    for (const item of backupInfo.moved) {
+    for (const item of movedShadows) {
       process.stdout.write(`    - ${item.from}\n`);
     }
     process.stdout.write(
@@ -1578,7 +1808,7 @@ function handleDoctor({ cleanShadow = false, json, version }) {
   } else {
     process.stdout.write(`  shadow files:   ${shadows.length} detected (shadows plugin!)\n`);
     for (const s of shadows) {
-      process.stdout.write(`    - ${s.path}\n`);
+      process.stdout.write(`    - ${s}\n`);
     }
     process.stdout.write(
       `    Fix: npx agy-loop doctor --clean-shadow  (or: sh ~/.gemini/config/plugins/agy-loop/install.sh --clean-shadow)\n`
@@ -1650,14 +1880,24 @@ function handleDoctor({ cleanShadow = false, json, version }) {
     }
   }
 
+  process.stdout.write(
+    `  profiles:       ${profiles.count} (${profiles.validCount} valid${
+      profiles.invalidCount > 0 ? `, ${profiles.invalidCount} invalid` : ""
+    })\n`
+  );
+  process.stdout.write(`  active locks:   ${activeLocks.length}\n`);
+  process.stdout.write(
+    `  daemons:        ${daemons.total} total (${daemons.workspace} in workspace; sidecar=${daemons.sidecar}, os=${daemons.os})\n`
+  );
+
   if (loopMd.active) {
     process.stdout.write(`  active loop.md: ${loopMd.activeSource} (${loopMd.active})\n`);
   } else {
     process.stdout.write(`  active loop.md: none (using built-in maintenance fallback)\n`);
   }
 
-  if (listRes.timedOut) {
-    process.exit(listRes.status || 124);
+  if (_meta.listTimedOut) {
+    process.exit(_meta.listTimeoutStatus || 124);
   }
 }
 
@@ -1696,6 +1936,25 @@ async function main() {
   }
   if (subcommand === "statusline") {
     await handleStatusline(rawArgv.slice(1));
+    return;
+  }
+  if (subcommand === "profiles") {
+    await handleProfiles(rawArgv.slice(1));
+    return;
+  }
+  if (subcommand === "daemon") {
+    await handleDaemon(rawArgv.slice(1), { version, pluginRoot: PLUGIN_ROOT });
+    return;
+  }
+  if (subcommand === "status") {
+    await handleStatusOverview(rawArgv.slice(1), {
+      version,
+      runDoctorReport: (opts) => buildDoctorReport({ ...opts, version }),
+    });
+    return;
+  }
+  if (subcommand === "validate") {
+    handleValidateCommand(rawArgv.slice(1), { version });
     return;
   }
 
@@ -1740,10 +1999,9 @@ async function main() {
       handleUninstall({ json: parsed.json });
       break;
     case "validate":
-      handleValidate({ json: parsed.json });
+      handleValidateCommand(parsed.json ? ["--json"] : [], { version });
       break;
     case "doctor":
-    case "status":
       handleDoctor({
         cleanShadow: parsed.cleanShadow,
         json: parsed.json,
@@ -1761,8 +2019,19 @@ async function main() {
   }
 }
 
-main().catch((err) => {
-  const msg = err instanceof Error ? err.message : String(err);
-  process.stderr.write(`Error: ${msg}\n`);
-  process.exit(1);
-});
+let isDirectCli = false;
+try {
+  isDirectCli =
+    Boolean(process.argv[1]) &&
+    fs.realpathSync(process.argv[1]) === fs.realpathSync(__filename);
+} catch {
+  isDirectCli = false;
+}
+
+if (isDirectCli) {
+  main().catch((err) => {
+    const msg = err instanceof Error ? err.message : String(err);
+    process.stderr.write(`Error: ${msg}\n`);
+    process.exit(1);
+  });
+}

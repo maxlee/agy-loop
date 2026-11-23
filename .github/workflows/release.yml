@@ -39,6 +39,9 @@ jobs:
       - name: Check POSIX shell syntax
         run: sh -n install.sh uninstall.sh skills/loop/scripts/loop-helper.sh
 
+      - name: Check Python workflow syntax (top-level await)
+        run: python3 -c 'import ast, pathlib; compile(pathlib.Path("workflows/loop-runner/workflow.py").read_text(encoding="utf-8"), "workflows/loop-runner/workflow.py", "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)'
+
       - name: Run test suite
         run: npm test
 
@@ -56,3 +59,12 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm publish --access public
+
+      - name: Validate published GitHub release plugin (if agy CLI available)
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          if command -v agy >/dev/null 2>&1; then
+            agy plugin validate --strict --json "https://github.com/maxlee/agy-loop/tree/${GITHUB_REF_NAME}"
+          else
+            echo "agy CLI not installed on runner; skipping remote validate"
+          fi

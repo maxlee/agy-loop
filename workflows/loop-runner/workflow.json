@@ -218,6 +218,51 @@
           "null"
         ],
         "description": "Optional override for loop state root directory (defaults to AGY_LOOP_STATE_DIR or <workspace_dir>/.agents/.agy-loop)."
+      },
+      "profile": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+        "description": "Named loop profile resolved from .agents/loops/<name>.md or ~/.gemini/config/loops/<name>.md."
+      },
+      "profile_file": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "Explicit path to a profile Markdown file (resolved relative to workspace_dir; mutually exclusive with profile)."
+      },
+      "singleton": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "enum": [
+          "profile",
+          "workspace",
+          "none",
+          null
+        ],
+        "description": "Single-instance lease lock scope ('profile', 'workspace', or 'none'; defaults to 'profile' when profile/profile_file is set, else 'none')."
+      },
+      "on_conflict": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "enum": [
+          "wake",
+          "skip",
+          "fail",
+          null
+        ],
+        "description": "Conflict policy when a live lease holder exists ('wake', 'skip', or 'fail')."
+      },
+      "relay_on_wake": {
+        "type": "boolean",
+        "description": "Consume an unclaimed wake arrived during the terminal turn and relay into one more iteration instead of exiting DONE."
       }
     }
   }

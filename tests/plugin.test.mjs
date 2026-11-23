@@ -86,7 +86,7 @@ const args = process.argv.slice(2);
 const logFile = process.env.MOCK_AGY_LOG;
 const stateFile = process.env.MOCK_AGY_STATE;
 const mockVersion = process.env.MOCK_AGY_VERSION || "1.5.9";
-const mockPluginVersion = process.env.MOCK_AGY_PLUGIN_VERSION || "1.3.0";
+const mockPluginVersion = process.env.MOCK_AGY_PLUGIN_VERSION || "2.0.0";
 const sleepMs = Number.parseInt(process.env.MOCK_AGY_SLEEP_MS || "0", 10);
 
 function handleArgs() {
@@ -260,7 +260,7 @@ test("plugin.json, package.json, and assets/logo.svg satisfy strict schema and p
   assert.equal(pluginJson.$schema, "https://antigravity.google/schemas/v1/plugin.json");
   assert.equal(pluginJson.name, "agy-loop");
   assert.equal(pluginJson.displayName, "AGY Loop");
-  assert.equal(pluginJson.version, "1.3.0");
+  assert.equal(pluginJson.version, "2.0.0");
   assert.doesNotMatch(
     pluginJson.displayName,
     /Antigravity|Gemini|Claude|Cursor|Plugin/i,
@@ -439,7 +439,20 @@ test(
       true,
       "skills/loop/references/workflow-engine.md must exist for progressive disclosure"
     );
+    const profilesDaemonsRefPath = path.join(
+      REPO_ROOT,
+      "skills",
+      "loop",
+      "references",
+      "profiles-and-daemons.md"
+    );
+    assert.equal(
+      fs.existsSync(profilesDaemonsRefPath),
+      true,
+      "skills/loop/references/profiles-and-daemons.md must exist for progressive disclosure"
+    );
     assert.match(body, /references\/workflow-engine\.md/);
+    assert.match(body, /references\/profiles-and-daemons\.md/);
     assert.ok(bodyBytes > 500, "SKILL.md body should contain full orchestration protocol");
     assert.doesNotMatch(
       body,
@@ -676,8 +689,23 @@ test("bin/agy-loop.mjs handles install, --clean-shadow, doctor --json, validate,
   const helpRes = runCli(["--help"]);
   assert.equal(helpRes.status, 0);
   assert.match(helpRes.stdout, /Usage:\s+agy-loop/);
-  assert.match(helpRes.stdout, /\bdoctor,\s*status\b/);
-  for (const subcmd of ["run", "resume", "nudge", "wake", "ps", "logs", "stop", "statusline"]) {
+  assert.match(helpRes.stdout, /^\s*status\s+Show runtime overview/m);
+  assert.match(helpRes.stdout, /^\s*doctor\s+Inspect agy capabilities/m);
+  for (const subcmd of [
+    "run",
+    "resume",
+    "nudge",
+    "wake",
+    "ps",
+    "logs",
+    "stop",
+    "statusline",
+    "profiles",
+    "daemon",
+    "validate",
+    "status",
+    "doctor",
+  ]) {
     assert.match(
       helpRes.stdout,
       new RegExp(`\\b${subcmd}\\b`),
@@ -689,7 +717,7 @@ test("bin/agy-loop.mjs handles install, --clean-shadow, doctor --json, validate,
   assert.equal(verRes.status, 0);
   const verJson = JSON.parse(verRes.stdout);
   assert.equal(verJson.name, "agy-loop");
-  assert.equal(verJson.version, "1.3.0");
+  assert.equal(verJson.version, "2.0.0");
 
   // Create shadow files in isolated HOME
   const shadowSkillDir = path.join(home, ".gemini", "config", "skills", "loop");
@@ -720,7 +748,7 @@ test("bin/agy-loop.mjs handles install, --clean-shadow, doctor --json, validate,
   assert.equal(docShadow.ok, false);
   assert.equal(docShadow.agy.version, "1.5.9");
   assert.equal(docShadow.plugin.installed, true);
-  assert.equal(docShadow.plugin.version, "1.3.0");
+  assert.equal(docShadow.plugin.version, "2.0.0");
   assert.equal(docShadow.shadows.length, 2);
   assert.equal(docShadow.skillFilterWarnings.length, 1);
   assert.equal(docShadow.loopMd.activeSource, ".agents/loop.md");
@@ -750,12 +778,25 @@ test("bin/agy-loop.mjs handles install, --clean-shadow, doctor --json, validate,
     "legacy shadow worker\n"
   );
 
-  // 4. doctor --json is now healthy (ok: true)
-  const docOkRes = runCli(["status", "--json"]);
+  // 4. Option A status --json overview vs deep doctor --json report (both ok: true)
+  const statusOkRes = runCli(["status", "--json"]);
+  assert.equal(statusOkRes.status, 0);
+  const statusOk = JSON.parse(statusOkRes.stdout);
+  assert.equal(statusOk.ok, true);
+  assert.equal(Array.isArray(statusOk.activeLoops), true);
+  assert.equal(Array.isArray(statusOk.daemons), true);
+  assert.equal(Array.isArray(statusOk.activeLocks), true);
+  assert.equal(statusOk.health?.ok, true);
+  assert.deepEqual(statusOk.health?.shadows, []);
+
+  const docOkRes = runCli(["doctor", "--json"]);
   assert.equal(docOkRes.status, 0);
   const docOk = JSON.parse(docOkRes.stdout);
   assert.equal(docOk.ok, true);
   assert.deepEqual(docOk.shadows, []);
+  assert.equal(typeof docOk.profiles?.count, "number");
+  assert.equal(Array.isArray(docOk.activeLocks), true);
+  assert.equal(typeof docOk.daemons?.total, "number");
 
   // 4b. doctor --clean-shadow --json (and human-readable status --clean-shadow) cleans shadows directly
   fs.mkdirSync(shadowSkillDir, { recursive: true });
@@ -2507,4 +2548,196 @@ test("doctor --json flips verifierToolsCheck and workflowBundleCheck to ok: fals
   assert.deepEqual(badWfDoc.workflowBundleCheck.mdFiles, ["FORBIDDEN.md"]);
   assert.equal(badWfDoc.ok, false);
 });
+
+test("loop-helper.sh v2.0: --profile/--file/--singleton/--on-conflict, profiles action, resolve-task frontmatter stripping, list-profiles, and state-init", (t) => {
+  const { home, workspace, envWithMockAgy } = makeSandbox(t);
+  const runHelper = (args, stdinText = undefined, cwd = workspace) =>
+    spawnSync("sh", [helperShPath, ...args], {
+      cwd,
+      env: envWithMockAgy,
+      input: stdinText,
+      encoding: "utf8",
+    });
+
+  // 1. Parse v2 flags & additive fields
+  const parsedProfile = JSON.parse(
+    runHelper([
+      "parse",
+      "--profile ci --singleton profile --on-conflict wake --max 5",
+    ]).stdout
+  );
+  assert.equal(parsedProfile.action, "run");
+  assert.equal(parsedProfile.engine, "workflow");
+  assert.equal(parsedProfile.profile, "ci");
+  assert.equal(parsedProfile.profile_file, null);
+  assert.equal(parsedProfile.singleton, "profile");
+  assert.equal(parsedProfile.on_conflict, "wake");
+  assert.equal(parsedProfile.max_iterations, 5);
+
+  const parsedFile = JSON.parse(
+    runHelper(["parse", "--file=.agents/custom.md --singleton=workspace --on-conflict=skip"]).stdout
+  );
+  assert.equal(parsedFile.engine, "workflow");
+  assert.equal(parsedFile.profile, null);
+  assert.equal(parsedFile.profile_file, ".agents/custom.md");
+  assert.equal(parsedFile.singleton, "workspace");
+  assert.equal(parsedFile.on_conflict, "skip");
+
+  // Lifecycle `profiles` action
+  assert.deepEqual(JSON.parse(runHelper(["parse", "profiles"]).stdout), { action: "profiles" });
+  assert.deepEqual(JSON.parse(runHelper(["parse", "/agy-loop:loop profiles --json"]).stdout), {
+    action: "profiles",
+    json: true,
+  });
+  assert.equal(runHelper(["parse", "profiles bogus"]).status, 2);
+
+  // 2. v2 parse conflicts & typo rejections (Exit 2)
+  const v2Conflicts = [
+    "parse --profile ci --file custom.md",
+    "parse --profile ci check inline prompt",
+    "parse --file custom.md check inline prompt",
+    "parse --profile ../evil",
+    "parse --profile a/b",
+    "parse --singleton profile --engine schedule check",
+    "parse --on-conflict wake --engine schedule check",
+    "parse 5m check --cron --singleton profile",
+    "parse --singleton bogus check",
+    "parse --on-conflict bogus check",
+    "parse --profiles ci",
+    "parse --on_conflict wake",
+  ];
+  for (const raw of v2Conflicts) {
+    const res = runHelper(raw.split(" "));
+    assert.equal(res.status, 2, `Expected exit 2 for '${raw}', got ${res.status}: ${res.stdout}`);
+    assert.ok(JSON.parse(res.stdout).error);
+  }
+
+  // 3. resolve-task multi-profile precedence, YAML frontmatter stripping, body-only 25k UTF-8 cap, and blocked_frontmatter_commands
+  const wsLoopsDir = path.join(workspace, ".agents", "loops");
+  const globalLoopsDir = path.join(home, ".gemini", "config", "loops");
+  fs.mkdirSync(wsLoopsDir, { recursive: true });
+  fs.mkdirSync(globalLoopsDir, { recursive: true });
+
+  fs.writeFileSync(
+    path.join(globalLoopsDir, "ci.md"),
+    "---\ninterval: 5m\n---\nGlobal ci body\n",
+    "utf8"
+  );
+  const resolvedGlobal = JSON.parse(runHelper(["resolve-task", workspace, "--profile", "ci"]).stdout);
+  assert.equal(resolvedGlobal.source, "~/.gemini/config/loops/ci.md");
+  assert.equal(resolvedGlobal.has_frontmatter, true);
+  assert.equal(resolvedGlobal.blocked_frontmatter_commands, false);
+  assert.match(resolvedGlobal.prompt, /Global ci body/);
+
+  // Workspace overrides global; frontmatter commands are blocked & omitted; body-only 25k cap holds
+  const largeBody = "中".repeat(9000); // 27,000 bytes
+  fs.writeFileSync(
+    path.join(wsLoopsDir, "ci.md"),
+    [
+      "---",
+      "name: ci",
+      "interval: 30s",
+      "max_iterations: 9",
+      "worktree: true",
+      'targets: ["api", "web"]',
+      'probe_cmd: "echo PWN"',
+      'verify_cmd: "echo PWN2"',
+      "---",
+      "",
+      largeBody,
+    ].join("\n"),
+    "utf8"
+  );
+  const resolvedWs = JSON.parse(runHelper(["resolve-task", workspace, "--profile", "ci"]).stdout);
+  assert.equal(resolvedWs.source, ".agents/loops/ci.md");
+  assert.equal(resolvedWs.profile_name, "ci");
+  assert.equal(resolvedWs.has_frontmatter, true);
+  assert.equal(resolvedWs.blocked_frontmatter_commands, true);
+  assert.equal(resolvedWs.frontmatter.interval, "30s");
+  assert.equal(resolvedWs.frontmatter.max_iterations, 9);
+  assert.equal(resolvedWs.frontmatter.worktree, true);
+  assert.deepEqual(resolvedWs.frontmatter.targets, ["api", "web"]);
+  assert.equal(resolvedWs.frontmatter.probe_cmd, undefined);
+  assert.equal(resolvedWs.frontmatter.verify_cmd, undefined);
+  assert.equal(resolvedWs.truncated, true);
+  assert.ok(Buffer.byteLength(resolvedWs.prompt, "utf8") <= 25000);
+  assert.equal(resolvedWs.prompt.includes("probe_cmd"), false);
+  assert.equal(resolvedWs.prompt.includes("\uFFFD"), false);
+
+  // Explicit --file resolution
+  fs.writeFileSync(path.join(workspace, "custom.md"), "---\nonce: true\n---\nCustom prompt\n", "utf8");
+  const resolvedFile = JSON.parse(
+    runHelper(["resolve-task", workspace, "--file", "custom.md"]).stdout
+  );
+  assert.equal(resolvedFile.source, "custom.md");
+  assert.equal(resolvedFile.has_frontmatter, true);
+  assert.equal(resolvedFile.frontmatter.once, true);
+  assert.match(resolvedFile.prompt, /Custom prompt/);
+
+  // 4. list-profiles enumerates default, workspace, and global profiles cleanly
+  fs.writeFileSync(path.join(workspace, ".agents", "loop.md"), "Default body\n", "utf8");
+  fs.writeFileSync(path.join(wsLoopsDir, "broken.md"), "---\nunclosed: true\n", "utf8");
+  const listed = JSON.parse(runHelper(["list-profiles", workspace]).stdout);
+  assert.equal(listed.ok, true);
+  assert.equal(listed.active_default_source, ".agents/loop.md");
+  assert.equal(
+    listed.profiles.some(
+      (p) => p.name === "ci" && p.scope === "workspace" && p.blocked_frontmatter_commands === true
+    ),
+    true
+  );
+  assert.equal(
+    listed.profiles.some((p) => p.name === "broken" && p.ok === false),
+    true
+  );
+
+  // 5. state-init preserves profile_name, profile_path, and singleton
+  const initProfile = JSON.parse(
+    runHelper(["state-init", workspace, "--stdin"], JSON.stringify(parsedProfile)).stdout
+  );
+  assert.equal(initProfile.profile_name, "ci");
+  assert.equal(initProfile.singleton, "profile");
+  const initFile = JSON.parse(
+    runHelper(["state-init", workspace, "--stdin"], JSON.stringify(parsedFile)).stdout
+  );
+  assert.equal(initFile.profile_path, ".agents/custom.md");
+  assert.equal(initFile.singleton, "workspace");
+
+  // 6. #95 regressions: explicit_flags in parse, a..b rejection, and zero-indented YAML block lists
+  assert.deepEqual(parsedProfile.explicit_flags, [
+    "max_iterations",
+    "profile",
+    "singleton",
+    "on_conflict",
+  ]);
+  const parsedBare = JSON.parse(runHelper(["parse", "--profile ci"]).stdout);
+  assert.deepEqual(parsedBare.explicit_flags, ["profile"]);
+  assert.equal(parsedBare.explicit_flags.includes("pacing"), false);
+  assert.equal(parsedBare.explicit_flags.includes("state_mode"), false);
+  assert.equal(parsedBare.explicit_flags.includes("targets"), false);
+
+  for (const dotCmd of [
+    ["parse", "--profile", "a..b"],
+    ["resolve-task", workspace, "--profile", "a..b"],
+  ]) {
+    const dotRes = runHelper(dotCmd);
+    assert.equal(dotRes.status, 2, `Expected exit 2 for ${dotCmd.join(" ")}, got ${dotRes.status}`);
+    assert.ok(JSON.parse(dotRes.stdout).error);
+  }
+  fs.writeFileSync(path.join(wsLoopsDir, "a..b.md"), "Bad double dot\n", "utf8");
+  const listedWithDots = JSON.parse(runHelper(["list-profiles", workspace]).stdout);
+  const dotEntry = listedWithDots.profiles.find((p) => p.name === "a..b");
+  assert.ok(dotEntry && dotEntry.ok === false);
+
+  fs.writeFileSync(
+    path.join(wsLoopsDir, "zeroindent.md"),
+    "---\ntargets:\n- pkgA\n- pkgB\n---\nZero indent targets\n",
+    "utf8"
+  );
+  const resolvedZeroIndent = JSON.parse(
+    runHelper(["resolve-task", workspace, "--profile", "zeroindent"]).stdout
+  );
+  assert.deepEqual(resolvedZeroIndent.frontmatter.targets, ["pkgA", "pkgB"]);
+});
+
 

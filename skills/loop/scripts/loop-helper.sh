@@ -358,7 +358,11 @@ run_parse() {
       kflags[21] = "reset-every"
       kflags[22] = "max-tokens"
       kflags[23] = "max-duration"
-      nkflags = 23
+      kflags[24] = "profile"
+      kflags[25] = "file"
+      kflags[26] = "singleton"
+      kflags[27] = "on-conflict"
+      nkflags = 27
 
       flag_aliases["--statefull"] = "--stateful"
       flag_aliases["--stateless"] = "--fresh"
@@ -401,6 +405,11 @@ run_parse() {
       flag_aliases["--max-dur"] = "--max-duration"
       flag_aliases["--max-durations"] = "--max-duration"
       flag_aliases["--max_duration"] = "--max-duration"
+      flag_aliases["--profiles"] = "--profile"
+      flag_aliases["--files"] = "--file"
+      flag_aliases["--singletons"] = "--singleton"
+      flag_aliases["--on_conflict"] = "--on-conflict"
+      flag_aliases["--on-conflicts"] = "--on-conflict"
     }
 
     function handle_unknown_option(t, rc,    eqp, fname, lfname, stem, k, max_d, d, best_d, best_k) {
@@ -552,6 +561,20 @@ run_parse() {
           }
           printf "{\"action\":\"status\""
           if (st_all) printf ",\"all\":true"
+          if (st_json) printf ",\"json\":true"
+          printf "}\n"
+          finish_ok()
+        }
+        if (w1 == "profiles") {
+          st_json = 0
+          for (i = 2; i <= ntok; i++) {
+            if (qflag[i] == 0 && tok[i] == "--json") {
+              st_json = 1
+            } else {
+              json_error("Unknown argument for profiles: " tok[i] " (expected /agy-loop:loop profiles [--json])")
+            }
+          }
+          printf "{\"action\":\"profiles\""
           if (st_json) printf ",\"json\":true"
           printf "}\n"
           finish_ok()
@@ -709,13 +732,13 @@ run_parse() {
 
     function parse_run_flags(    i, t, val, end_of_opts) {
       OP_MAX_SET = 0; OP_MAX_VAL = 20
-      OP_ONCE = 0
+      OP_ONCE = 0; OP_ONCE_EXPLICIT = 0
       OP_STATE_MODE = "fresh"; OP_STATEFUL = 0; OP_FRESH = 0
       OP_WORKSPACE = "inherit"; OP_WORKTREE = 0; OP_SHARE = 0
       OP_MODEL_SET = 0; OP_MODEL_VAL = ""
       OP_SELF = 0; OP_CRON = 0; OP_EXACT = 0; OP_DAEMON = 0
       OP_ENGINE_ARG = "auto"
-      OP_VERIFY = 0
+      OP_VERIFY = 0; OP_VERIFY_EXPLICIT = 0
       OP_VERIFIER_MODEL_SET = 0; OP_VERIFIER_MODEL_VAL = ""
       OP_VERIFY_CMD_SET = 0; OP_VERIFY_CMD_VAL = ""
       OP_VERIFY_TIMEOUT_SET = 0; OP_VERIFY_TIMEOUT_SEC = 60
@@ -725,6 +748,10 @@ run_parse() {
       OP_RESET_EVERY_SET = 0; OP_RESET_EVERY_VAL = 0
       OP_MAX_TOKENS_SET = 0; OP_MAX_TOKENS_VAL = 0
       OP_MAX_DUR_SET = 0; OP_MAX_DUR_SEC = 0
+      OP_PROFILE_SET = 0; OP_PROFILE_VAL = ""
+      OP_FILE_SET = 0; OP_FILE_VAL = ""
+      OP_SINGLETON_SET = 0; OP_SINGLETON_VAL = ""
+      OP_ON_CONFLICT_SET = 0; OP_ON_CONFLICT_VAL = ""
       OP_RCOUNT = 0
       wcount = 0
       end_of_opts = 0
@@ -736,7 +763,7 @@ run_parse() {
             end_of_opts = 1
             continue
           }
-          if (t == "--once") { OP_ONCE = 1; continue }
+          if (t == "--once") { OP_ONCE = 1; OP_ONCE_EXPLICIT = 1; continue }
           if (t == "--stateful") {
             if (OP_FRESH) json_error("Conflicting flags: --stateful and --fresh cannot be combined")
             OP_STATEFUL = 1; OP_STATE_MODE = "stateful"; continue
@@ -757,7 +784,7 @@ run_parse() {
           if (t == "--cron") { OP_CRON = 1; continue }
           if (t == "--exact") { OP_EXACT = 1; continue }
           if (t == "--daemon") { OP_DAEMON = 1; continue }
-          if (t == "--verify") { OP_VERIFY = 1; continue }
+          if (t == "--verify") { OP_VERIFY = 1; OP_VERIFY_EXPLICIT = 1; continue }
           if (index(t, "--verify=") == 1) json_error("Option --verify does not take a value")
           if (t == "--probe-until-pass") { OP_PROBE_UNTIL_PASS = 1; continue }
           if (index(t, "--probe-until-pass=") == 1) json_error("Option --probe-until-pass does not take a value")
@@ -919,6 +946,63 @@ run_parse() {
             OP_TARGETS_SET = 1
             continue
           }
+          if (t == "--profile" || index(t, "--profile=") == 1) {
+            if (t == "--profile") {
+              if (i + 1 > ntok) json_error("Missing value for --profile")
+              i++
+              val = qflag[i] ? tok[i] : strip_opt_quotes(tok[i])
+            } else {
+              val = substr(t, 11)
+              if (!eq_qflag[i]) val = strip_opt_quotes(val)
+            }
+            if (val == "") json_error("Missing value for --profile")
+            if (val !~ /^[A-Za-z0-9][A-Za-z0-9._-]*$/ || length(val) > 64 || index(val, "..") > 0) {
+              json_error("Invalid --profile name: " val " (expected 1-64 chars matching ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$, no '..')")
+            }
+            OP_PROFILE_SET = 1; OP_PROFILE_VAL = val; continue
+          }
+          if (t == "--file" || index(t, "--file=") == 1) {
+            if (t == "--file") {
+              if (i + 1 > ntok) json_error("Missing value for --file")
+              i++
+              val = qflag[i] ? tok[i] : strip_opt_quotes(tok[i])
+            } else {
+              val = substr(t, 8)
+              if (!eq_qflag[i]) val = strip_opt_quotes(val)
+            }
+            if (trim(val) == "") json_error("Missing or empty value for --file")
+            OP_FILE_SET = 1; OP_FILE_VAL = val; continue
+          }
+          if (t == "--singleton" || index(t, "--singleton=") == 1) {
+            if (t == "--singleton") {
+              if (i + 1 > ntok) json_error("Missing value for --singleton")
+              i++
+              val = qflag[i] ? tok[i] : strip_opt_quotes(tok[i])
+            } else {
+              val = substr(t, 13)
+              if (!eq_qflag[i]) val = strip_opt_quotes(val)
+            }
+            if (val == "") json_error("Missing value for --singleton")
+            if (val != "profile" && val != "workspace" && val != "none") {
+              json_error("Invalid --singleton value: " val " (expected profile, workspace, or none)")
+            }
+            OP_SINGLETON_SET = 1; OP_SINGLETON_VAL = val; continue
+          }
+          if (t == "--on-conflict" || index(t, "--on-conflict=") == 1) {
+            if (t == "--on-conflict") {
+              if (i + 1 > ntok) json_error("Missing value for --on-conflict")
+              i++
+              val = qflag[i] ? tok[i] : strip_opt_quotes(tok[i])
+            } else {
+              val = substr(t, 15)
+              if (!eq_qflag[i]) val = strip_opt_quotes(val)
+            }
+            if (val == "") json_error("Missing value for --on-conflict")
+            if (val != "wake" && val != "skip" && val != "fail") {
+              json_error("Invalid --on-conflict value: " val " (expected wake, skip, or fail)")
+            }
+            OP_ON_CONFLICT_SET = 1; OP_ON_CONFLICT_VAL = val; continue
+          }
           if (substr(t, 1, 2) == "--") {
             handle_unknown_option(t, OP_RCOUNT)
           }
@@ -939,13 +1023,13 @@ run_parse() {
         if (rq[2] == 0) check_fractional_compact(rtok[2])
         if (rc >= 3 && rq[2] == 0 && rq[3] == 0) check_fractional_split(rtok[2], rtok[3])
         if (rq[2] == 0 && parse_compact_dur(rtok[2])) {
-          OP_ONCE = 1; OP_HAS_INTERVAL = 1; OP_P_START = 3
+          OP_ONCE = 1; OP_ONCE_EXPLICIT = 1; OP_HAS_INTERVAL = 1; OP_P_START = 3
         } else if (rc >= 3 && rq[2] == 0 && rq[3] == 0 && parse_split_dur(rtok[2], rtok[3])) {
-          OP_ONCE = 1; OP_HAS_INTERVAL = 1; OP_P_START = 4
+          OP_ONCE = 1; OP_ONCE_EXPLICIT = 1; OP_HAS_INTERVAL = 1; OP_P_START = 4
         } else if (rc >= 3 && rq[2] == 0 && (tolower(rtok[2]) == "a" || tolower(rtok[2]) == "an") && rq[3] == 0 && unit_short(strip_comma(rtok[3])) != "") {
           su = unit_short(strip_comma(rtok[3]))
           PARSED_NUM = 1; PARSED_UNIT = su; PARSED_SEC = unit_mult(su); PARSED_LABEL = "1" su
-          OP_ONCE = 1; OP_HAS_INTERVAL = 1; OP_P_START = 4
+          OP_ONCE = 1; OP_ONCE_EXPLICIT = 1; OP_HAS_INTERVAL = 1; OP_P_START = 4
         }
       } else if (rc >= 2 && rq[1] == 0 && tolower(rtok[1]) == "every") {
         if (rq[2] == 0) check_fractional_compact(rtok[2])
@@ -993,7 +1077,7 @@ run_parse() {
       }
     }
 
-    function execute_parse(is_single_mode,    i, has_wf_only, effective_engine, pcount, prompt, pacing, max_iterations, task_source, delegate, has_cron, cron_expr, use_cron) {
+    function execute_parse(is_single_mode,    i, has_wf_only, has_lease_flags, effective_engine, pcount, prompt, pacing, max_iterations, task_source, delegate, has_cron, cron_expr, use_cron, ex_cnt) {
       if (ntok >= 1 && qflag[1] == 0 && (tok[1] == "/loop" || tok[1] == "/agy-loop:loop")) {
         for (i = 1; i < ntok; i++) {
           tok[i] = tok[i + 1]
@@ -1014,13 +1098,23 @@ run_parse() {
       if (OP_ONCE && OP_MAX_SET && OP_MAX_VAL > 1) {
         json_error("Conflicting flags: one-shot mode (--once or in <delay>) cannot use --max > 1")
       }
+      if (OP_PROFILE_SET && OP_FILE_SET) {
+        json_error("Conflicting flags: --profile and --file cannot be combined")
+      }
 
       has_wf_only = (OP_VERIFY || OP_VERIFIER_MODEL_SET || OP_VERIFY_CMD_SET || OP_VERIFY_TIMEOUT_SET || OP_PROBE_SET || OP_PROBE_TIMEOUT_SET || OP_TARGETS_SET || OP_MAX_TOKENS_SET || OP_MAX_DUR_SET || OP_RESET_EVERY_SET) ? 1 : 0
+      has_lease_flags = (OP_SINGLETON_SET || OP_ON_CONFLICT_SET) ? 1 : 0
       if ((OP_CRON || OP_EXACT || OP_DAEMON) && (OP_ENGINE_ARG == "workflow" || has_wf_only)) {
         json_error("Conflicting flags: --cron, --exact, and --daemon require --engine schedule (cannot combine with --engine workflow or workflow-only options)")
       }
+      if ((OP_CRON || OP_EXACT || OP_DAEMON) && has_lease_flags) {
+        json_error("Conflicting flags: --cron, --exact, and --daemon require --engine schedule (cannot combine with --singleton or --on-conflict)")
+      }
       if (OP_ENGINE_ARG == "schedule" && has_wf_only) {
         json_error("Conflicting flags: workflow-only options (--verify, --verifier-model, --verify-cmd, --verify-timeout, --probe, --probe-timeout, --targets, --max-tokens, --max-duration, --reset-every) require --engine workflow")
+      }
+      if (OP_ENGINE_ARG == "schedule" && has_lease_flags) {
+        json_error("Conflicting flags: --singleton and --on-conflict require --engine workflow (schedule engine does not hold a lease lock)")
       }
       if (OP_RESET_EVERY_SET && !OP_STATEFUL) {
         json_error("Conflicting flags: --reset-every requires --stateful")
@@ -1034,7 +1128,7 @@ run_parse() {
       if (OP_PROBE_TIMEOUT_SET && !OP_PROBE_SET) {
         json_error("Conflicting flags: --probe-timeout requires --probe <cmd>")
       }
-      effective_engine = (OP_ENGINE_ARG == "workflow" || (OP_ENGINE_ARG == "auto" && has_wf_only)) ? "workflow" : "schedule"
+      effective_engine = (OP_ENGINE_ARG == "workflow" || (OP_ENGINE_ARG == "auto" && (has_wf_only || has_lease_flags))) ? "workflow" : "schedule"
 
       pcount = (OP_P_END >= OP_P_START) ? (OP_P_END - OP_P_START + 1) : 0
       if (pcount == 0) {
@@ -1049,6 +1143,10 @@ run_parse() {
         }
       }
       prompt = trim(prompt)
+
+      if ((OP_PROFILE_SET || OP_FILE_SET) && prompt != "") {
+        json_error("Cannot combine --profile/--file with an inline prompt")
+      }
 
       pacing = OP_HAS_INTERVAL ? "fixed" : "dynamic"
       max_iterations = OP_MAX_SET ? OP_MAX_VAL : (OP_ONCE ? 1 : 20)
@@ -1127,6 +1225,39 @@ run_parse() {
       } else {
         printf "\"max_duration_sec\":null,"
       }
+      printf "\"profile\":%s,", json_str_or_null(OP_PROFILE_SET, OP_PROFILE_VAL)
+      printf "\"profile_file\":%s,", json_str_or_null(OP_FILE_SET, OP_FILE_VAL)
+      printf "\"singleton\":%s,", json_str_or_null(OP_SINGLETON_SET, OP_SINGLETON_VAL)
+      printf "\"on_conflict\":%s,", json_str_or_null(OP_ON_CONFLICT_SET, OP_ON_CONFLICT_VAL)
+      ex_cnt = 0
+      if (OP_HAS_INTERVAL) { ex_flags[++ex_cnt] = "pacing"; ex_flags[++ex_cnt] = "interval_sec" }
+      if (OP_ONCE_EXPLICIT) ex_flags[++ex_cnt] = "once"
+      if (OP_MAX_SET) ex_flags[++ex_cnt] = "max_iterations"
+      if (OP_STATEFUL || OP_FRESH) ex_flags[++ex_cnt] = "state_mode"
+      if (OP_RESET_EVERY_SET) ex_flags[++ex_cnt] = "reset_every"
+      if (OP_WORKTREE || OP_SHARE) ex_flags[++ex_cnt] = "workspace"
+      if (OP_MODEL_SET) ex_flags[++ex_cnt] = "model"
+      if (OP_SELF) ex_flags[++ex_cnt] = "delegate"
+      if (OP_VERIFY_EXPLICIT) ex_flags[++ex_cnt] = "verify"
+      if (OP_VERIFIER_MODEL_SET) ex_flags[++ex_cnt] = "verifier_model"
+      if (OP_VERIFY_CMD_SET) ex_flags[++ex_cnt] = "verify_cmd"
+      if (OP_VERIFY_TIMEOUT_SET) ex_flags[++ex_cnt] = "verify_timeout_sec"
+      if (OP_PROBE_SET) ex_flags[++ex_cnt] = "probe_cmd"
+      if (OP_PROBE_TIMEOUT_SET) ex_flags[++ex_cnt] = "probe_timeout_sec"
+      if (OP_PROBE_UNTIL_PASS) ex_flags[++ex_cnt] = "probe_until_pass"
+      if (OP_TARGETS_SET) ex_flags[++ex_cnt] = "targets"
+      if (OP_MAX_TOKENS_SET) ex_flags[++ex_cnt] = "max_tokens"
+      if (OP_MAX_DUR_SET) ex_flags[++ex_cnt] = "max_duration_sec"
+      if (OP_PROFILE_SET) ex_flags[++ex_cnt] = "profile"
+      if (OP_FILE_SET) ex_flags[++ex_cnt] = "profile_file"
+      if (OP_SINGLETON_SET) ex_flags[++ex_cnt] = "singleton"
+      if (OP_ON_CONFLICT_SET) ex_flags[++ex_cnt] = "on_conflict"
+      printf "\"explicit_flags\":["
+      for (i = 1; i <= ex_cnt; i++) {
+        if (i > 1) printf ","
+        printf "\"%s\"", ex_flags[i]
+      }
+      printf "],"
       printf "\"task_source\":\"%s\",", task_source
       printf "\"prompt\":\"%s\"", json_escape(prompt)
       if (wcount > 0) {
@@ -1184,37 +1315,7 @@ run_parse() {
   ' SENTINEL "$@"
 }
 
-run_resolve_task() {
-  ws_dir="$(normalize_dir "${1:-$PWD}")"
-  home_dir="${HOME:-}"
-
-  sel_source="builtin"
-  sel_path=""
-
-  if [ -f "$ws_dir/.agents/loop.md" ] && [ -s "$ws_dir/.agents/loop.md" ]; then
-    sel_source=".agents/loop.md"
-    sel_path="$ws_dir/.agents/loop.md"
-  elif [ -f "$ws_dir/loop.md" ] && [ -s "$ws_dir/loop.md" ]; then
-    sel_source="loop.md"
-    sel_path="$ws_dir/loop.md"
-  elif [ -n "$home_dir" ] && [ -f "$home_dir/.gemini/config/loop.md" ] && [ -s "$home_dir/.gemini/config/loop.md" ]; then
-    sel_source="~/.gemini/config/loop.md"
-    sel_path="$home_dir/.gemini/config/loop.md"
-  fi
-
-  if [ "$sel_source" = "builtin" ]; then
-    POSIXLY_CORRECT=1 LC_ALL=C awk '
-      BEGIN {
-        p = "Execute one non-blocking branch maintenance pass: (1) check git status and run fast incremental tests or build checks for any modified/unfinished work; (2) if gh CLI is available and an open PR exists for the current branch, inspect PR check runs and unresolved review comments, applying minimal verified fixes if straightforward; (3) if everything is clean and green, report in one concise line and recommend an idle backoff."
-        printf "{\"source\":\"builtin\",\"path\":null,\"truncated\":false,\"prompt\":\"%s\"}\n", p
-        exit 0
-      }
-    '
-    return 0
-  fi
-
-  byte_len="$(wc -c < "$sel_path" | tr -d '[:space:]')"
-  LP_SOURCE="$sel_source" LP_PATH="$sel_path" LP_BYTES="$byte_len" \
+run_profile_reader_awk() {
   POSIXLY_CORRECT=1 LC_ALL=C awk '
     function init_tables(    i, c) {
       for (i = 1; i < 256; i++) {
@@ -1249,6 +1350,12 @@ run_resolve_task() {
       return out
     }
 
+    function trim_str(s) {
+      sub(/^[ \t\r\n]+/, "", s)
+      sub(/[ \t\r\n]+$/, "", s)
+      return s
+    }
+
     function utf8_safe_cap(s, cap,    n, cont, lead_pos, lb, seq_len) {
       n = length(s)
       if (n <= cap) return s
@@ -1276,41 +1383,569 @@ run_resolve_task() {
       return s
     }
 
+    function yaml_unquote_scalar(raw,    s, q, i, n, ch, nx, out, closed, rest) {
+      s = trim_str(raw)
+      if (s == "") { YS_TYPE = "empty"; return "" }
+      q = substr(s, 1, 1)
+      n = length(s)
+      if (q == "\"" || q == "\047") {
+        out = ""
+        closed = 0
+        i = 2
+        while (i <= n) {
+          ch = substr(s, i, 1)
+          if (q == "\"" && ch == "\\" && i < n) {
+            nx = substr(s, i + 1, 1)
+            if (nx == "n") out = out "\n"
+            else if (nx == "r") out = out "\r"
+            else if (nx == "t") out = out "\t"
+            else out = out nx
+            i += 2
+            continue
+          }
+          if (q == "\047" && ch == "\047" && i < n && substr(s, i + 1, 1) == "\047") {
+            out = out "\047"
+            i += 2
+            continue
+          }
+          if (ch == q) {
+            closed = 1
+            i++
+            break
+          }
+          out = out ch
+          i++
+        }
+        if (closed) {
+          rest = trim_str(substr(s, i))
+          if (rest == "" || substr(rest, 1, 1) == "#") {
+            YS_TYPE = "quoted"
+            return out
+          }
+        }
+        YS_TYPE = "bare"
+        return s
+      }
+      sub(/[ \t]+#.*$/, "", s)
+      sub(/^#.*$/, "", s)
+      s = trim_str(s)
+      YS_TYPE = (s == "") ? "empty" : "bare"
+      return s
+    }
+
+    function yaml_parse_inline_array(raw, out_arr,    s, n, i, ch, inq, qch, start, cnt, item) {
+      split("", out_arr)
+      s = trim_str(raw)
+      n = length(s)
+      if (n < 2 || substr(s, 1, 1) != "[") return 0
+      inq = 0; qch = ""; cnt = 0; start = 2
+      i = 2
+      while (i <= n) {
+        ch = substr(s, i, 1)
+        if (inq) {
+          if (qch == "\"" && ch == "\\" && i < n) { i += 2; continue }
+          if (qch == "\047" && ch == "\047" && i < n && substr(s, i + 1, 1) == "\047") { i += 2; continue }
+          if (ch == qch) inq = 0
+          i++
+          continue
+        }
+        if (ch == "\"" || ch == "\047") { inq = 1; qch = ch; i++; continue }
+        if (ch == "," || ch == "]") {
+          item = trim_str(substr(s, start, i - start))
+          if (item != "") {
+            out_arr[++cnt] = yaml_unquote_scalar(item)
+          }
+          start = i + 1
+          if (ch == "]") break
+        }
+        i++
+      }
+      return cnt
+    }
+
+    function is_safe_key(k) {
+      if (k == "name" || k == "description" || k == "engine" || k == "interval" || k == "cron" || k == "timezone" || k == "state_mode" || k == "worker_model" || k == "model" || k == "effort" || k == "fallback_model" || k == "verifier_model" || k == "verify_timeout" || k == "probe_timeout" || k == "mode" || k == "max_duration" || k == "turn_timeout" || k == "singleton") {
+        return "str"
+      }
+      if (k == "once" || k == "verify" || k == "probe_until_pass" || k == "sandbox" || k == "worktree" || k == "keep_worktree" || k == "fail_on_denied") {
+        return "bool"
+      }
+      if (k == "max_iterations" || k == "reset_every" || k == "budget_tokens" || k == "max_tokens" || k == "max_retries" || k == "max_errors") {
+        return "int"
+      }
+      if (k == "targets" || k == "access_grants") {
+        return "arr"
+      }
+      return ""
+    }
+
+    function fm_set_key(key, jval) {
+      FM_VAL[key] = jval
+      if (!(key in FM_SEEN)) {
+        FM_SEEN[key] = 1
+        FM_KEYS[++FM_KCOUNT] = key
+      }
+    }
+
+    function format_fm_json(    i, k, out) {
+      out = "{"
+      for (i = 1; i <= FM_KCOUNT; i++) {
+        k = FM_KEYS[i]
+        if (i > 1) out = out ","
+        out = out "\"" json_escape(k) "\":" FM_VAL[k]
+      }
+      out = out "}"
+      return out
+    }
+
+    function parse_fm_lines(fm_n,    i, ln, tln, cur_arr_key, cur_arr_json, colon, key, raw_v, ktype, sval, ac, a_items, j, ajson, item_raw) {
+      cur_arr_key = ""
+      cur_arr_json = ""
+      for (i = 1; i <= fm_n; i++) {
+        ln = FM_LINES[i]
+        tln = trim_str(ln)
+        if (tln == "" || substr(tln, 1, 1) == "#") continue
+        if (cur_arr_key != "" && ln ~ /^[ \t]*-[ \t]*/) {
+          item_raw = ln
+          sub(/^[ \t]*-[ \t]*/, "", item_raw)
+          sval = yaml_unquote_scalar(item_raw)
+          if (YS_TYPE != "empty" || sval != "") {
+            if (cur_arr_json != "") cur_arr_json = cur_arr_json ","
+            cur_arr_json = cur_arr_json "\"" json_escape(sval) "\""
+            fm_set_key(cur_arr_key, "[" cur_arr_json "]")
+          }
+          continue
+        }
+        if (ln ~ /^[A-Za-z_][A-Za-z0-9_-]*[ \t]*:/) {
+          cur_arr_key = ""
+          cur_arr_json = ""
+          colon = index(ln, ":")
+          key = trim_str(substr(ln, 1, colon - 1))
+          raw_v = trim_str(substr(ln, colon + 1))
+          if (key == "probe_cmd" || key == "verify_cmd") {
+            sval = yaml_unquote_scalar(raw_v)
+            if ((YS_TYPE == "quoted" && sval != "") || (YS_TYPE == "bare" && sval != "" && sval != "null" && sval != "~")) {
+              FM_BLOCKED_CMDS = 1
+            }
+            continue
+          }
+          ktype = is_safe_key(key)
+          if (ktype == "") continue
+          if (ktype == "arr") {
+            if (substr(raw_v, 1, 1) == "[") {
+              ac = yaml_parse_inline_array(raw_v, a_items)
+              ajson = "["
+              for (j = 1; j <= ac; j++) {
+                if (j > 1) ajson = ajson ","
+                ajson = ajson "\"" json_escape(a_items[j]) "\""
+              }
+              ajson = ajson "]"
+              fm_set_key(key, ajson)
+            } else if (raw_v == "" || substr(raw_v, 1, 1) == "#") {
+              cur_arr_key = key
+              cur_arr_json = ""
+              fm_set_key(key, "[]")
+            }
+            continue
+          }
+          sval = yaml_unquote_scalar(raw_v)
+          if (YS_TYPE == "bare" && (sval == "" || sval == "null" || sval == "~")) {
+            fm_set_key(key, "null")
+          } else if (ktype == "bool") {
+            if (sval == "true" || sval == "false") {
+              fm_set_key(key, sval)
+            } else {
+              fm_set_key(key, "\"" json_escape(sval) "\"")
+            }
+          } else if (ktype == "int") {
+            if (sval ~ /^[0-9]+$/) {
+              fm_set_key(key, (sval + 0) "")
+            } else {
+              fm_set_key(key, "\"" json_escape(sval) "\"")
+            }
+          } else {
+            if (key == "name" && sval != "") {
+              FM_NAME_VAL = sval
+            }
+            fm_set_key(key, "\"" json_escape(sval) "\"")
+          }
+        }
+      }
+    }
+
+    function read_profile_file(fpath, total_bytes, cap, collect_body,    ln, rln, tmp, all_bytes, nr, in_fm, fm_closed, fm_n, body_lines, body_bytes, buf) {
+      RES_OK = 0; RES_ERR = ""; RES_HAS_FM = 0; RES_BLOCKED = 0
+      RES_FM_JSON = "{}"; RES_BODY = ""; RES_BODY_BYTES = 0; RES_TRUNCATED = 0
+      FM_KCOUNT = 0; split("", FM_KEYS); split("", FM_VAL); split("", FM_SEEN); split("", FM_LINES)
+      FM_BLOCKED_CMDS = 0; FM_NAME_VAL = ""
+
+      nr = 0; all_bytes = 0; in_fm = 0; fm_closed = 0; fm_n = 0
+      body_lines = 0; body_bytes = 0; buf = ""
+
+      while ((getline ln < fpath) > 0) {
+        nr++
+        all_bytes += length(ln)
+        rln = ln
+        sub(/\r$/, "", rln)
+        if (nr == 1 && rln == "---") {
+          in_fm = 1
+          continue
+        }
+        if (in_fm) {
+          tmp = rln
+          sub(/[ \t]*$/, "", tmp)
+          if (tmp == "---") {
+            in_fm = 0
+            fm_closed = 1
+            continue
+          }
+          FM_LINES[++fm_n] = rln
+          continue
+        }
+        body_lines++
+        if (body_lines > 1) {
+          body_bytes += 1
+          if (collect_body && length(buf) < cap + 8) buf = buf "\n"
+        }
+        body_bytes += length(ln)
+        if (collect_body && length(buf) < cap + 8) buf = buf ln
+      }
+      close(fpath)
+
+      if (nr == 0) {
+        RES_OK = 0
+        RES_ERR = "Empty profile file"
+        return 0
+      }
+      if (in_fm) {
+        RES_OK = 0
+        RES_ERR = "Unclosed YAML frontmatter"
+        return 0
+      }
+      if (body_lines > 0 && (all_bytes + nr) == total_bytes) {
+        body_bytes += 1
+        if (collect_body && length(buf) < cap + 8) buf = buf "\n"
+      }
+
+      RES_HAS_FM = fm_closed ? 1 : 0
+      if (fm_closed) {
+        parse_fm_lines(fm_n)
+      }
+      RES_BLOCKED = FM_BLOCKED_CMDS ? 1 : 0
+      RES_FM_JSON = fm_closed ? format_fm_json() : "{}"
+      RES_BODY_BYTES = body_bytes
+      RES_TRUNCATED = (collect_body && body_bytes > cap) ? 1 : 0
+      RES_BODY = collect_body ? (RES_TRUNCATED ? utf8_safe_cap(buf, cap) : buf) : ""
+      RES_OK = 1
+      return 1
+    }
+
     BEGIN {
       init_tables()
-      src = ENVIRON["LP_SOURCE"]
-      fpath = ENVIRON["LP_PATH"]
-      total_bytes = ENVIRON["LP_BYTES"] + 0
-      cap = 25000
-      buf = ""
-      sum_lines = 0
+      op = ENVIRON["LP_OP"]
+      if (op == "resolve") {
+        src = ENVIRON["LP_SOURCE"]
+        fpath = ENVIRON["LP_PATH"]
+        total_bytes = ENVIRON["LP_BYTES"] + 0
+        req_pname = ENVIRON["LP_REQ_PROFILE"]
+        if (!read_profile_file(fpath, total_bytes, 25000, 1)) {
+          printf "{\"error\":\"%s\"}\n", json_escape(RES_ERR " in " src)
+          exit 2
+        }
+        pname = (req_pname != "") ? req_pname : FM_NAME_VAL
+        printf "{\"source\":\"%s\",\"path\":\"%s\",\"profile_name\":%s,\"has_frontmatter\":%s,\"blocked_frontmatter_commands\":%s,\"frontmatter\":%s,\"truncated\":%s,\"prompt\":\"%s\"}\n",
+          json_escape(src),
+          json_escape(fpath),
+          (pname != "" ? "\"" json_escape(pname) "\"" : "null"),
+          (RES_HAS_FM ? "true" : "false"),
+          (RES_BLOCKED ? "true" : "false"),
+          RES_FM_JSON,
+          (RES_TRUNCATED ? "true" : "false"),
+          json_escape(RES_BODY)
+        exit 0
+      }
+      if (op == "list") {
+        printf "{\"ok\":true,\"workspace_dir\":\"%s\",\"active_default_source\":\"%s\",\"profiles\":[",
+          json_escape(ENVIRON["LP_WS_DIR"]),
+          json_escape(ENVIRON["LP_ACT_DEF"])
+        cnt = 0
+      }
     }
 
     {
-      if (NR > 1) {
-        if (length(buf) < cap + 8) buf = buf "\n"
-      }
-      sum_lines += length($0)
-      if (length(buf) < cap + 8) {
-        buf = buf $0
+      if (op == "list") {
+        idx = (NR - 1) % 6
+        if (idx == 0) c_name = $0
+        else if (idx == 1) c_scope = $0
+        else if (idx == 2) c_source = $0
+        else if (idx == 3) c_path = $0
+        else if (idx == 4) c_isdef = ($0 == "1") ? 1 : 0
+        else if (idx == 5) {
+          c_bytes = $0 + 0
+          valid_name = (c_isdef || (c_name ~ /^[A-Za-z0-9][A-Za-z0-9._-]*$/ && length(c_name) <= 64 && index(c_name, "..") == 0)) ? 1 : 0
+          if (!valid_name) {
+            e_ok = 0
+            e_err = "Invalid profile name: " c_name
+            RES_HAS_FM = 0; RES_BLOCKED = 0; RES_FM_JSON = "{}"; RES_BODY_BYTES = 0
+          } else {
+            e_ok = read_profile_file(c_path, c_bytes, 25000, 0)
+            e_err = RES_ERR
+          }
+          if (cnt > 0) printf ","
+          printf "{\"name\":\"%s\",\"scope\":\"%s\",\"source\":\"%s\",\"path\":\"%s\",\"is_default\":%s,\"ok\":%s,\"error\":%s,\"has_frontmatter\":%s,\"blocked_frontmatter_commands\":%s,\"body_bytes\":%d,\"frontmatter\":%s}",
+            json_escape(c_name),
+            json_escape(c_scope),
+            json_escape(c_source),
+            json_escape(c_path),
+            (c_isdef ? "true" : "false"),
+            (e_ok ? "true" : "false"),
+            (e_err != "" ? "\"" json_escape(e_err) "\"" : "null"),
+            (RES_HAS_FM ? "true" : "false"),
+            (RES_BLOCKED ? "true" : "false"),
+            RES_BODY_BYTES,
+            RES_FM_JSON
+          cnt++
+        }
       }
     }
 
     END {
-      if (NR > 0 && (sum_lines + NR) == total_bytes) {
-        if (length(buf) < cap + 8) buf = buf "\n"
+      if (op == "list") {
+        printf "]}\n"
       }
-      truncated = (total_bytes > cap) ? 1 : 0
-      if (truncated) {
-        buf = utf8_safe_cap(buf, cap)
-      }
-      printf "{\"source\":\"%s\",\"path\":\"%s\",\"truncated\":%s,\"prompt\":\"%s\"}\n",
-        json_escape(src),
-        json_escape(fpath),
-        (truncated ? "true" : "false"),
-        json_escape(buf)
     }
-  ' "$sel_path"
+  '
+}
+
+validate_profile_name() {
+  LP_PNAME="${1:-}" POSIXLY_CORRECT=1 LC_ALL=C awk '
+    BEGIN {
+      v = ENVIRON["LP_PNAME"]
+      exit !(v ~ /^[A-Za-z0-9][A-Za-z0-9._-]*$/ && length(v) <= 64 && index(v, "..") == 0)
+    }
+  '
+}
+
+run_resolve_task() {
+  _rt_ws=""
+  _rt_ws_set=0
+  _rt_profile=""
+  _rt_profile_set=0
+  _rt_file=""
+  _rt_file_set=0
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --profile)
+        if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+          emit_json_error "Missing value for --profile"
+        fi
+        _rt_profile="$2"
+        _rt_profile_set=1
+        shift
+        ;;
+      --profile=*)
+        _rt_profile="${1#--profile=}"
+        if [ -z "$_rt_profile" ]; then
+          emit_json_error "Missing value for --profile"
+        fi
+        _rt_profile_set=1
+        ;;
+      --file)
+        if [ "$#" -lt 2 ] || [ -z "$(printf '%s' "$2" | tr -d '[:space:]')" ]; then
+          emit_json_error "Missing or empty value for --file"
+        fi
+        _rt_file="$2"
+        _rt_file_set=1
+        shift
+        ;;
+      --file=*)
+        _rt_file="${1#--file=}"
+        if [ -z "$(printf '%s' "$_rt_file" | tr -d '[:space:]')" ]; then
+          emit_json_error "Missing or empty value for --file"
+        fi
+        _rt_file_set=1
+        ;;
+      -*)
+        emit_json_error "Unknown option for resolve-task: $1"
+        ;;
+      *)
+        if [ "$_rt_ws_set" -eq 1 ]; then
+          emit_json_error "Unexpected extra argument for resolve-task: $1"
+        fi
+        _rt_ws="$1"
+        _rt_ws_set=1
+        ;;
+    esac
+    shift
+  done
+
+  if [ "$_rt_profile_set" -eq 1 ] && [ "$_rt_file_set" -eq 1 ]; then
+    emit_json_error "Cannot combine --profile and --file in resolve-task"
+  fi
+  if [ "$_rt_profile_set" -eq 1 ]; then
+    if ! validate_profile_name "$_rt_profile"; then
+      emit_json_error "Invalid --profile name: $_rt_profile (expected 1-64 chars matching ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$)"
+    fi
+  fi
+
+  ws_dir="$(normalize_dir "${_rt_ws:-$PWD}")"
+  home_dir="${HOME:-}"
+  sel_source="builtin"
+  sel_path=""
+
+  if [ "$_rt_profile_set" -eq 1 ]; then
+    if [ -f "$ws_dir/.agents/loops/${_rt_profile}.md" ] && [ -s "$ws_dir/.agents/loops/${_rt_profile}.md" ]; then
+      sel_source=".agents/loops/${_rt_profile}.md"
+      sel_path="$ws_dir/.agents/loops/${_rt_profile}.md"
+    elif [ -n "$home_dir" ] && [ -f "$home_dir/.gemini/config/loops/${_rt_profile}.md" ] && [ -s "$home_dir/.gemini/config/loops/${_rt_profile}.md" ]; then
+      sel_source="~/.gemini/config/loops/${_rt_profile}.md"
+      sel_path="$home_dir/.gemini/config/loops/${_rt_profile}.md"
+    else
+      emit_json_error "Profile not found or empty: $_rt_profile (checked .agents/loops/${_rt_profile}.md and ~/.gemini/config/loops/${_rt_profile}.md)"
+    fi
+  elif [ "$_rt_file_set" -eq 1 ]; then
+    case "$_rt_file" in
+      /*) _rt_resolved="$_rt_file" ;;
+      *)
+        if [ "$ws_dir" = "/" ]; then
+          _rt_resolved="/$_rt_file"
+        else
+          _rt_resolved="$ws_dir/$_rt_file"
+        fi
+        ;;
+    esac
+    if [ ! -f "$_rt_resolved" ] || [ ! -s "$_rt_resolved" ]; then
+      emit_json_error "Profile file not found or empty: $_rt_file"
+    fi
+    sel_source="$_rt_file"
+    sel_path="$_rt_resolved"
+  else
+    if [ -f "$ws_dir/.agents/loop.md" ] && [ -s "$ws_dir/.agents/loop.md" ]; then
+      sel_source=".agents/loop.md"
+      sel_path="$ws_dir/.agents/loop.md"
+    elif [ -f "$ws_dir/loop.md" ] && [ -s "$ws_dir/loop.md" ]; then
+      sel_source="loop.md"
+      sel_path="$ws_dir/loop.md"
+    elif [ -n "$home_dir" ] && [ -f "$home_dir/.gemini/config/loop.md" ] && [ -s "$home_dir/.gemini/config/loop.md" ]; then
+      sel_source="~/.gemini/config/loop.md"
+      sel_path="$home_dir/.gemini/config/loop.md"
+    fi
+  fi
+
+  if [ "$sel_source" = "builtin" ]; then
+    POSIXLY_CORRECT=1 LC_ALL=C awk '
+      BEGIN {
+        p = "Execute one non-blocking branch maintenance pass: (1) check git status and run fast incremental tests or build checks for any modified/unfinished work; (2) if gh CLI is available and an open PR exists for the current branch, inspect PR check runs and unresolved review comments, applying minimal verified fixes if straightforward; (3) if everything is clean and green, report in one concise line and recommend an idle backoff."
+        printf "{\"source\":\"builtin\",\"path\":null,\"profile_name\":null,\"has_frontmatter\":false,\"blocked_frontmatter_commands\":false,\"frontmatter\":{},\"truncated\":false,\"prompt\":\"%s\"}\n", p
+        exit 0
+      }
+    '
+    return 0
+  fi
+
+  byte_len="$(wc -c < "$sel_path" | tr -d '[:space:]')"
+  LP_OP="resolve" LP_SOURCE="$sel_source" LP_PATH="$sel_path" LP_BYTES="$byte_len" LP_REQ_PROFILE="$_rt_profile" \
+    run_profile_reader_awk </dev/null
+}
+
+list_md_dir_sorted() {
+  _lmd_dir="$1"
+  [ -d "$_lmd_dir" ] || return 0
+  (
+    cd "$_lmd_dir" 2>/dev/null || exit 0
+    set +f
+    for _f in *.md; do
+      [ -f "$_f" ] || continue
+      printf '%s\n' "$_f"
+    done
+  ) | LC_ALL=C sort
+}
+
+run_list_profiles() {
+  _lp_ws=""
+  _lp_ws_set=0
+  for _arg in "$@"; do
+    case "$_arg" in
+      --json)
+        ;;
+      -*)
+        emit_json_error "Unknown option for list-profiles: $_arg"
+        ;;
+      *)
+        if [ "$_lp_ws_set" -eq 1 ]; then
+          emit_json_error "Unexpected extra argument for list-profiles: $_arg"
+        fi
+        _lp_ws="$_arg"
+        _lp_ws_set=1
+        ;;
+    esac
+  done
+
+  ws_dir="$(normalize_dir "${_lp_ws:-$PWD}")"
+  home_dir="${HOME:-}"
+
+  _act_def="builtin"
+  if [ -f "$ws_dir/.agents/loop.md" ] && [ -s "$ws_dir/.agents/loop.md" ]; then
+    _act_def=".agents/loop.md"
+  elif [ -f "$ws_dir/loop.md" ] && [ -s "$ws_dir/loop.md" ]; then
+    _act_def="loop.md"
+  elif [ -n "$home_dir" ] && [ -f "$home_dir/.gemini/config/loop.md" ] && [ -s "$home_dir/.gemini/config/loop.md" ]; then
+    _act_def="~/.gemini/config/loop.md"
+  fi
+
+  case "$-" in
+    *f*) _lp_had_noglob=1 ;;
+    *) _lp_had_noglob=0 ;;
+  esac
+  set -f
+
+  {
+    if [ -f "$ws_dir/.agents/loop.md" ]; then
+      _cb="$(wc -c < "$ws_dir/.agents/loop.md" | tr -d '[:space:]')"
+      printf 'default\nworkspace\n.agents/loop.md\n%s\n1\n%s\n' "$ws_dir/.agents/loop.md" "$_cb"
+    fi
+    if [ -f "$ws_dir/loop.md" ]; then
+      _cb="$(wc -c < "$ws_dir/loop.md" | tr -d '[:space:]')"
+      printf 'default\nworkspace\nloop.md\n%s\n1\n%s\n' "$ws_dir/loop.md" "$_cb"
+    fi
+    if [ -n "$home_dir" ] && [ -f "$home_dir/.gemini/config/loop.md" ]; then
+      _cb="$(wc -c < "$home_dir/.gemini/config/loop.md" | tr -d '[:space:]')"
+      printf 'default\nglobal\n~/.gemini/config/loop.md\n%s\n1\n%s\n' "$home_dir/.gemini/config/loop.md" "$_cb"
+    fi
+
+    if [ -d "$ws_dir/.agents/loops" ]; then
+      while IFS= read -r _fname; do
+        [ -n "$_fname" ] || continue
+        _fpath="$ws_dir/.agents/loops/$_fname"
+        [ -f "$_fpath" ] || continue
+        _stem="${_fname%.md}"
+        _cb="$(wc -c < "$_fpath" | tr -d '[:space:]')"
+        printf '%s\nworkspace\n.agents/loops/%s\n%s\n0\n%s\n' "$_stem" "$_fname" "$_fpath" "$_cb"
+      done <<EOF
+$(list_md_dir_sorted "$ws_dir/.agents/loops")
+EOF
+    fi
+
+    if [ -n "$home_dir" ] && [ -d "$home_dir/.gemini/config/loops" ]; then
+      while IFS= read -r _fname; do
+        [ -n "$_fname" ] || continue
+        _fpath="$home_dir/.gemini/config/loops/$_fname"
+        [ -f "$_fpath" ] || continue
+        _stem="${_fname%.md}"
+        _cb="$(wc -c < "$_fpath" | tr -d '[:space:]')"
+        printf '%s\nglobal\n~/.gemini/config/loops/%s\n%s\n0\n%s\n' "$_stem" "$_fname" "$_fpath" "$_cb"
+      done <<EOF
+$(list_md_dir_sorted "$home_dir/.gemini/config/loops")
+EOF
+    fi
+  } | LP_OP="list" LP_WS_DIR="$ws_dir" LP_ACT_DEF="$_act_def" run_profile_reader_awk
+
+  _lp_rc=$?
+  if [ "$_lp_had_noglob" -eq 0 ]; then
+    set +f
+  fi
+  return "$_lp_rc"
 }
 
 inspect_skills_json() {
@@ -2339,6 +2974,9 @@ run_state_engine() {
       out = out ",\"workspace_dir\":" json_str_val(st_v["workspace_dir"])
       out = out ",\"task_source\":" json_str_val(st_v["task_source"])
       out = out ",\"inline_prompt\":" json_str_val(st_v["inline_prompt"])
+      out = out ",\"profile_name\":" json_nullable_str(st_t["profile_name"], st_v["profile_name"])
+      out = out ",\"profile_path\":" json_nullable_str(st_t["profile_path"], st_v["profile_path"])
+      out = out ",\"singleton\":" json_str_val(st_v["singleton"])
       out = out ",\"pacing\":" json_str_val(st_v["pacing"])
       out = out ",\"once\":" (st_v["once"] ? "true" : "false")
       out = out ",\"interval_sec\":" json_nullable_int(st_t["interval_sec"], st_v["interval_sec"])
@@ -2425,6 +3063,9 @@ run_state_engine() {
       st_t["workspace_dir"] = "str"; st_v["workspace_dir"] = ""
       st_t["task_source"] = "str"; st_v["task_source"] = "loop_md_or_default"
       st_t["inline_prompt"] = "str"; st_v["inline_prompt"] = ""
+      st_t["profile_name"] = "null"; st_v["profile_name"] = ""
+      st_t["profile_path"] = "null"; st_v["profile_path"] = ""
+      st_t["singleton"] = "str"; st_v["singleton"] = "none"
       st_t["pacing"] = "str"; st_v["pacing"] = "dynamic"
       st_t["once"] = "bool"; st_v["once"] = 0
       st_t["interval_sec"] = "null"; st_v["interval_sec"] = ""
@@ -2706,6 +3347,41 @@ run_state_engine() {
           st_v["inline_prompt"] = in_v["inline_prompt"]
         } else if ("prompt" in in_t && in_t["prompt"] == "str") {
           st_v["inline_prompt"] = in_v["prompt"]
+        }
+        if ("profile_name" in in_t) {
+          if (in_t["profile_name"] == "str" && in_v["profile_name"] != "") {
+            st_t["profile_name"] = "str"; st_v["profile_name"] = in_v["profile_name"]
+          } else if (in_t["profile_name"] == "null") {
+            st_t["profile_name"] = "null"; st_v["profile_name"] = ""
+          }
+        } else if ("profile" in in_t) {
+          if (in_t["profile"] == "str" && in_v["profile"] != "") {
+            st_t["profile_name"] = "str"; st_v["profile_name"] = in_v["profile"]
+          } else if (in_t["profile"] == "null") {
+            st_t["profile_name"] = "null"; st_v["profile_name"] = ""
+          }
+        }
+        if ("profile_path" in in_t) {
+          if (in_t["profile_path"] == "str" && in_v["profile_path"] != "") {
+            st_t["profile_path"] = "str"; st_v["profile_path"] = in_v["profile_path"]
+          } else if (in_t["profile_path"] == "null") {
+            st_t["profile_path"] = "null"; st_v["profile_path"] = ""
+          }
+        } else if ("profile_file" in in_t) {
+          if (in_t["profile_file"] == "str" && in_v["profile_file"] != "") {
+            st_t["profile_path"] = "str"; st_v["profile_path"] = in_v["profile_file"]
+          } else if (in_t["profile_file"] == "null") {
+            st_t["profile_path"] = "null"; st_v["profile_path"] = ""
+          }
+        }
+        if ("singleton" in in_t) {
+          if (in_t["singleton"] == "str" && (in_v["singleton"] == "profile" || in_v["singleton"] == "workspace" || in_v["singleton"] == "none")) {
+            st_t["singleton"] = "str"; st_v["singleton"] = in_v["singleton"]
+          } else if (in_t["singleton"] == "null") {
+            st_t["singleton"] = "str"; st_v["singleton"] = "none"
+          } else {
+            json_error("Invalid singleton field in state-init")
+          }
         }
         if ("pacing" in in_t && in_t["pacing"] == "str") st_v["pacing"] = in_v["pacing"]
         if ("once" in in_t && in_t["once"] == "bool") st_v["once"] = in_v["once"]
@@ -4054,6 +4730,9 @@ case "$SUBCMD" in
   resolve-task)
     run_resolve_task "$@"
     ;;
+  list-profiles)
+    run_list_profiles "$@"
+    ;;
   doctor)
     run_doctor 0 "$@"
     ;;
@@ -4082,7 +4761,7 @@ case "$SUBCMD" in
     run_inbox_push "$@"
     ;;
   help|--help|-h|"")
-    printf '%s\n' '{"usage":"loop-helper.sh <parse|resolve-task|doctor|clean-shadow|session-start|state-init|state-read|state-update|state-list|state-stop|inbox-push> [args...]"}'
+    printf '%s\n' '{"usage":"loop-helper.sh <parse|resolve-task|list-profiles|doctor|clean-shadow|session-start|state-init|state-read|state-update|state-list|state-stop|inbox-push> [args...]"}'
     exit 0
     ;;
   *)

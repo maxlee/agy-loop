@@ -89,7 +89,7 @@ test(
     const installedDir = path.join(tmpHome, ".gemini", "config", "plugins", "agy-loop");
     assert.equal(fs.existsSync(path.join(installedDir, "plugin.json")), true);
 
-    // 2. Verify agy plugin list --json exposes v1.2.0 skill, subagent, and hook
+    // 2. Verify agy plugin list --json exposes v2.0.0 skill, subagent, and hook
     const listRes = spawnSync("agy", ["plugin", "list", "--json"], {
       cwd: tmpWs,
       env: isolatedEnv,
@@ -103,7 +103,7 @@ test(
     );
     assert.ok(entry, "Expected agy-loop in isolated agy plugin list --json");
     assert.equal(entry.enabled, true);
-    assert.equal(entry.version, "1.3.0");
+    assert.equal(entry.version, "2.0.0");
     assert.ok(Array.isArray(entry.skills) && entry.skills.includes("loop"));
     assert.ok(
       Array.isArray(entry.agents) &&
@@ -113,7 +113,7 @@ test(
     );
     assert.ok(Array.isArray(entry.hooks) && entry.hooks.includes("agy-loop-shadow-check"));
 
-    // 3. Verify node bin/agy-loop.mjs doctor --json passes all v1.3 diagnostics
+    // 3. Verify node bin/agy-loop.mjs doctor --json passes all v2.0 diagnostics
     const docRes = spawnSync(
       process.execPath,
       [path.join(REPO_ROOT, "bin", "agy-loop.mjs"), "doctor", "--json"],
@@ -132,7 +132,10 @@ test(
     assert.equal(doc.verifierToolsCheck?.ok, true);
     assert.equal(doc.workflowBundleCheck?.ok, true);
     assert.equal(doc.plugin?.installed, true);
-    assert.equal(doc.plugin?.version, "1.3.0");
+    assert.equal(doc.plugin?.version, "2.0.0");
+    assert.equal(typeof doc.profiles?.count, "number");
+    assert.equal(Array.isArray(doc.activeLocks), true);
+    assert.equal(typeof doc.daemons?.total, "number");
 
     // 4. Verify agy --output-format json models exits 0 with valid JSON (uses authenticated user HOME with ANTIGRAVITY_* stripped)
     const modelsRes = spawnSync("agy", ["--output-format", "json", "models"], {
@@ -515,4 +518,129 @@ test(
     assert.ok(resumedEvents.some((e) => e.event === "iteration_end" && e.iteration === 2));
   }
 );
+
+test(
+  "live: v2.0 'agy-loop profiles --json', 'status --json', 'daemon install --dry-run', and 'run --profile <name> --once' against real agy",
+  { skip: skipReason },
+  (t) => {
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "agy-loop-live-v2-"));
+    const tmpWs = path.join(tmpRoot, "ws");
+    const tmpStateDir = path.join(tmpRoot, "state");
+    fs.mkdirSync(path.join(tmpWs, ".agents", "loops"), { recursive: true });
+    t.after(() => {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    });
+
+    const profilePath = path.join(tmpWs, ".agents", "loops", "smoke.md");
+    fs.writeFileSync(
+      profilePath,
+      [
+        "---",
+        "name: smoke",
+        "worker_model: gemini-4-carbon-low",
+        "turn_timeout: 60s",
+        "once: true",
+        "singleton: profile",
+        "---",
+        "Do not edit files or run tools. Immediately finish with iteration 1, loop_status DONE, next_delay_sec 0, summary 'Live profile smoke ok', next_hint 'None'.",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const liveEnv = {
+      ...buildCleanAgyEnv(),
+      AGY_LOOP_STATE_DIR: tmpStateDir,
+    };
+    const cliPath = path.join(REPO_ROOT, "bin", "agy-loop.mjs");
+
+    // 1. agy-loop profiles --json
+    const profilesRes = spawnSync(process.execPath, [cliPath, "profiles", "--json"], {
+      cwd: tmpWs,
+      env: liveEnv,
+      encoding: "utf8",
+      timeout: 15000,
+    });
+    assert.equal(profilesRes.status, 0, profilesRes.stderr);
+    const profilesJson = JSON.parse(profilesRes.stdout);
+    assert.equal(profilesJson.ok, true);
+    assert.equal(profilesJson.profiles.some((p) => p.name === "smoke" && p.ok), true);
+
+    // 2. agy-loop status --json (Option A)
+    const statusRes = spawnSync(process.execPath, [cliPath, "status", "--json"], {
+      cwd: tmpWs,
+      env: liveEnv,
+      encoding: "utf8",
+      timeout: 30000,
+    });
+    assert.equal(statusRes.status, 0, statusRes.stderr);
+    const statusJson = JSON.parse(statusRes.stdout);
+    assert.equal(typeof statusJson.ok, "boolean");
+    assert.equal(Array.isArray(statusJson.activeLoops), true);
+    assert.equal(Array.isArray(statusJson.daemons), true);
+    assert.equal(Array.isArray(statusJson.activeLocks), true);
+    assert.equal(typeof statusJson.health?.ok, "boolean");
+
+    // 3. agy-loop daemon install --mode sidecar --cron "0 9 * * *" --dry-run --allow-temp-workspace
+    const daemonDryRes = spawnSync(
+      process.execPath,
+      [
+        cliPath,
+        "daemon",
+        "install",
+        "--profile",
+        "smoke",
+        "--mode",
+        "sidecar",
+        "--cron",
+        "0 9 * * *",
+        "--dry-run",
+        "--allow-temp-workspace",
+        "--json",
+      ],
+      {
+        cwd: tmpWs,
+        env: liveEnv,
+        encoding: "utf8",
+        timeout: 15000,
+      }
+    );
+    assert.equal(daemonDryRes.status, 0, daemonDryRes.stderr);
+    const daemonDry = JSON.parse(daemonDryRes.stdout);
+    assert.equal(daemonDry.ok, true);
+    assert.equal(daemonDry.dryRun, true);
+    assert.equal(daemonDry.config.builtin, "schedule");
+    assert.match(daemonDry.config.args[0], /^CRON_TZ=.* 0 9 \* \* \*$/);
+    assert.equal(daemonDry.config.args[1], "agentapi");
+    assert.equal(daemonDry.config.args[2], "new-conversation");
+    assert.equal(daemonDry.config.restart_policy, "always");
+
+    // 4. agy-loop run --profile smoke --once --json against real agy
+    const runRes = spawnSync(
+      process.execPath,
+      [cliPath, "run", "--profile", "smoke", "--once", "--json"],
+      {
+        cwd: tmpWs,
+        env: liveEnv,
+        encoding: "utf8",
+        timeout: 120000,
+      }
+    );
+    assert.equal(
+      runRes.status,
+      0,
+      `agy-loop run --profile smoke --once failed (exit=${runRes.status}):\nstdout: ${runRes.stdout}\nstderr: ${runRes.stderr}`
+    );
+    const payload = JSON.parse(runRes.stdout);
+    assert.equal(payload.ok, true);
+    assert.equal(payload.exit_code, 0);
+    assert.equal(payload.status, "done");
+    assert.equal(payload.profile_name, "smoke");
+    assert.equal(payload.singleton, "profile");
+    assert.match(payload.lock_scope_key, /^pf_[0-9a-f]{16}$/);
+    assert.ok(payload.usage_totals.total_tokens > 0, "Expected positive live token usage");
+    const locksDir = path.join(tmpStateDir, "locks");
+    assert.equal(fs.existsSync(locksDir) ? fs.readdirSync(locksDir).length : 0, 0);
+  }
+);
+
 
